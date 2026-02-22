@@ -86,6 +86,13 @@ pub enum ClosedCodeError {
 
     #[error("Sub-agent tool loop exceeded max iterations ({max}) for agent '{agent_id}'")]
     SubAgentMaxIterations { agent_id: String, max: usize },
+
+    // File modification errors (Phase 4)
+    #[error("Cannot modify protected path: {path}")]
+    ProtectedPath { path: String },
+
+    #[error("Approval prompt failed: {0}")]
+    ApprovalError(String),
 }
 
 impl ClosedCodeError {
@@ -231,6 +238,29 @@ mod tests {
         for err in &errors {
             assert!(!err.is_retryable(), "Expected not retryable: {err}");
         }
+    }
+
+    #[test]
+    fn phase4_errors_are_not_retryable() {
+        let errors: Vec<ClosedCodeError> = vec![
+            ClosedCodeError::ProtectedPath { path: ".git/config".into() },
+            ClosedCodeError::ApprovalError("prompt failed".into()),
+        ];
+        for err in &errors {
+            assert!(!err.is_retryable(), "Expected not retryable: {err}");
+        }
+    }
+
+    #[test]
+    fn phase4_error_display_messages() {
+        assert_eq!(
+            ClosedCodeError::ProtectedPath { path: ".git/config".into() }.to_string(),
+            "Cannot modify protected path: .git/config"
+        );
+        assert_eq!(
+            ClosedCodeError::ApprovalError("prompt failed".into()).to_string(),
+            "Approval prompt failed: prompt failed"
+        );
     }
 
     #[test]

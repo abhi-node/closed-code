@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::gemini::GeminiClient;
+use crate::ui::approval::ApprovalHandler;
 
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::types::{
@@ -164,10 +165,14 @@ pub fn create_planner_registry(
 
 /// Create a ToolRegistry for the orchestrator.
 /// Includes filesystem + spawn tools based on mode.
+///
+/// In Execute mode, `approval_handler` must be `Some` to register write tools.
+/// In other modes, `approval_handler` is ignored (write tools are not registered).
 pub fn create_orchestrator_registry(
     working_directory: PathBuf,
     mode: &Mode,
     client: Arc<GeminiClient>,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     register_filesystem_tools(&mut registry, working_directory.clone());
@@ -197,8 +202,19 @@ pub fn create_orchestrator_registry(
         Mode::Execute => {
             registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
                 client,
-                working_directory,
+                working_directory.clone(),
             )));
+            // Write tools — Execute mode only
+            if let Some(handler) = approval_handler {
+                registry.register(Box::new(super::file_write::WriteFileTool::new(
+                    working_directory.clone(),
+                    handler.clone(),
+                )));
+                registry.register(Box::new(super::file_edit::EditFileTool::new(
+                    working_directory,
+                    handler,
+                )));
+            }
         }
     }
 
@@ -394,7 +410,7 @@ mod tests {
             "model".into(),
         ));
         let registry =
-            create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Explore, client);
+            create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Explore, client, None);
         // 5 filesystem/shell + spawn_explorer = 6
         assert_eq!(registry.len(), 6);
         assert!(registry.get("spawn_explorer").is_some());
@@ -408,12 +424,73 @@ mod tests {
             "key".into(),
             "model".into(),
         ));
-        let registry = create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Plan, client);
+        let registry =
+            create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Plan, client, None);
         // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
         assert_eq!(registry.len(), 8);
         assert!(registry.get("spawn_explorer").is_some());
         assert!(registry.get("spawn_planner").is_some());
         assert!(registry.get("spawn_web_search").is_some());
+    }
+
+    // ── Phase 4 Registry Factory Tests ──
+
+    #[test]
+    fn create_orchestrator_registry_execute_mode_with_handler() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let handler = Arc::new(crate::ui::approval::AutoApproveHandler::always_approve())
+            as Arc<dyn crate::ui::approval::ApprovalHandler>;
+        let registry = create_orchestrator_registry(
+            PathBuf::from("/tmp"),
+            &Mode::Execute,
+            client,
+            Some(handler),
+        );
+        // 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
+        assert_eq!(registry.len(), 8);
+        assert!(registry.get("write_file").is_some());
+        assert!(registry.get("edit_file").is_some());
+        assert!(registry.get("spawn_explorer").is_some());
+    }
+
+    #[test]
+    fn create_orchestrator_registry_execute_mode_without_handler() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let registry = create_orchestrator_registry(
+            PathBuf::from("/tmp"),
+            &Mode::Execute,
+            client,
+            None,
+        );
+        // No write tools registered without handler
+        assert_eq!(registry.len(), 6);
+        assert!(registry.get("write_file").is_none());
+        assert!(registry.get("edit_file").is_none());
+    }
+
+    #[test]
+    fn create_orchestrator_registry_explore_ignores_handler() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let handler = Arc::new(crate::ui::approval::AutoApproveHandler::always_approve())
+            as Arc<dyn crate::ui::approval::ApprovalHandler>;
+        let registry = create_orchestrator_registry(
+            PathBuf::from("/tmp"),
+            &Mode::Explore,
+            client,
+            Some(handler),
+        );
+        // Explore mode: no write tools regardless of handler
+        assert_eq!(registry.len(), 6);
+        assert!(registry.get("write_file").is_none());
     }
 
     #[test]

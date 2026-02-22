@@ -1,3 +1,5 @@
+pub mod approval;
+pub mod diff;
 pub mod spinner;
 pub mod theme;
 

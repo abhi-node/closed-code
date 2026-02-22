@@ -6,6 +6,8 @@ use crate::error::Result;
 use crate::gemini::types::{FunctionDeclaration, Parameters};
 use crate::mode::Mode;
 
+pub mod file_edit;
+pub mod file_write;
 pub mod filesystem;
 pub mod registry;
 pub mod report;

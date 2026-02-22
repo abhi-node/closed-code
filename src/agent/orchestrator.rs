@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -9,6 +10,7 @@ use crate::gemini::types::{Content, GenerateContentRequest, GenerationConfig, Pa
 use crate::gemini::GeminiClient;
 use crate::mode::Mode;
 use crate::tool::registry::{create_orchestrator_registry, ToolRegistry};
+use crate::ui::approval::ApprovalHandler;
 use crate::ui::spinner::Spinner;
 
 const MAX_ORCHESTRATOR_ITERATIONS: usize = 30;
@@ -21,12 +23,14 @@ const MAX_CONTEXT_TURNS: usize = 50;
 pub struct Orchestrator {
     client: Arc<GeminiClient>,
     mode: Mode,
-    #[allow(dead_code)]
     working_directory: PathBuf,
     history: Vec<Content>,
     registry: ToolRegistry,
     system_prompt: String,
     max_output_tokens: u32,
+    approval_handler: Arc<dyn ApprovalHandler>,
+    current_plan: Option<String>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Orchestrator {
@@ -35,9 +39,14 @@ impl Orchestrator {
         mode: Mode,
         working_directory: PathBuf,
         max_output_tokens: u32,
+        approval_handler: Arc<dyn ApprovalHandler>,
     ) -> Self {
-        let registry =
-            create_orchestrator_registry(working_directory.clone(), &mode, client.clone());
+        let registry = create_orchestrator_registry(
+            working_directory.clone(),
+            &mode,
+            client.clone(),
+            Some(approval_handler.clone()),
+        );
         let system_prompt = Self::build_system_prompt(&mode, &working_directory);
 
         Self {
@@ -48,6 +57,9 @@ impl Orchestrator {
             registry,
             system_prompt,
             max_output_tokens,
+            approval_handler,
+            current_plan: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -104,6 +116,8 @@ impl Orchestrator {
                     if let Part::FunctionCall { name, args, .. } = part {
                         let display = format_tool_call(name, args);
                         let tool_spinner = Spinner::new(&format!("[tool] {}", display));
+                        // Clear spinner before executing — tool may show interactive UI
+                        tool_spinner.finish();
 
                         let result = match self.registry.execute(name, args.clone()).await {
                             Ok(v) => v,
@@ -113,7 +127,7 @@ impl Orchestrator {
                             }
                         };
 
-                        tool_spinner.finish_with_message(&format!("\u{2713} [tool] {}", display));
+                        println!("\u{2713} [tool] {}", display);
                         response_parts.push(Part::FunctionResponse {
                             name: name.clone(),
                             response: result,
@@ -144,6 +158,12 @@ impl Orchestrator {
         let mut final_text = String::new();
 
         for iteration in 0..MAX_ORCHESTRATOR_ITERATIONS {
+            // Check cancellation before each iteration
+            if self.cancelled.load(Ordering::SeqCst) {
+                tracing::info!("Orchestrator cancelled by user");
+                break;
+            }
+
             tracing::debug!(
                 "Orchestrator tool loop iteration {}/{}",
                 iteration + 1,
@@ -194,10 +214,15 @@ impl Orchestrator {
                     // Execute all function calls
                     let mut response_parts: Vec<Part> = Vec::new();
                     for part in response.function_calls() {
+                        if self.cancelled.load(Ordering::SeqCst) {
+                            break;
+                        }
                         if let Part::FunctionCall { name, args, .. } = part {
                             let display = format_tool_call(name, args);
                             let tool_spinner =
                                 Spinner::new(&format!("[tool] {}", display));
+                            // Clear spinner before executing — tool may show interactive UI
+                            tool_spinner.finish();
 
                             let result =
                                 match self.registry.execute(name, args.clone()).await {
@@ -208,8 +233,7 @@ impl Orchestrator {
                                     }
                                 };
 
-                            tool_spinner
-                                .finish_with_message(&format!("\u{2713} [tool] {}", display));
+                            println!("\u{2713} [tool] {}", display);
                             response_parts.push(Part::FunctionResponse {
                                 name: name.clone(),
                                 response: result,
@@ -261,25 +285,63 @@ impl Orchestrator {
             working_directory.display()
         );
 
-        let tools_section = match mode {
+        let mode_section = match mode {
             Mode::Explore => {
-                "\n\nYou have access to filesystem tools and a spawn_explorer tool.\n\
-                 Use spawn_explorer for deep codebase research when you need a thorough analysis."
+                "\n\nYou are in EXPLORE mode. You are strictly READ-ONLY.\n\
+                 You CANNOT create, modify, or delete any files.\n\
+                 \n\
+                 Your role is to help the user understand the codebase:\n\
+                 - Read and analyze files using read_file\n\
+                 - Search for patterns with search_files and grep\n\
+                 - List directory contents with list_directory\n\
+                 - Run read-only shell commands (git log, cargo check, etc.)\n\
+                 - Use spawn_explorer for deep codebase research\n\
+                 \n\
+                 Explain code architecture, patterns, data flow, and answer questions.\n\
+                 NEVER suggest creating or modifying files in this mode."
             }
             Mode::Plan => {
-                "\n\nYou have access to filesystem tools and these agent tools:\n\
-                 - spawn_explorer: Deep codebase research and analysis\n\
+                "\n\nYou are in PLAN mode. You create implementation plans for review.\n\
+                 You CANNOT modify files. Your job is to:\n\
+                 1. Understand the user's requirements\n\
+                 2. Research the codebase using filesystem tools and sub-agents\n\
+                 3. Produce a clear, structured implementation plan with:\n\
+                    - Step-by-step implementation order\n\
+                    - Files to create or modify (with specific changes)\n\
+                    - Code patterns to follow from the existing codebase\n\
+                    - Potential risks or trade-offs\n\
+                 \n\
+                 Available tools:\n\
+                 - spawn_explorer: Deep codebase research\n\
                  - spawn_planner: Create detailed implementation plans\n\
-                 - spawn_web_search: Research topics online with Google Search\n\
-                 Use these tools to gather information before providing your response."
+                 - spawn_web_search: Research topics online\n\
+                 - All filesystem read tools\n\
+                 \n\
+                 The user will either:\n\
+                 - Give feedback to refine the plan (continue the conversation)\n\
+                 - Accept the plan with /accept (transitions to Execute mode)"
             }
             Mode::Execute => {
-                "\n\nYou have access to filesystem tools and a spawn_explorer tool.\n\
-                 Use spawn_explorer when you need to understand code before making changes."
+                "\n\nYou are in EXECUTE mode. You can create and edit files.\n\
+                 \n\
+                 Available tools:\n\
+                 - write_file: Create new files or overwrite existing ones\n\
+                 - edit_file: Make targeted changes using search/replace\n\
+                 - spawn_explorer: Research code before making changes\n\
+                 - All filesystem read tools (read_file, list_directory, search_files, grep, shell)\n\
+                 \n\
+                 IMPORTANT workflow:\n\
+                 1. Always read the file first (read_file) before editing it\n\
+                 2. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 3. Use write_file for new files or complete rewrites\n\
+                 4. Every file change shows a diff and requires user approval\n\
+                 5. If a change is rejected, ask the user what they want instead\n\
+                 \n\
+                 Make changes methodically: one file at a time, with clear purpose."
             }
         };
 
-        format!("{}{}", base, tools_section)
+        format!("{}{}", base, mode_section)
     }
 
     /// Switch to a different mode at runtime.
@@ -290,6 +352,7 @@ impl Orchestrator {
             self.working_directory.clone(),
             &self.mode,
             self.client.clone(),
+            Some(self.approval_handler.clone()),
         );
         self.system_prompt = Self::build_system_prompt(&self.mode, &self.working_directory);
     }
@@ -344,6 +407,57 @@ impl Orchestrator {
     pub fn system_prompt(&self) -> &str {
         &self.system_prompt
     }
+
+    /// Store the current plan text.
+    /// Called by the REPL after each Plan mode response.
+    pub fn set_current_plan(&mut self, plan: String) {
+        self.current_plan = Some(plan);
+    }
+
+    /// Get the current plan, if any.
+    pub fn current_plan(&self) -> Option<&str> {
+        self.current_plan.as_deref()
+    }
+
+    /// Accept the current plan and switch to Execute mode.
+    ///
+    /// Injects the accepted plan into conversation history as context,
+    /// then switches mode to Execute (which registers write tools).
+    /// Returns the plan text if one was set, or None.
+    pub fn accept_plan(&mut self) -> Option<String> {
+        if let Some(plan) = self.current_plan.take() {
+            self.history.push(Content::user(&format!(
+                "[ACCEPTED PLAN — Execute this plan step by step]\n\n{}",
+                plan
+            )));
+            self.set_mode(Mode::Execute);
+            Some(plan)
+        } else {
+            None
+        }
+    }
+
+    /// Get a clone of the cancellation flag for use by signal handlers.
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
+    /// Reset the cancellation flag. Call before each model invocation.
+    pub fn reset_cancel(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether the model was cancelled by the user.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Record an interruption in conversation history.
+    /// Adds a model message so the history stays consistent.
+    pub fn record_interruption(&mut self) {
+        self.history
+            .push(Content::model("[Response interrupted by user]"));
+    }
 }
 
 impl std::fmt::Debug for Orchestrator {
@@ -352,6 +466,8 @@ impl std::fmt::Debug for Orchestrator {
             .field("mode", &self.mode)
             .field("tools", &self.registry.len())
             .field("history_len", &self.history.len())
+            .field("has_plan", &self.current_plan.is_some())
+            .field("cancelled", &self.is_cancelled())
             .finish()
     }
 }
@@ -392,9 +508,14 @@ pub(crate) fn format_tool_call(name: &str, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::approval::AutoApproveHandler;
 
     fn test_client() -> Arc<GeminiClient> {
         Arc::new(GeminiClient::new("key".into(), "model".into()))
+    }
+
+    fn test_handler() -> Arc<dyn ApprovalHandler> {
+        Arc::new(AutoApproveHandler::always_approve())
     }
 
     #[test]
@@ -404,13 +525,13 @@ mod tests {
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
+            test_handler(),
         );
         // 5 filesystem/shell + spawn_explorer = 6
         assert_eq!(orch.tool_count(), 6);
         assert_eq!(*orch.mode(), Mode::Explore);
-        assert!(orch.system_prompt().contains("explore"));
-        assert!(orch.system_prompt().contains("spawn_explorer"));
-        assert!(!orch.system_prompt().contains("spawn_planner"));
+        assert!(orch.system_prompt().contains("READ-ONLY"));
+        assert!(!orch.system_prompt().contains("write_file"));
     }
 
     #[test]
@@ -420,14 +541,29 @@ mod tests {
             Mode::Plan,
             PathBuf::from("/tmp"),
             8192,
+            test_handler(),
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
         assert_eq!(orch.tool_count(), 8);
         assert_eq!(*orch.mode(), Mode::Plan);
-        assert!(orch.system_prompt().contains("plan"));
-        assert!(orch.system_prompt().contains("spawn_explorer"));
-        assert!(orch.system_prompt().contains("spawn_planner"));
-        assert!(orch.system_prompt().contains("spawn_web_search"));
+        assert!(orch.system_prompt().contains("PLAN"));
+        assert!(orch.system_prompt().contains("/accept"));
+    }
+
+    #[test]
+    fn orchestrator_new_execute_mode() {
+        let orch = Orchestrator::new(
+            test_client(),
+            Mode::Execute,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+        );
+        // 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
+        assert_eq!(orch.tool_count(), 8);
+        assert!(orch.system_prompt().contains("EXECUTE"));
+        assert!(orch.system_prompt().contains("write_file"));
+        assert!(orch.system_prompt().contains("edit_file"));
     }
 
     #[test]
@@ -437,6 +573,7 @@ mod tests {
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
+            test_handler(),
         );
         // Simulate some conversation
         orch.history.push(Content::user("hello"));
@@ -455,6 +592,7 @@ mod tests {
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
+            test_handler(),
         );
 
         // Fill history beyond MAX_CONTEXT_TURNS
@@ -482,6 +620,7 @@ mod tests {
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
+            test_handler(),
         );
         orch.history.push(Content::user("hello"));
         orch.history.push(Content::model("hi"));
@@ -498,10 +637,12 @@ mod tests {
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
+            test_handler(),
         );
         let debug = format!("{:?}", orch);
         assert!(debug.contains("Orchestrator"));
         assert!(debug.contains("Explore"));
+        assert!(debug.contains("has_plan"));
     }
 
     #[test]
@@ -536,6 +677,7 @@ mod tests {
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
+            test_handler(),
         );
         assert_eq!(*orch.mode(), Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
@@ -554,11 +696,77 @@ mod tests {
         // History preserved
         assert_eq!(orch.turn_count(), 2);
 
+        // Switch to Execute mode
+        orch.set_mode(Mode::Execute);
+        assert_eq!(*orch.mode(), Mode::Execute);
+        assert_eq!(orch.tool_count(), 8);
+        assert!(orch.system_prompt().contains("write_file"));
+
         // Switch back to Explore
         orch.set_mode(Mode::Explore);
         assert_eq!(*orch.mode(), Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
         assert!(!orch.system_prompt().contains("spawn_planner"));
+    }
+
+    #[test]
+    fn orchestrator_set_current_plan() {
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Plan,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+        );
+
+        assert!(orch.current_plan().is_none());
+        orch.set_current_plan("Step 1: Add feature X".into());
+        assert_eq!(orch.current_plan(), Some("Step 1: Add feature X"));
+    }
+
+    #[test]
+    fn orchestrator_accept_plan_switches_to_execute() {
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Plan,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+        );
+
+        orch.set_current_plan("The plan content".into());
+        let plan = orch.accept_plan();
+
+        assert!(plan.is_some());
+        assert_eq!(plan.unwrap(), "The plan content");
+        assert_eq!(*orch.mode(), Mode::Execute);
+        assert_eq!(orch.tool_count(), 8); // Now has write tools
+        assert!(orch.current_plan().is_none()); // Plan consumed
+
+        // Plan should be in history
+        let last_user_msg = orch.history.last().unwrap();
+        let text = last_user_msg.parts.first().unwrap();
+        if let Part::Text(t) = text {
+            assert!(t.contains("[ACCEPTED PLAN"));
+            assert!(t.contains("The plan content"));
+        } else {
+            panic!("Expected text part in history");
+        }
+    }
+
+    #[test]
+    fn orchestrator_accept_plan_no_plan() {
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Plan,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+        );
+
+        let plan = orch.accept_plan();
+        assert!(plan.is_none());
+        assert_eq!(*orch.mode(), Mode::Plan); // Mode unchanged
     }
 
     #[test]

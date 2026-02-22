@@ -62,5 +62,11 @@ shlex = "1"
 # Lenient JSON parsing (handles trailing commas from Gemini SSE)
 json5 = "1"
 
+# Diff generation (Myers algorithm)
+similar = "2"
+
+# Interactive terminal prompts (approval y/N)
+dialoguer = "0.11"
+
 [dev-dependencies]
 tempfile = "3"

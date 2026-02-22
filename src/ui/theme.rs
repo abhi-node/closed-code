@@ -10,6 +10,12 @@ impl Theme {
     pub const DIM: Color = Color::DarkGrey;
     pub const ACCENT: Color = Color::Yellow;
     pub const PROMPT: Color = Color::Blue;
+
+    // Phase 4: diff display colors
+    pub const DIFF_ADD: Color = Color::Green;
+    pub const DIFF_DELETE: Color = Color::Red;
+    pub const DIFF_HUNK: Color = Color::Cyan;
+    pub const DIFF_CONTEXT: Color = Color::DarkGrey;
 }
 
 #[cfg(test)]
