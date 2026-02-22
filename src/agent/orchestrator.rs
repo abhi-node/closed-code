@@ -282,6 +282,18 @@ impl Orchestrator {
         format!("{}{}", base, tools_section)
     }
 
+    /// Switch to a different mode at runtime.
+    /// Rebuilds the tool registry and system prompt. Preserves conversation history.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.registry = create_orchestrator_registry(
+            self.working_directory.clone(),
+            &self.mode,
+            self.client.clone(),
+        );
+        self.system_prompt = Self::build_system_prompt(&self.mode, &self.working_directory);
+    }
+
     /// Prune conversation history when it exceeds MAX_CONTEXT_TURNS.
     /// Drops the oldest half, ensuring the first entry has role "user".
     pub fn prune_history(&mut self) {
@@ -515,6 +527,38 @@ mod tests {
         let args = serde_json::json!({"content": long_val});
         let result = format_tool_call("write_file", &args);
         assert!(result.contains("..."));
+    }
+
+    #[test]
+    fn orchestrator_set_mode() {
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            PathBuf::from("/tmp"),
+            8192,
+        );
+        assert_eq!(*orch.mode(), Mode::Explore);
+        assert_eq!(orch.tool_count(), 6);
+
+        // Add some history
+        orch.history.push(Content::user("hello"));
+        orch.history.push(Content::model("hi"));
+
+        // Switch to Plan mode
+        orch.set_mode(Mode::Plan);
+        assert_eq!(*orch.mode(), Mode::Plan);
+        assert_eq!(orch.tool_count(), 8);
+        assert!(orch.system_prompt().contains("spawn_planner"));
+        assert!(orch.system_prompt().contains("spawn_web_search"));
+
+        // History preserved
+        assert_eq!(orch.turn_count(), 2);
+
+        // Switch back to Explore
+        orch.set_mode(Mode::Explore);
+        assert_eq!(*orch.mode(), Mode::Explore);
+        assert_eq!(orch.tool_count(), 6);
+        assert!(!orch.system_prompt().contains("spawn_planner"));
     }
 
     #[test]

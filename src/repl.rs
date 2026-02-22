@@ -87,7 +87,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
     println!("Type /help for commands, /quit to exit.\n");
 
     loop {
-        let prompt = format!("{} > ", config.mode);
+        let prompt = format!("{} > ", orchestrator.mode());
         match editor.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim();
@@ -151,9 +151,37 @@ fn handle_slash_command(input: &str, orchestrator: &mut Orchestrator) -> SlashRe
         }
         "/help" => {
             println!("Commands:");
-            println!("  /help   — Show this help");
-            println!("  /clear  — Clear conversation history");
-            println!("  /quit   — Exit");
+            println!("  /help          — Show this help");
+            println!("  /mode [name]   — Show or switch mode (explore, plan, execute)");
+            println!("  /clear         — Clear conversation history");
+            println!("  /quit          — Exit");
+            SlashResult::Continue
+        }
+        input if input.starts_with("/mode") => {
+            let arg = input.strip_prefix("/mode").unwrap().trim();
+            if arg.is_empty() {
+                println!(
+                    "Current mode: {}. Usage: /mode <explore|plan|execute>",
+                    orchestrator.mode()
+                );
+            } else {
+                match arg.parse::<crate::mode::Mode>() {
+                    Ok(new_mode) => {
+                        orchestrator.set_mode(new_mode);
+                        println!(
+                            "Switched to {} mode. Tools: {}",
+                            new_mode,
+                            orchestrator.tool_count()
+                        );
+                    }
+                    Err(_) => {
+                        println!(
+                            "Invalid mode '{}'. Expected: explore, plan, or execute",
+                            arg
+                        );
+                    }
+                }
+            }
             SlashResult::Continue
         }
         _ => {
@@ -224,6 +252,36 @@ mod tests {
             handle_slash_command("/unknown", &mut orch),
             SlashResult::Continue
         ));
+    }
+
+    #[test]
+    fn slash_mode_switches_mode() {
+        let mut orch = test_orchestrator();
+        assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
+        assert_eq!(orch.tool_count(), 6);
+
+        let result = handle_slash_command("/mode plan", &mut orch);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(*orch.mode(), crate::mode::Mode::Plan);
+        assert_eq!(orch.tool_count(), 8);
+    }
+
+    #[test]
+    fn slash_mode_invalid_stays_unchanged() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/mode bad", &mut orch);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
+        assert_eq!(orch.tool_count(), 6);
+    }
+
+    #[test]
+    fn slash_mode_no_arg_shows_current() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/mode", &mut orch);
+        assert!(matches!(result, SlashResult::Continue));
+        // Mode should not change
+        assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
     }
 
     #[test]
