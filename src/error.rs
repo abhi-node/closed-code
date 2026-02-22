@@ -93,6 +93,16 @@ pub enum ClosedCodeError {
 
     #[error("Approval prompt failed: {0}")]
     ApprovalError(String),
+
+    // Configuration errors (Phase 5)
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
+
+    #[error("Invalid approval policy '{0}'. Expected: suggest, auto_edit, full_auto")]
+    InvalidApprovalPolicy(String),
+
+    #[error("Invalid personality '{0}'. Expected: friendly, pragmatic, none")]
+    InvalidPersonality(String),
 }
 
 impl ClosedCodeError {
@@ -249,6 +259,34 @@ mod tests {
         for err in &errors {
             assert!(!err.is_retryable(), "Expected not retryable: {err}");
         }
+    }
+
+    #[test]
+    fn phase5_errors_are_not_retryable() {
+        let errors: Vec<ClosedCodeError> = vec![
+            ClosedCodeError::ConfigError("bad toml".into()),
+            ClosedCodeError::InvalidApprovalPolicy("bad".into()),
+            ClosedCodeError::InvalidPersonality("bad".into()),
+        ];
+        for err in &errors {
+            assert!(!err.is_retryable(), "Expected not retryable: {err}");
+        }
+    }
+
+    #[test]
+    fn phase5_error_display_messages() {
+        assert_eq!(
+            ClosedCodeError::ConfigError("bad toml".into()).to_string(),
+            "Configuration error: bad toml"
+        );
+        assert_eq!(
+            ClosedCodeError::InvalidApprovalPolicy("bad".into()).to_string(),
+            "Invalid approval policy 'bad'. Expected: suggest, auto_edit, full_auto"
+        );
+        assert_eq!(
+            ClosedCodeError::InvalidPersonality("bad".into()).to_string(),
+            "Invalid personality 'bad'. Expected: friendly, pragmatic, none"
+        );
     }
 
     #[test]

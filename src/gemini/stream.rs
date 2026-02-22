@@ -21,12 +21,16 @@ pub enum StreamEvent {
 #[derive(Debug)]
 pub enum StreamResult {
     /// Normal text completion.
-    Text(String),
+    Text {
+        text: String,
+        usage: Option<UsageMetadata>,
+    },
     /// A function call was detected. Contains the full response with function call parts,
     /// plus any text accumulated before the function call.
     FunctionCall {
         text_so_far: String,
         response: GenerateContentResponse,
+        usage: Option<UsageMetadata>,
     },
 }
 
@@ -71,6 +75,7 @@ pub async fn consume_stream(
     mut on_event: impl FnMut(StreamEvent),
 ) -> Result<StreamResult> {
     let mut full_text = String::new();
+    let mut last_usage: Option<UsageMetadata> = None;
 
     while let Some(event) = es.next().await {
         match event {
@@ -106,11 +111,13 @@ pub async fn consume_stream(
                                     on_event(StreamEvent::TextDelta(text.clone()));
                                 }
                                 Part::FunctionCall { .. } => {
+                                    let usage = response.usage_metadata.clone();
                                     on_event(StreamEvent::FunctionCall(response.clone()));
                                     es.close();
                                     return Ok(StreamResult::FunctionCall {
                                         text_so_far: full_text,
                                         response,
+                                        usage,
                                     });
                                 }
                                 _ => {}
@@ -119,6 +126,9 @@ pub async fn consume_stream(
                     }
 
                     if candidate.finish_reason.is_some() {
+                        if let Some(ref u) = response.usage_metadata {
+                            last_usage = Some(u.clone());
+                        }
                         on_event(StreamEvent::Done {
                             finish_reason: candidate.finish_reason.clone(),
                             usage: response.usage_metadata.clone(),
@@ -134,7 +144,10 @@ pub async fn consume_stream(
         }
     }
 
-    Ok(StreamResult::Text(full_text))
+    Ok(StreamResult::Text {
+        text: full_text,
+        usage: last_usage,
+    })
 }
 
 #[cfg(test)]
@@ -156,9 +169,35 @@ mod tests {
 
     #[test]
     fn stream_result_text_variant() {
-        let result = StreamResult::Text("hello world".into());
+        let result = StreamResult::Text {
+            text: "hello world".into(),
+            usage: None,
+        };
         match result {
-            StreamResult::Text(text) => assert_eq!(text, "hello world"),
+            StreamResult::Text { text, usage } => {
+                assert_eq!(text, "hello world");
+                assert!(usage.is_none());
+            }
+            _ => panic!("Expected StreamResult::Text"),
+        }
+    }
+
+    #[test]
+    fn stream_result_text_with_usage() {
+        let result = StreamResult::Text {
+            text: "hello".into(),
+            usage: Some(UsageMetadata {
+                prompt_token_count: Some(10),
+                candidates_token_count: Some(5),
+                total_token_count: Some(15),
+            }),
+        };
+        match result {
+            StreamResult::Text { text, usage } => {
+                assert_eq!(text, "hello");
+                let u = usage.unwrap();
+                assert_eq!(u.prompt_token_count, Some(10));
+            }
             _ => panic!("Expected StreamResult::Text"),
         }
     }
@@ -185,14 +224,17 @@ mod tests {
         let result = StreamResult::FunctionCall {
             text_so_far: "partial".into(),
             response,
+            usage: None,
         };
         match result {
             StreamResult::FunctionCall {
                 text_so_far,
                 response,
+                usage,
             } => {
                 assert_eq!(text_so_far, "partial");
                 assert!(response.has_function_calls());
+                assert!(usage.is_none());
             }
             _ => panic!("Expected StreamResult::FunctionCall"),
         }

@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::error::Result;
+use crate::config::Personality;
+use crate::error::{ClosedCodeError, Result};
 use crate::gemini::stream::{consume_stream, StreamEvent, StreamResult};
 use crate::gemini::types::{Content, GenerateContentRequest, GenerationConfig, Part};
 use crate::gemini::GeminiClient;
@@ -12,9 +14,10 @@ use crate::mode::Mode;
 use crate::tool::registry::{create_orchestrator_registry, ToolRegistry};
 use crate::ui::approval::ApprovalHandler;
 use crate::ui::spinner::Spinner;
+use crate::ui::usage::SessionUsage;
 
 const MAX_ORCHESTRATOR_ITERATIONS: usize = 30;
-const MAX_CONTEXT_TURNS: usize = 50;
+const MAX_RATE_LIMIT_RETRIES: usize = 5;
 
 /// The main orchestrator that owns the Gemini client, tool registry,
 /// conversation history, and mode-specific system prompt.
@@ -31,6 +34,11 @@ pub struct Orchestrator {
     approval_handler: Arc<dyn ApprovalHandler>,
     current_plan: Option<String>,
     cancelled: Arc<AtomicBool>,
+    // Phase 5
+    personality: Personality,
+    context_window_turns: usize,
+    session_usage: SessionUsage,
+    model_name: String,
 }
 
 impl Orchestrator {
@@ -40,6 +48,8 @@ impl Orchestrator {
         working_directory: PathBuf,
         max_output_tokens: u32,
         approval_handler: Arc<dyn ApprovalHandler>,
+        personality: Personality,
+        context_window_turns: usize,
     ) -> Self {
         let registry = create_orchestrator_registry(
             working_directory.clone(),
@@ -47,7 +57,9 @@ impl Orchestrator {
             client.clone(),
             Some(approval_handler.clone()),
         );
-        let system_prompt = Self::build_system_prompt(&mode, &working_directory);
+        let system_prompt =
+            Self::build_system_prompt(&mode, &working_directory, personality);
+        let model_name = client.model().to_string();
 
         Self {
             client,
@@ -60,6 +72,10 @@ impl Orchestrator {
             approval_handler,
             current_plan: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            personality,
+            context_window_turns,
+            session_usage: SessionUsage::new(),
+            model_name,
         }
     }
 
@@ -77,31 +93,67 @@ impl Orchestrator {
 
         let request = self.build_request();
 
-        let spinner = Spinner::new("Thinking...");
-        let es = self.client.stream_generate_content(&request);
-        let mut spinner_cleared = false;
+        // Stream with rate limit retry
+        let mut rate_limit_retries = 0;
+        let stream_result = loop {
+            let spinner = Spinner::new("Thinking...");
+            let es = self.client.stream_generate_content(&request);
+            let mut spinner_cleared = false;
 
-        let stream_result = consume_stream(es, |event| {
-            if !spinner_cleared {
-                spinner.finish();
-                spinner_cleared = true;
+            match consume_stream(es, |event| {
+                if !spinner_cleared {
+                    spinner.finish();
+                    spinner_cleared = true;
+                }
+                on_event(event);
+            })
+            .await
+            {
+                Ok(result) => {
+                    if !spinner_cleared {
+                        spinner.finish();
+                    }
+                    break result;
+                }
+                Err(ClosedCodeError::RateLimited { retry_after_ms })
+                    if rate_limit_retries < MAX_RATE_LIMIT_RETRIES =>
+                {
+                    spinner.finish();
+                    let delay = crate::gemini::client::with_jitter(
+                        Duration::from_millis(retry_after_ms),
+                    );
+                    display_rate_limit_countdown(delay).await;
+                    rate_limit_retries += 1;
+                    continue;
+                }
+                Err(e) => {
+                    if !spinner_cleared {
+                        spinner.finish();
+                    }
+                    return Err(e);
+                }
             }
-            on_event(event);
-        })
-        .await?;
+        };
 
-        if !spinner_cleared {
-            spinner.finish();
+        // Accumulate usage
+        match &stream_result {
+            StreamResult::Text { usage, .. }
+            | StreamResult::FunctionCall { usage, .. } => {
+                if let Some(u) = usage {
+                    self.session_usage.accumulate(u);
+                }
+            }
         }
 
         match stream_result {
-            StreamResult::Text(text) => {
+            StreamResult::Text { text, .. } => {
                 self.history.push(Content::model(&text));
                 Ok(text)
             }
             StreamResult::FunctionCall {
                 text_so_far,
                 response,
+                ..
             } => {
                 // Append model's function call content to history
                 if let Some(candidate) = response.candidates.first() {
@@ -172,25 +224,60 @@ impl Orchestrator {
 
             let request = self.build_request();
 
-            let spinner = Spinner::new("Thinking...");
-            let es = self.client.stream_generate_content(&request);
-            let mut spinner_cleared = false;
+            // Stream with rate limit retry
+            let mut rate_limit_retries = 0;
+            let stream_result = loop {
+                let spinner = Spinner::new("Thinking...");
+                let es = self.client.stream_generate_content(&request);
+                let mut spinner_cleared = false;
 
-            let stream_result = consume_stream(es, |event| {
-                if !spinner_cleared {
-                    spinner.finish();
-                    spinner_cleared = true;
+                match consume_stream(es, |event| {
+                    if !spinner_cleared {
+                        spinner.finish();
+                        spinner_cleared = true;
+                    }
+                    on_event(event);
+                })
+                .await
+                {
+                    Ok(result) => {
+                        if !spinner_cleared {
+                            spinner.finish();
+                        }
+                        break result;
+                    }
+                    Err(ClosedCodeError::RateLimited { retry_after_ms })
+                        if rate_limit_retries < MAX_RATE_LIMIT_RETRIES =>
+                    {
+                        spinner.finish();
+                        let delay = crate::gemini::client::with_jitter(
+                            Duration::from_millis(retry_after_ms),
+                        );
+                        display_rate_limit_countdown(delay).await;
+                        rate_limit_retries += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        if !spinner_cleared {
+                            spinner.finish();
+                        }
+                        return Err(e);
+                    }
                 }
-                on_event(event);
-            })
-            .await?;
+            };
 
-            if !spinner_cleared {
-                spinner.finish();
+            // Accumulate usage
+            match &stream_result {
+                StreamResult::Text { usage, .. }
+                | StreamResult::FunctionCall { usage, .. } => {
+                    if let Some(u) = usage {
+                        self.session_usage.accumulate(u);
+                    }
+                }
             }
 
             match stream_result {
-                StreamResult::Text(text) => {
+                StreamResult::Text { text, .. } => {
                     final_text.push_str(&text);
                     self.history.push(Content::model(&text));
                     break;
@@ -198,6 +285,7 @@ impl Orchestrator {
                 StreamResult::FunctionCall {
                     text_so_far,
                     response,
+                    ..
                 } => {
                     final_text.push_str(&text_so_far);
                     if !text_so_far.is_empty() {
@@ -276,11 +364,29 @@ impl Orchestrator {
         }
     }
 
-    /// Build the mode-specific system prompt.
-    fn build_system_prompt(mode: &Mode, working_directory: &std::path::Path) -> String {
+    /// Build the mode-specific system prompt with personality prefix.
+    fn build_system_prompt(
+        mode: &Mode,
+        working_directory: &std::path::Path,
+        personality: Personality,
+    ) -> String {
+        let personality_prefix = match personality {
+            Personality::Friendly => {
+                "You are warm, encouraging, and approachable. Use casual but \
+                 professional language. Celebrate progress and be supportive \
+                 when users encounter issues.\n\n"
+            }
+            Personality::Pragmatic => {
+                "You are direct, concise, and code-focused. Get straight to \
+                 the point. Prioritize accuracy and efficiency in your responses.\n\n"
+            }
+            Personality::None => "",
+        };
+
         let base = format!(
-            "You are closed-code, an AI coding assistant operating in {} mode.\n\
+            "{}You are closed-code, an AI coding assistant operating in {} mode.\n\
              Working directory: {}",
+            personality_prefix,
             mode,
             working_directory.display()
         );
@@ -354,17 +460,29 @@ impl Orchestrator {
             self.client.clone(),
             Some(self.approval_handler.clone()),
         );
-        self.system_prompt = Self::build_system_prompt(&self.mode, &self.working_directory);
+        self.system_prompt =
+            Self::build_system_prompt(&self.mode, &self.working_directory, self.personality);
     }
 
-    /// Prune conversation history when it exceeds MAX_CONTEXT_TURNS.
+    /// Prune conversation history when it exceeds context_window_turns.
     /// Drops the oldest half, ensuring the first entry has role "user".
     pub fn prune_history(&mut self) {
-        if self.history.len() <= MAX_CONTEXT_TURNS {
+        // Warn at 80% threshold
+        let threshold = (self.context_window_turns as f64 * 0.8) as usize;
+        if self.history.len() == threshold {
+            eprintln!(
+                "Warning: Approaching context limit ({}/{} turns). Consider /clear or conversation will be pruned.",
+                self.history.len(),
+                self.context_window_turns,
+            );
+        }
+
+        if self.history.len() <= self.context_window_turns {
             return;
         }
 
-        let keep = self.history.len() / 2;
+        let keep = self.context_window_turns / 2;
+        let pruned_count = self.history.len() - keep;
         self.history = self.history.split_off(self.history.len() - keep);
 
         // Ensure the first message is from the user
@@ -381,6 +499,12 @@ impl Orchestrator {
                 Content::user("[Earlier conversation context was pruned]"),
             );
         }
+
+        eprintln!(
+            "Context pruned: removed {} oldest turns ({} remaining)",
+            pruned_count,
+            self.history.len()
+        );
     }
 
     /// Clear the conversation history.
@@ -458,6 +582,50 @@ impl Orchestrator {
         self.history
             .push(Content::model("[Response interrupted by user]"));
     }
+
+    // ── Phase 5 getters/setters ──
+
+    /// Get current personality.
+    pub fn personality(&self) -> Personality {
+        self.personality
+    }
+
+    /// Set personality and rebuild system prompt.
+    pub fn set_personality(&mut self, personality: Personality) {
+        self.personality = personality;
+        self.system_prompt =
+            Self::build_system_prompt(&self.mode, &self.working_directory, self.personality);
+    }
+
+    /// Get current model name.
+    pub fn model(&self) -> &str {
+        &self.model_name
+    }
+
+    /// Switch model. Rebuilds client and tool registry.
+    pub fn set_model(&mut self, model: String) {
+        self.model_name = model.clone();
+        self.client = Arc::new(GeminiClient::new(
+            self.client.api_key().to_string(),
+            model,
+        ));
+        self.registry = create_orchestrator_registry(
+            self.working_directory.clone(),
+            &self.mode,
+            self.client.clone(),
+            Some(self.approval_handler.clone()),
+        );
+    }
+
+    /// Get cumulative token usage.
+    pub fn session_usage(&self) -> &SessionUsage {
+        &self.session_usage
+    }
+
+    /// Get configured context window size.
+    pub fn context_window_turns(&self) -> usize {
+        self.context_window_turns
+    }
 }
 
 impl std::fmt::Debug for Orchestrator {
@@ -468,8 +636,22 @@ impl std::fmt::Debug for Orchestrator {
             .field("history_len", &self.history.len())
             .field("has_plan", &self.current_plan.is_some())
             .field("cancelled", &self.is_cancelled())
+            .field("personality", &self.personality)
+            .field("model", &self.model_name)
             .finish()
     }
+}
+
+/// Display a countdown while waiting for rate limit retry.
+async fn display_rate_limit_countdown(delay: Duration) {
+    use std::io::Write;
+    let secs = delay.as_secs();
+    for remaining in (1..=secs).rev() {
+        eprint!("\rRate limited. Retrying in {}s... ", remaining);
+        std::io::stderr().flush().ok();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    eprintln!("\rRetrying now...                    ");
 }
 
 /// Format a tool call for display: `tool_name(key: "value", key2: 123)`
@@ -518,15 +700,21 @@ mod tests {
         Arc::new(AutoApproveHandler::always_approve())
     }
 
-    #[test]
-    fn orchestrator_new_explore_mode() {
-        let orch = Orchestrator::new(
+    fn test_orchestrator() -> Orchestrator {
+        Orchestrator::new(
             test_client(),
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
-        );
+            Personality::default(),
+            50,
+        )
+    }
+
+    #[test]
+    fn orchestrator_new_explore_mode() {
+        let orch = test_orchestrator();
         // 5 filesystem/shell + spawn_explorer = 6
         assert_eq!(orch.tool_count(), 6);
         assert_eq!(*orch.mode(), Mode::Explore);
@@ -542,6 +730,8 @@ mod tests {
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            50,
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
         assert_eq!(orch.tool_count(), 8);
@@ -558,6 +748,8 @@ mod tests {
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            50,
         );
         // 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
         assert_eq!(orch.tool_count(), 8);
@@ -568,14 +760,7 @@ mod tests {
 
     #[test]
     fn orchestrator_clear_history() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-        );
-        // Simulate some conversation
+        let mut orch = test_orchestrator();
         orch.history.push(Content::user("hello"));
         orch.history.push(Content::model("hi there"));
         assert_eq!(orch.turn_count(), 2);
@@ -587,15 +772,9 @@ mod tests {
 
     #[test]
     fn orchestrator_prune_history() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-        );
+        let mut orch = test_orchestrator();
 
-        // Fill history beyond MAX_CONTEXT_TURNS
+        // Fill history beyond context_window_turns
         for i in 0..60 {
             if i % 2 == 0 {
                 orch.history.push(Content::user(&format!("msg {}", i)));
@@ -606,7 +785,7 @@ mod tests {
         assert_eq!(orch.turn_count(), 60);
 
         orch.prune_history();
-        assert!(orch.turn_count() <= MAX_CONTEXT_TURNS);
+        assert!(orch.turn_count() <= 50);
 
         // First entry should be role "user"
         let first_role = orch.history[0].role.as_deref();
@@ -615,13 +794,7 @@ mod tests {
 
     #[test]
     fn orchestrator_prune_no_op_when_small() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-        );
+        let mut orch = test_orchestrator();
         orch.history.push(Content::user("hello"));
         orch.history.push(Content::model("hi"));
         assert_eq!(orch.turn_count(), 2);
@@ -631,18 +804,39 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_debug_format() {
-        let orch = Orchestrator::new(
+    fn prune_configurable_turns() {
+        let mut orch = Orchestrator::new(
             test_client(),
             Mode::Explore,
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            20, // smaller context window
         );
+
+        for i in 0..30 {
+            if i % 2 == 0 {
+                orch.history.push(Content::user(&format!("msg {}", i)));
+            } else {
+                orch.history.push(Content::model(&format!("reply {}", i)));
+            }
+        }
+        assert_eq!(orch.turn_count(), 30);
+
+        orch.prune_history();
+        assert!(orch.turn_count() <= 20);
+    }
+
+    #[test]
+    fn orchestrator_debug_format() {
+        let orch = test_orchestrator();
         let debug = format!("{:?}", orch);
         assert!(debug.contains("Orchestrator"));
         assert!(debug.contains("Explore"));
         assert!(debug.contains("has_plan"));
+        assert!(debug.contains("personality"));
+        assert!(debug.contains("model"));
     }
 
     #[test]
@@ -672,13 +866,7 @@ mod tests {
 
     #[test]
     fn orchestrator_set_mode() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-        );
+        let mut orch = test_orchestrator();
         assert_eq!(*orch.mode(), Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
 
@@ -717,6 +905,8 @@ mod tests {
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            50,
         );
 
         assert!(orch.current_plan().is_none());
@@ -732,6 +922,8 @@ mod tests {
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            50,
         );
 
         orch.set_current_plan("The plan content".into());
@@ -762,6 +954,8 @@ mod tests {
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            50,
         );
 
         let plan = orch.accept_plan();
@@ -774,8 +968,120 @@ mod tests {
         assert_eq!(MAX_ORCHESTRATOR_ITERATIONS, 30);
     }
 
+    // ── Phase 5: Personality Tests ──
+
     #[test]
-    fn max_context_turns_constant() {
-        assert_eq!(MAX_CONTEXT_TURNS, 50);
+    fn orchestrator_friendly_prompt() {
+        let orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::Friendly,
+            50,
+        );
+        assert!(orch.system_prompt().contains("warm"));
+        assert!(orch.system_prompt().contains("encouraging"));
+    }
+
+    #[test]
+    fn orchestrator_pragmatic_prompt() {
+        let orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::Pragmatic,
+            50,
+        );
+        assert!(orch.system_prompt().contains("direct"));
+        assert!(orch.system_prompt().contains("concise"));
+    }
+
+    #[test]
+    fn orchestrator_none_prompt() {
+        let orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::None,
+            50,
+        );
+        assert!(!orch.system_prompt().contains("warm"));
+        assert!(!orch.system_prompt().contains("concise, and code-focused"));
+        assert!(orch.system_prompt().contains("closed-code"));
+    }
+
+    #[test]
+    fn set_personality_rebuilds_prompt() {
+        let mut orch = test_orchestrator();
+        assert!(orch.system_prompt().contains("concise, and code-focused")); // default is Pragmatic
+
+        orch.set_personality(Personality::Friendly);
+        assert!(orch.system_prompt().contains("warm"));
+        assert!(!orch.system_prompt().contains("concise, and code-focused"));
+        assert_eq!(orch.personality(), Personality::Friendly);
+    }
+
+    #[test]
+    fn set_mode_preserves_personality() {
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::Friendly,
+            50,
+        );
+        assert!(orch.system_prompt().contains("warm"));
+
+        orch.set_mode(Mode::Plan);
+        assert!(orch.system_prompt().contains("warm"));
+        assert_eq!(orch.personality(), Personality::Friendly);
+    }
+
+    // ── Phase 5: Model + Usage + Context ──
+
+    #[test]
+    fn model_getter() {
+        let orch = test_orchestrator();
+        assert_eq!(orch.model(), "model");
+    }
+
+    #[test]
+    fn set_model_changes_name() {
+        let mut orch = test_orchestrator();
+        orch.set_model("gemini-2.0-flash".into());
+        assert_eq!(orch.model(), "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn session_usage_starts_empty() {
+        let orch = test_orchestrator();
+        let usage = orch.session_usage();
+        assert_eq!(usage.total_tokens, 0);
+        assert_eq!(usage.api_calls, 0);
+    }
+
+    #[test]
+    fn context_window_getter() {
+        let orch = test_orchestrator();
+        assert_eq!(orch.context_window_turns(), 50);
+
+        let orch2 = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::default(),
+            100,
+        );
+        assert_eq!(orch2.context_window_turns(), 100);
     }
 }

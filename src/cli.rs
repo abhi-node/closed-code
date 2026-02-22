@@ -24,6 +24,22 @@ pub struct Cli {
     #[arg(short, long)]
     pub verbose: bool,
 
+    /// Approval policy: suggest, auto_edit, full_auto
+    #[arg(long)]
+    pub approval_policy: Option<String>,
+
+    /// Personality: friendly, pragmatic, none
+    #[arg(long)]
+    pub personality: Option<String>,
+
+    /// Max context window turns before pruning
+    #[arg(long)]
+    pub context_window_turns: Option<usize>,
+
+    /// Max output tokens per response
+    #[arg(long)]
+    pub max_output_tokens: Option<u32>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -89,5 +105,38 @@ mod tests {
     fn parse_api_key_flag() {
         let cli = Cli::parse_from(["closed-code", "--api-key", "test-key-123"]);
         assert_eq!(cli.api_key.unwrap(), "test-key-123");
+    }
+
+    #[test]
+    fn parse_approval_policy_flag() {
+        let cli = Cli::parse_from(["closed-code", "--approval-policy", "full_auto"]);
+        assert_eq!(cli.approval_policy.as_deref(), Some("full_auto"));
+    }
+
+    #[test]
+    fn parse_personality_flag() {
+        let cli = Cli::parse_from(["closed-code", "--personality", "friendly"]);
+        assert_eq!(cli.personality.as_deref(), Some("friendly"));
+    }
+
+    #[test]
+    fn parse_context_window_turns_flag() {
+        let cli = Cli::parse_from(["closed-code", "--context-window-turns", "100"]);
+        assert_eq!(cli.context_window_turns, Some(100));
+    }
+
+    #[test]
+    fn parse_max_output_tokens_flag() {
+        let cli = Cli::parse_from(["closed-code", "--max-output-tokens", "4096"]);
+        assert_eq!(cli.max_output_tokens, Some(4096));
+    }
+
+    #[test]
+    fn new_flags_default_to_none() {
+        let cli = Cli::parse_from(["closed-code"]);
+        assert!(cli.approval_policy.is_none());
+        assert!(cli.personality.is_none());
+        assert!(cli.context_window_turns.is_none());
+        assert!(cli.max_output_tokens.is_none());
     }
 }

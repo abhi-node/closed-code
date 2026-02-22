@@ -24,6 +24,16 @@ impl GeminiClient {
         }
     }
 
+    /// Get the API key (needed for model switching to reconstruct client).
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    /// Get the model name.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     fn url(&self, method: &str) -> String {
         format!("{}/models/{}:{}", self.base_url, self.model, method)
     }
@@ -87,6 +97,26 @@ impl GeminiClient {
     }
 }
 
+/// Parse Retry-After header from a 429 response.
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(Duration::from_secs)
+}
+
+/// Add jitter to a duration (±25%).
+pub fn with_jitter(duration: Duration) -> Duration {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let jitter_factor = 0.75 + (nanos as f64 / u32::MAX as f64) * 0.5; // 0.75–1.25
+    Duration::from_millis((duration.as_millis() as f64 * jitter_factor) as u64)
+}
+
 impl fmt::Debug for GeminiClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GeminiClient")
@@ -121,5 +151,48 @@ mod tests {
         assert!(!debug_output.contains("super-secret-key"));
         assert!(debug_output.contains("[REDACTED]"));
         assert!(debug_output.contains("test-model"));
+    }
+
+    #[test]
+    fn api_key_getter() {
+        let client = GeminiClient::new("my-key".into(), "model".into());
+        assert_eq!(client.api_key(), "my-key");
+    }
+
+    #[test]
+    fn model_getter() {
+        let client = GeminiClient::new("key".into(), "gemini-2.0-flash".into());
+        assert_eq!(client.model(), "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn retry_after_parsing() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "5".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_after_missing() {
+        let headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn retry_after_non_numeric() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "not-a-number".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn jitter_within_range() {
+        let base = Duration::from_secs(10);
+        let jittered = with_jitter(base);
+        // Should be within 75%–125% of base
+        let min = Duration::from_millis(7500);
+        let max = Duration::from_millis(12500);
+        assert!(jittered >= min, "jittered {:?} < min {:?}", jittered, min);
+        assert!(jittered <= max, "jittered {:?} > max {:?}", jittered, max);
     }
 }

@@ -1,42 +1,281 @@
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use serde::Deserialize;
 
 use crate::cli::Cli;
 use crate::error::ClosedCodeError;
 use crate::mode::Mode;
 
-#[derive(Debug)]
+// ── Approval Policy ──
+
+/// Approval policy for file writes and shell commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// Prompt for file writes AND shell commands (default).
+    Suggest,
+    /// Auto-approve file operations, prompt for shell commands.
+    AutoEdit,
+    /// Fully autonomous, no prompts.
+    FullAuto,
+}
+
+impl Default for ApprovalPolicy {
+    fn default() -> Self {
+        Self::Suggest
+    }
+}
+
+impl fmt::Display for ApprovalPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Suggest => write!(f, "suggest"),
+            Self::AutoEdit => write!(f, "auto_edit"),
+            Self::FullAuto => write!(f, "full_auto"),
+        }
+    }
+}
+
+impl FromStr for ApprovalPolicy {
+    type Err = ClosedCodeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "suggest" => Ok(Self::Suggest),
+            "auto_edit" | "autoedit" => Ok(Self::AutoEdit),
+            "full_auto" | "fullauto" => Ok(Self::FullAuto),
+            _ => Err(ClosedCodeError::InvalidApprovalPolicy(s.to_string())),
+        }
+    }
+}
+
+// ── Personality ──
+
+/// Personality style that modifies the system prompt prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Personality {
+    /// Warm, encouraging, casual language.
+    Friendly,
+    /// Direct, concise, code-focused.
+    Pragmatic,
+    /// Minimal personality, just answers.
+    None,
+}
+
+impl Default for Personality {
+    fn default() -> Self {
+        Self::Pragmatic
+    }
+}
+
+impl fmt::Display for Personality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Friendly => write!(f, "friendly"),
+            Self::Pragmatic => write!(f, "pragmatic"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+impl FromStr for Personality {
+    type Err = ClosedCodeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "friendly" => Ok(Self::Friendly),
+            "pragmatic" => Ok(Self::Pragmatic),
+            "none" => Ok(Self::None),
+            _ => Err(ClosedCodeError::InvalidPersonality(s.to_string())),
+        }
+    }
+}
+
+// ── TOML Config (intermediate, all fields optional for layered merging) ──
+
+#[derive(Debug, Default, Deserialize)]
+pub struct TomlConfig {
+    pub api_key: Option<String>,
+    pub model: Option<String>,
+    pub default_mode: Option<String>,
+    pub approval_policy: Option<String>,
+    pub personality: Option<String>,
+    pub context_window_turns: Option<usize>,
+    pub max_output_tokens: Option<u32>,
+    pub verbose: Option<bool>,
+    #[serde(default)]
+    pub shell: Option<ShellConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ShellConfig {
+    pub additional_allowlist: Option<Vec<String>>,
+}
+
+// ── Final Config ──
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub api_key: String,
     pub model: String,
     pub mode: Mode,
     pub working_directory: PathBuf,
+    pub approval_policy: ApprovalPolicy,
+    pub personality: Personality,
+    pub shell_additional_allowlist: Vec<String>,
+    pub context_window_turns: usize,
     pub verbose: bool,
     pub max_output_tokens: u32,
 }
 
 impl Config {
+    /// Build final Config from CLI args, layered TOML files, and env vars.
+    ///
+    /// Resolution order (later wins):
+    ///   hardcoded defaults → ~/.closed-code/config.toml → <working_dir>/.closed-code/config.toml → env → CLI
     pub fn from_cli(cli: &Cli) -> crate::error::Result<Self> {
-        let api_key = cli
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
-            .ok_or(ClosedCodeError::MissingApiKey)?;
-
-        let mode = cli.mode.parse::<Mode>()?;
-
+        // Determine working directory early (needed for project config path)
         let working_directory = cli
             .directory
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+        // Load and merge TOML layers
+        let user_toml = Self::load_user_config()?;
+        let project_toml = Self::load_project_config(&working_directory)?;
+
+        let merged = match (user_toml, project_toml) {
+            (Some(base), Some(overlay)) => Self::merge(base, overlay),
+            (Some(config), None) | (None, Some(config)) => config,
+            (None, None) => TomlConfig::default(),
+        };
+
+        // Resolve each field: TOML merged → env → CLI (CLI wins)
+        let api_key = cli
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            .or(merged.api_key)
+            .ok_or(ClosedCodeError::MissingApiKey)?;
+
+        let model = cli.model.clone();
+        // If user didn't pass --model explicitly, check TOML
+        // clap gives the default_value, so we can't easily distinguish.
+        // Workaround: if TOML has model and CLI has the default, use TOML.
+        // For simplicity, CLI always wins since clap provides a default.
+        let model = merged.model.unwrap_or(model);
+        // But CLI flag should override TOML — re-check if user explicitly passed --model
+        // clap doesn't distinguish "default" vs "explicit". We use a simple heuristic:
+        // if the cli.model != default, the user explicitly set it.
+        let model = if cli.model != "gemini-3.1-pro-preview" {
+            cli.model.clone()
+        } else {
+            model
+        };
+
+        let mode_str = if cli.mode != "explore" {
+            cli.mode.clone()
+        } else {
+            merged.default_mode.unwrap_or_else(|| cli.mode.clone())
+        };
+        let mode = mode_str.parse::<Mode>()?;
+
+        let approval_policy = if let Some(ref ap) = cli.approval_policy {
+            ap.parse::<ApprovalPolicy>()?
+        } else if let Some(ref ap) = merged.approval_policy {
+            ap.parse::<ApprovalPolicy>()?
+        } else {
+            ApprovalPolicy::default()
+        };
+
+        let personality = if let Some(ref p) = cli.personality {
+            p.parse::<Personality>()?
+        } else if let Some(ref p) = merged.personality {
+            p.parse::<Personality>()?
+        } else {
+            Personality::default()
+        };
+
+        let context_window_turns = cli
+            .context_window_turns
+            .or(merged.context_window_turns)
+            .unwrap_or(50);
+
+        let max_output_tokens = cli
+            .max_output_tokens
+            .or(merged.max_output_tokens)
+            .unwrap_or(8192);
+
+        let verbose = cli.verbose || merged.verbose.unwrap_or(false);
+
+        let shell_additional_allowlist = merged
+            .shell
+            .and_then(|s| s.additional_allowlist)
+            .unwrap_or_default();
+
         Ok(Self {
             api_key,
-            model: cli.model.clone(),
+            model,
             mode,
             working_directory,
-            verbose: cli.verbose,
-            max_output_tokens: 8192,
+            approval_policy,
+            personality,
+            shell_additional_allowlist,
+            context_window_turns,
+            verbose,
+            max_output_tokens,
         })
+    }
+
+    /// Load and parse a TOML file, returning None if it doesn't exist.
+    fn load_toml_file(path: &Path) -> crate::error::Result<Option<TomlConfig>> {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                let config: TomlConfig = toml::from_str(&contents)
+                    .map_err(|e| ClosedCodeError::ConfigError(format!("{}: {}", path.display(), e)))?;
+                Ok(Some(config))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ClosedCodeError::ConfigError(format!(
+                "Failed to read {}: {}",
+                path.display(),
+                e
+            ))),
+        }
+    }
+
+    /// Merge two TomlConfig layers (overlay wins for present fields).
+    fn merge(base: TomlConfig, overlay: TomlConfig) -> TomlConfig {
+        TomlConfig {
+            api_key: overlay.api_key.or(base.api_key),
+            model: overlay.model.or(base.model),
+            default_mode: overlay.default_mode.or(base.default_mode),
+            approval_policy: overlay.approval_policy.or(base.approval_policy),
+            personality: overlay.personality.or(base.personality),
+            context_window_turns: overlay.context_window_turns.or(base.context_window_turns),
+            max_output_tokens: overlay.max_output_tokens.or(base.max_output_tokens),
+            verbose: overlay.verbose.or(base.verbose),
+            shell: overlay.shell.or(base.shell),
+        }
+    }
+
+    /// Load user config from ~/.closed-code/config.toml.
+    fn load_user_config() -> crate::error::Result<Option<TomlConfig>> {
+        if let Some(home) = dirs::home_dir() {
+            let path = home.join(".closed-code").join("config.toml");
+            Self::load_toml_file(&path)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load project config from <working_dir>/.closed-code/config.toml.
+    fn load_project_config(working_dir: &Path) -> crate::error::Result<Option<TomlConfig>> {
+        let path = working_dir.join(".closed-code").join("config.toml");
+        Self::load_toml_file(&path)
     }
 }
 
@@ -46,18 +285,21 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn config_from_cli_with_api_key() {
+    fn config_from_cli_defaults() {
         let cli = Cli::parse_from(["closed-code", "--api-key", "test-key"]);
         let config = Config::from_cli(&cli).unwrap();
         assert_eq!(config.api_key, "test-key");
-        assert_eq!(config.model, "gemini-3.1-pro-preview");
         assert_eq!(config.mode, Mode::Explore);
+        assert_eq!(config.approval_policy, ApprovalPolicy::Suggest);
+        assert_eq!(config.personality, Personality::Pragmatic);
+        assert_eq!(config.context_window_turns, 50);
         assert_eq!(config.max_output_tokens, 8192);
+        assert!(!config.verbose);
+        assert!(config.shell_additional_allowlist.is_empty());
     }
 
     #[test]
     fn config_from_cli_missing_api_key() {
-        // Unset the env var for this test
         std::env::remove_var("GEMINI_API_KEY");
         let cli = Cli::parse_from(["closed-code"]);
         let result = Config::from_cli(&cli);
@@ -94,5 +336,165 @@ mod tests {
         let cli = Cli::parse_from(["closed-code", "--api-key", "k", "-v"]);
         let config = Config::from_cli(&cli).unwrap();
         assert!(config.verbose);
+    }
+
+    #[test]
+    fn config_from_cli_with_new_flags() {
+        let cli = Cli::parse_from([
+            "closed-code",
+            "--api-key",
+            "k",
+            "--approval-policy",
+            "full_auto",
+            "--personality",
+            "friendly",
+            "--context-window-turns",
+            "100",
+            "--max-output-tokens",
+            "4096",
+        ]);
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(config.approval_policy, ApprovalPolicy::FullAuto);
+        assert_eq!(config.personality, Personality::Friendly);
+        assert_eq!(config.context_window_turns, 100);
+        assert_eq!(config.max_output_tokens, 4096);
+    }
+
+    // ── TOML parsing ──
+
+    #[test]
+    fn config_toml_parsing() {
+        let toml_str = r#"
+api_key = "toml-key"
+model = "gemini-2.0-flash"
+default_mode = "plan"
+approval_policy = "auto_edit"
+personality = "friendly"
+context_window_turns = 100
+max_output_tokens = 4096
+verbose = true
+
+[shell]
+additional_allowlist = ["docker", "cargo"]
+"#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.api_key.as_deref(), Some("toml-key"));
+        assert_eq!(config.model.as_deref(), Some("gemini-2.0-flash"));
+        assert_eq!(config.default_mode.as_deref(), Some("plan"));
+        assert_eq!(config.approval_policy.as_deref(), Some("auto_edit"));
+        assert_eq!(config.personality.as_deref(), Some("friendly"));
+        assert_eq!(config.context_window_turns, Some(100));
+        assert_eq!(config.max_output_tokens, Some(4096));
+        assert_eq!(config.verbose, Some(true));
+        let shell = config.shell.unwrap();
+        assert_eq!(
+            shell.additional_allowlist.unwrap(),
+            vec!["docker", "cargo"]
+        );
+    }
+
+    #[test]
+    fn config_toml_empty() {
+        let config: TomlConfig = toml::from_str("").unwrap();
+        assert!(config.api_key.is_none());
+        assert!(config.model.is_none());
+    }
+
+    // ── Merge ──
+
+    #[test]
+    fn config_merge_overlay_wins() {
+        let base = TomlConfig {
+            model: Some("base-model".into()),
+            personality: Some("pragmatic".into()),
+            ..Default::default()
+        };
+        let overlay = TomlConfig {
+            model: Some("overlay-model".into()),
+            ..Default::default()
+        };
+        let merged = Config::merge(base, overlay);
+        assert_eq!(merged.model.as_deref(), Some("overlay-model"));
+        assert_eq!(merged.personality.as_deref(), Some("pragmatic"));
+    }
+
+    #[test]
+    fn config_merge_none_preserves_base() {
+        let base = TomlConfig {
+            model: Some("base-model".into()),
+            approval_policy: Some("suggest".into()),
+            ..Default::default()
+        };
+        let overlay = TomlConfig::default();
+        let merged = Config::merge(base, overlay);
+        assert_eq!(merged.model.as_deref(), Some("base-model"));
+        assert_eq!(merged.approval_policy.as_deref(), Some("suggest"));
+    }
+
+    // ── ApprovalPolicy ──
+
+    #[test]
+    fn approval_policy_from_str() {
+        assert_eq!("suggest".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::Suggest);
+        assert_eq!("auto_edit".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::AutoEdit);
+        assert_eq!("autoedit".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::AutoEdit);
+        assert_eq!("full_auto".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::FullAuto);
+        assert_eq!("fullauto".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::FullAuto);
+        assert_eq!("SUGGEST".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::Suggest);
+        assert_eq!("Full_Auto".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::FullAuto);
+    }
+
+    #[test]
+    fn approval_policy_from_str_invalid() {
+        let result = "bad".parse::<ApprovalPolicy>();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::InvalidApprovalPolicy(_)
+        ));
+    }
+
+    #[test]
+    fn approval_policy_default() {
+        assert_eq!(ApprovalPolicy::default(), ApprovalPolicy::Suggest);
+    }
+
+    #[test]
+    fn approval_policy_display() {
+        assert_eq!(ApprovalPolicy::Suggest.to_string(), "suggest");
+        assert_eq!(ApprovalPolicy::AutoEdit.to_string(), "auto_edit");
+        assert_eq!(ApprovalPolicy::FullAuto.to_string(), "full_auto");
+    }
+
+    // ── Personality ──
+
+    #[test]
+    fn personality_from_str() {
+        assert_eq!("friendly".parse::<Personality>().unwrap(), Personality::Friendly);
+        assert_eq!("pragmatic".parse::<Personality>().unwrap(), Personality::Pragmatic);
+        assert_eq!("none".parse::<Personality>().unwrap(), Personality::None);
+        assert_eq!("FRIENDLY".parse::<Personality>().unwrap(), Personality::Friendly);
+    }
+
+    #[test]
+    fn personality_from_str_invalid() {
+        let result = "bad".parse::<Personality>();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::InvalidPersonality(_)
+        ));
+    }
+
+    #[test]
+    fn personality_default() {
+        assert_eq!(Personality::default(), Personality::Pragmatic);
+    }
+
+    #[test]
+    fn personality_display() {
+        assert_eq!(Personality::Friendly.to_string(), "friendly");
+        assert_eq!(Personality::Pragmatic.to_string(), "pragmatic");
+        assert_eq!(Personality::None.to_string(), "none");
     }
 }

@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -7,10 +8,10 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
 use crate::agent::orchestrator::Orchestrator;
-use crate::config::Config;
+use crate::config::{ApprovalPolicy, Config, Personality};
 use crate::gemini::stream::StreamEvent;
 use crate::gemini::GeminiClient;
-use crate::ui::approval::TerminalApprovalHandler;
+use crate::ui::approval::PolicyAwareApprovalHandler;
 use crate::ui::theme::Theme;
 
 fn styled_text(text: &str, color: crossterm::style::Color) -> String {
@@ -50,18 +51,34 @@ fn drain_stdin() {
     }
 }
 
+/// Execute a local shell command (for the ! prefix).
+async fn execute_local_shell(
+    cmd: &str,
+    working_directory: &Path,
+) -> anyhow::Result<std::process::Output> {
+    tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(working_directory)
+        .output()
+        .await
+        .map_err(Into::into)
+}
+
 pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> {
     let client = Arc::new(GeminiClient::new(
         config.api_key.clone(),
         config.model.clone(),
     ));
-    let approval_handler = Arc::new(TerminalApprovalHandler::new());
+    let approval_handler = Arc::new(PolicyAwareApprovalHandler::new(config.approval_policy));
     let mut orchestrator = Orchestrator::new(
         client,
         config.mode,
         config.working_directory.clone(),
         config.max_output_tokens,
         approval_handler,
+        config.personality,
+        config.context_window_turns,
     );
 
     match orchestrator
@@ -84,13 +101,15 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         config.api_key.clone(),
         config.model.clone(),
     ));
-    let approval_handler = Arc::new(TerminalApprovalHandler::new());
+    let approval_handler = Arc::new(PolicyAwareApprovalHandler::new(config.approval_policy));
     let mut orchestrator = Orchestrator::new(
         client,
         config.mode,
         config.working_directory.clone(),
         config.max_output_tokens,
-        approval_handler,
+        approval_handler.clone(),
+        config.personality,
+        config.context_window_turns,
     );
     let mut editor = DefaultEditor::new()?;
 
@@ -127,8 +146,38 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
                 }
                 let _ = editor.add_history_entry(line);
 
+                // Shell prefix: !command runs a local shell command
+                if line.starts_with('!') {
+                    let shell_cmd = &line[1..];
+                    if !shell_cmd.is_empty() {
+                        match execute_local_shell(shell_cmd, &config.working_directory)
+                            .await
+                        {
+                            Ok(output) => {
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                if !stdout.is_empty() {
+                                    print!("{}", stdout);
+                                }
+                                if !stderr.is_empty() {
+                                    eprint!("{}", stderr);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "{}: {}",
+                                    styled_text("Error", Theme::ERROR),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if line.starts_with('/') {
-                    match handle_slash_command(line, &mut orchestrator) {
+                    match handle_slash_command(line, &mut orchestrator, &approval_handler)
+                    {
                         SlashResult::Continue => continue,
                         SlashResult::Quit => break,
                         SlashResult::ExecutePlan => {
@@ -219,8 +268,17 @@ enum SlashResult {
     ExecutePlan,
 }
 
-fn handle_slash_command(input: &str, orchestrator: &mut Orchestrator) -> SlashResult {
-    match input {
+fn handle_slash_command(
+    input: &str,
+    orchestrator: &mut Orchestrator,
+    approval_handler: &PolicyAwareApprovalHandler,
+) -> SlashResult {
+    let (cmd, arg) = match input.find(' ') {
+        Some(pos) => (&input[..pos], input[pos + 1..].trim()),
+        None => (input, ""),
+    };
+
+    match cmd {
         "/quit" | "/exit" | "/q" => SlashResult::Quit,
         "/clear" => {
             orchestrator.clear_history();
@@ -255,17 +313,102 @@ fn handle_slash_command(input: &str, orchestrator: &mut Orchestrator) -> SlashRe
         }
         "/help" => {
             println!("Commands:");
-            println!("  /help          \u{2014} Show this help");
-            println!("  /mode [name]   \u{2014} Show or switch mode (explore, plan, execute)");
-            println!("  /accept        \u{2014} Accept the current plan and switch to Execute mode");
-            println!("  /clear         \u{2014} Clear conversation history");
-            println!("  /quit          \u{2014} Exit");
+            println!("  /help              \u{2014} Show this help");
+            println!("  /mode [name]       \u{2014} Show or switch mode (explore, plan, execute)");
+            println!("  /explore           \u{2014} Switch to Explore mode");
+            println!("  /plan              \u{2014} Switch to Plan mode");
+            println!("  /execute           \u{2014} Switch to Execute mode");
+            println!("  /accept            \u{2014} Accept the current plan and switch to Execute mode");
+            println!("  /model [name]      \u{2014} Show or switch model");
+            println!("  /permissions [p]   \u{2014} Show or change approval policy (suggest, auto_edit, full_auto)");
+            println!("  /personality [s]   \u{2014} Show or change personality (friendly, pragmatic, none)");
+            println!("  /status            \u{2014} Show session status (tokens, model, mode, etc.)");
+            println!("  /clear             \u{2014} Clear conversation history");
+            println!("  /quit              \u{2014} Exit");
             println!();
-            println!("  Ctrl+C         \u{2014} Interrupt model while it is running");
+            println!("  !<command>         \u{2014} Run a local shell command");
+            println!("  Ctrl+C             \u{2014} Interrupt model while it is running");
             SlashResult::Continue
         }
-        input if input.starts_with("/mode") => {
-            let arg = input.strip_prefix("/mode").unwrap().trim();
+        "/model" => {
+            if arg.is_empty() {
+                println!("Current model: {}", orchestrator.model());
+            } else {
+                orchestrator.set_model(arg.to_string());
+                println!("Model changed to: {}", arg);
+            }
+            SlashResult::Continue
+        }
+        "/permissions" => {
+            if arg.is_empty() {
+                println!("Current approval policy: {}", approval_handler.policy());
+            } else {
+                match arg.parse::<ApprovalPolicy>() {
+                    Ok(policy) => {
+                        approval_handler.set_policy(policy);
+                        println!("Approval policy changed to: {}", policy);
+                    }
+                    Err(e) => println!("{}", e),
+                }
+            }
+            SlashResult::Continue
+        }
+        "/personality" => {
+            if arg.is_empty() {
+                println!("Current personality: {}", orchestrator.personality());
+            } else {
+                match arg.parse::<Personality>() {
+                    Ok(p) => {
+                        orchestrator.set_personality(p);
+                        println!("Personality changed to: {}", p);
+                    }
+                    Err(e) => println!("{}", e),
+                }
+            }
+            SlashResult::Continue
+        }
+        "/status" => {
+            println!(
+                "Mode: {} | Model: {} | Policy: {} | Personality: {}",
+                orchestrator.mode(),
+                orchestrator.model(),
+                approval_handler.policy(),
+                orchestrator.personality(),
+            );
+            println!("Tokens: {}", orchestrator.session_usage());
+            println!(
+                "Turns: {} / {} | Tools: {}",
+                orchestrator.turn_count(),
+                orchestrator.context_window_turns(),
+                orchestrator.tool_count(),
+            );
+            SlashResult::Continue
+        }
+        "/explore" => {
+            orchestrator.set_mode(crate::mode::Mode::Explore);
+            println!(
+                "Switched to explore mode. Tools: {}",
+                orchestrator.tool_count()
+            );
+            SlashResult::Continue
+        }
+        "/plan" => {
+            orchestrator.set_mode(crate::mode::Mode::Plan);
+            println!(
+                "Switched to plan mode. Tools: {}",
+                orchestrator.tool_count()
+            );
+            SlashResult::Continue
+        }
+        "/execute" => {
+            orchestrator.set_mode(crate::mode::Mode::Execute);
+            println!(
+                "Switched to execute mode. Tools: {}",
+                orchestrator.tool_count()
+            );
+            SlashResult::Continue
+        }
+        "/mode" => {
             if arg.is_empty() {
                 println!(
                     "Current mode: {}. Usage: /mode <explore|plan|execute>",
@@ -304,11 +447,16 @@ fn handle_slash_command(input: &str, orchestrator: &mut Orchestrator) -> SlashRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ApprovalPolicy;
     use crate::ui::approval::{ApprovalHandler, AutoApproveHandler};
     use std::path::PathBuf;
 
     fn test_handler() -> Arc<dyn ApprovalHandler> {
         Arc::new(AutoApproveHandler::always_approve())
+    }
+
+    fn test_approval_handler() -> PolicyAwareApprovalHandler {
+        PolicyAwareApprovalHandler::new(ApprovalPolicy::Suggest)
     }
 
     fn test_orchestrator() -> Orchestrator {
@@ -319,6 +467,8 @@ mod tests {
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            50,
         )
     }
 
@@ -330,22 +480,25 @@ mod tests {
             PathBuf::from("/tmp"),
             8192,
             test_handler(),
+            Personality::default(),
+            50,
         )
     }
 
     #[test]
     fn slash_quit_returns_quit() {
         let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
         assert!(matches!(
-            handle_slash_command("/quit", &mut orch),
+            handle_slash_command("/quit", &mut orch, &ah),
             SlashResult::Quit
         ));
         assert!(matches!(
-            handle_slash_command("/exit", &mut orch),
+            handle_slash_command("/exit", &mut orch, &ah),
             SlashResult::Quit
         ));
         assert!(matches!(
-            handle_slash_command("/q", &mut orch),
+            handle_slash_command("/q", &mut orch, &ah),
             SlashResult::Quit
         ));
     }
@@ -353,16 +506,18 @@ mod tests {
     #[test]
     fn slash_clear_clears_history() {
         let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
         assert_eq!(orch.turn_count(), 0);
-        handle_slash_command("/clear", &mut orch);
+        handle_slash_command("/clear", &mut orch, &ah);
         assert_eq!(orch.turn_count(), 0);
     }
 
     #[test]
     fn slash_help_returns_continue() {
         let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
         assert!(matches!(
-            handle_slash_command("/help", &mut orch),
+            handle_slash_command("/help", &mut orch, &ah),
             SlashResult::Continue
         ));
     }
@@ -370,8 +525,9 @@ mod tests {
     #[test]
     fn unknown_command_returns_continue() {
         let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
         assert!(matches!(
-            handle_slash_command("/unknown", &mut orch),
+            handle_slash_command("/unknown", &mut orch, &ah),
             SlashResult::Continue
         ));
     }
@@ -379,10 +535,11 @@ mod tests {
     #[test]
     fn slash_mode_switches_mode() {
         let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
 
-        let result = handle_slash_command("/mode plan", &mut orch);
+        let result = handle_slash_command("/mode plan", &mut orch, &ah);
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Plan);
         assert_eq!(orch.tool_count(), 8);
@@ -391,7 +548,8 @@ mod tests {
     #[test]
     fn slash_mode_invalid_stays_unchanged() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/mode bad", &mut orch);
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/mode bad", &mut orch, &ah);
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
@@ -400,7 +558,8 @@ mod tests {
     #[test]
     fn slash_mode_no_arg_shows_current() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/mode", &mut orch);
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/mode", &mut orch, &ah);
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
     }
@@ -416,8 +575,9 @@ mod tests {
     #[test]
     fn slash_accept_in_plan_mode_with_plan() {
         let mut orch = test_plan_orchestrator();
+        let ah = test_approval_handler();
         orch.set_current_plan("My implementation plan".into());
-        let result = handle_slash_command("/accept", &mut orch);
+        let result = handle_slash_command("/accept", &mut orch, &ah);
         assert!(matches!(result, SlashResult::ExecutePlan));
         assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
     }
@@ -425,7 +585,8 @@ mod tests {
     #[test]
     fn slash_accept_in_plan_mode_no_plan() {
         let mut orch = test_plan_orchestrator();
-        let result = handle_slash_command("/accept", &mut orch);
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/accept", &mut orch, &ah);
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Plan); // unchanged
     }
@@ -433,7 +594,8 @@ mod tests {
     #[test]
     fn slash_accept_in_explore_mode() {
         let mut orch = test_orchestrator(); // Explore mode
-        let result = handle_slash_command("/accept", &mut orch);
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/accept", &mut orch, &ah);
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore); // unchanged
     }
@@ -441,8 +603,116 @@ mod tests {
     #[test]
     fn slash_accept_shorthand() {
         let mut orch = test_plan_orchestrator();
+        let ah = test_approval_handler();
         orch.set_current_plan("plan".into());
-        let result = handle_slash_command("/a", &mut orch);
+        let result = handle_slash_command("/a", &mut orch, &ah);
         assert!(matches!(result, SlashResult::ExecutePlan));
+    }
+
+    // ── Phase 5: New Slash Command Tests ──
+
+    #[test]
+    fn slash_model_show() {
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/model", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(orch.model(), "model"); // unchanged
+    }
+
+    #[test]
+    fn slash_model_switch() {
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/model gemini-2.0-flash", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(orch.model(), "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn slash_permissions_show() {
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/permissions", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(ah.policy(), ApprovalPolicy::Suggest); // unchanged
+    }
+
+    #[test]
+    fn slash_permissions_switch() {
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/permissions full_auto", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(ah.policy(), ApprovalPolicy::FullAuto);
+    }
+
+    #[test]
+    fn slash_personality_show() {
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/personality", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(orch.personality(), Personality::Pragmatic); // default
+    }
+
+    #[test]
+    fn slash_personality_switch() {
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+        let result =
+            handle_slash_command("/personality friendly", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(orch.personality(), Personality::Friendly);
+    }
+
+    #[test]
+    fn slash_status_returns_continue() {
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/status", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[test]
+    fn slash_explore_shorthand() {
+        let mut orch = test_plan_orchestrator(); // Start in plan
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/explore", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
+    }
+
+    #[test]
+    fn slash_plan_shorthand() {
+        let mut orch = test_orchestrator(); // Start in explore
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/plan", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(*orch.mode(), crate::mode::Mode::Plan);
+    }
+
+    #[test]
+    fn slash_execute_shorthand() {
+        let mut orch = test_orchestrator(); // Start in explore
+        let ah = test_approval_handler();
+        let result = handle_slash_command("/execute", &mut orch, &ah);
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
+    }
+
+    #[test]
+    fn slash_command_arg_splitting() {
+        // Verify command/arg splitting works for multi-word args
+        let mut orch = test_orchestrator();
+        let ah = test_approval_handler();
+
+        // /mode with arg
+        handle_slash_command("/mode execute", &mut orch, &ah);
+        assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
+
+        // /model with arg containing spaces-like model name
+        handle_slash_command("/model gemini-2.0-flash", &mut orch, &ah);
+        assert_eq!(orch.model(), "gemini-2.0-flash");
     }
 }

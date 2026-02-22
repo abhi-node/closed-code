@@ -112,6 +112,49 @@ impl ApprovalHandler for TerminalApprovalHandler {
     }
 }
 
+/// Policy-aware approval handler that applies an approval policy.
+///
+/// - Suggest: always prompt (delegates to inner TerminalApprovalHandler).
+/// - AutoEdit: auto-approve file changes (the only thing this trait handles).
+/// - FullAuto: auto-approve everything.
+///
+/// The policy can be changed at runtime via `set_policy()`, protected by a `RwLock`.
+#[derive(Debug)]
+pub struct PolicyAwareApprovalHandler {
+    policy: std::sync::RwLock<crate::config::ApprovalPolicy>,
+    inner: TerminalApprovalHandler,
+}
+
+impl PolicyAwareApprovalHandler {
+    pub fn new(policy: crate::config::ApprovalPolicy) -> Self {
+        Self {
+            policy: std::sync::RwLock::new(policy),
+            inner: TerminalApprovalHandler::new(),
+        }
+    }
+
+    pub fn policy(&self) -> crate::config::ApprovalPolicy {
+        *self.policy.read().unwrap()
+    }
+
+    pub fn set_policy(&self, policy: crate::config::ApprovalPolicy) {
+        *self.policy.write().unwrap() = policy;
+    }
+}
+
+#[async_trait]
+impl ApprovalHandler for PolicyAwareApprovalHandler {
+    async fn request_approval(&self, change: &FileChange) -> Result<ApprovalDecision> {
+        match self.policy() {
+            crate::config::ApprovalPolicy::FullAuto
+            | crate::config::ApprovalPolicy::AutoEdit => Ok(ApprovalDecision::Approved),
+            crate::config::ApprovalPolicy::Suggest => {
+                self.inner.request_approval(change).await
+            }
+        }
+    }
+}
+
 /// Auto-approve handler for testing.
 ///
 /// Configurable to always approve or always reject without user interaction.
@@ -191,5 +234,60 @@ mod tests {
         let handler = TerminalApprovalHandler::new();
         let debug = format!("{:?}", handler);
         assert!(debug.contains("TerminalApprovalHandler"));
+    }
+
+    // ── Phase 5: PolicyAwareApprovalHandler Tests ──
+
+    fn test_file_change() -> FileChange {
+        FileChange {
+            file_path: "test.rs".into(),
+            resolved_path: "/tmp/test.rs".into(),
+            old_content: String::new(),
+            new_content: "fn main() {}".into(),
+            is_new_file: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_auto_edit_approves() {
+        let handler =
+            PolicyAwareApprovalHandler::new(crate::config::ApprovalPolicy::AutoEdit);
+        let decision = handler
+            .request_approval(&test_file_change())
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Approved);
+    }
+
+    #[tokio::test]
+    async fn policy_full_auto_approves() {
+        let handler =
+            PolicyAwareApprovalHandler::new(crate::config::ApprovalPolicy::FullAuto);
+        let decision = handler
+            .request_approval(&test_file_change())
+            .await
+            .unwrap();
+        assert_eq!(decision, ApprovalDecision::Approved);
+    }
+
+    #[test]
+    fn policy_runtime_switch() {
+        let handler =
+            PolicyAwareApprovalHandler::new(crate::config::ApprovalPolicy::Suggest);
+        assert_eq!(handler.policy(), crate::config::ApprovalPolicy::Suggest);
+
+        handler.set_policy(crate::config::ApprovalPolicy::FullAuto);
+        assert_eq!(handler.policy(), crate::config::ApprovalPolicy::FullAuto);
+
+        handler.set_policy(crate::config::ApprovalPolicy::AutoEdit);
+        assert_eq!(handler.policy(), crate::config::ApprovalPolicy::AutoEdit);
+    }
+
+    #[test]
+    fn policy_aware_handler_debug() {
+        let handler =
+            PolicyAwareApprovalHandler::new(crate::config::ApprovalPolicy::Suggest);
+        let debug = format!("{:?}", handler);
+        assert!(debug.contains("PolicyAwareApprovalHandler"));
     }
 }
