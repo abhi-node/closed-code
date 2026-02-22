@@ -46,3 +46,21 @@ dotenvy = "0.15"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 futures = "0.3"
+
+# File search (glob patterns)
+glob = "0.3"
+
+# Regex content search
+regex = "1"
+
+# Gitignore-aware directory walking
+ignore = "0.4"
+
+# Safe shell command string splitting
+shlex = "1"
+
+# Lenient JSON parsing (handles trailing commas from Gemini SSE)
+json5 = "1"
+
+[dev-dependencies]
+tempfile = "3"

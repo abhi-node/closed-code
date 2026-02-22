@@ -23,8 +23,14 @@ impl Spinner {
         self.bar.set_message(message.to_string());
     }
 
+    /// Clear the spinner line entirely (no trace left).
     pub fn finish(&self) {
         self.bar.finish_and_clear();
+    }
+
+    /// Stop the spinner but leave the message as a static line.
+    pub fn finish_with_message(&self, message: &str) {
+        self.bar.finish_with_message(message.to_string());
     }
 }
 

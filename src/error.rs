@@ -38,6 +38,41 @@ pub enum ClosedCodeError {
 
     #[error("Failed to parse Gemini Part: {0}")]
     PartParseError(String),
+
+    // Tool errors (Phase 2)
+    #[error("Tool '{name}' not found in registry")]
+    ToolNotFound { name: String },
+
+    #[error("Tool '{name}' execution failed: {message}")]
+    ToolError { name: String, message: String },
+
+    #[error("Tool-call loop exceeded max iterations ({max})")]
+    ToolLoopMaxIterations { max: usize },
+
+    #[error("Command '{command}' is not in the allowlist. Allowed: {allowed}")]
+    ShellNotAllowed { command: String, allowed: String },
+
+    #[error("Shell command failed: {0}")]
+    ShellError(String),
+
+    #[error("Shell command timed out after {seconds}s")]
+    ShellTimeout { seconds: u64 },
+
+    #[error("File too large ({size_bytes} bytes, max {max_bytes}): {path}")]
+    FileTooLarge {
+        path: String,
+        size_bytes: u64,
+        max_bytes: u64,
+    },
+
+    #[error("Binary file detected: {path}")]
+    BinaryFile { path: String },
+
+    #[error("Invalid glob pattern: {0}")]
+    GlobError(String),
+
+    #[error("Invalid regex pattern: {0}")]
+    RegexError(String),
 }
 
 impl ClosedCodeError {
@@ -150,6 +185,69 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Invalid mode 'bad'. Expected: explore, plan, or execute"
+        );
+    }
+
+    #[test]
+    fn tool_errors_are_not_retryable() {
+        let errors: Vec<ClosedCodeError> = vec![
+            ClosedCodeError::ToolNotFound { name: "x".into() },
+            ClosedCodeError::ToolError { name: "x".into(), message: "fail".into() },
+            ClosedCodeError::ToolLoopMaxIterations { max: 10 },
+            ClosedCodeError::ShellNotAllowed { command: "rm".into(), allowed: "ls".into() },
+            ClosedCodeError::ShellError("fail".into()),
+            ClosedCodeError::ShellTimeout { seconds: 30 },
+            ClosedCodeError::FileTooLarge { path: "big".into(), size_bytes: 200000, max_bytes: 100000 },
+            ClosedCodeError::BinaryFile { path: "a.out".into() },
+            ClosedCodeError::GlobError("bad".into()),
+            ClosedCodeError::RegexError("bad".into()),
+        ];
+        for err in &errors {
+            assert!(!err.is_retryable(), "Expected not retryable: {err}");
+        }
+    }
+
+    #[test]
+    fn tool_error_display_messages() {
+        assert_eq!(
+            ClosedCodeError::ToolNotFound { name: "read_file".into() }.to_string(),
+            "Tool 'read_file' not found in registry"
+        );
+        assert_eq!(
+            ClosedCodeError::ToolError { name: "grep".into(), message: "bad regex".into() }.to_string(),
+            "Tool 'grep' execution failed: bad regex"
+        );
+        assert_eq!(
+            ClosedCodeError::ToolLoopMaxIterations { max: 10 }.to_string(),
+            "Tool-call loop exceeded max iterations (10)"
+        );
+        assert_eq!(
+            ClosedCodeError::ShellNotAllowed { command: "rm".into(), allowed: "ls, cat".into() }.to_string(),
+            "Command 'rm' is not in the allowlist. Allowed: ls, cat"
+        );
+        assert_eq!(
+            ClosedCodeError::ShellError("failed".into()).to_string(),
+            "Shell command failed: failed"
+        );
+        assert_eq!(
+            ClosedCodeError::ShellTimeout { seconds: 30 }.to_string(),
+            "Shell command timed out after 30s"
+        );
+        assert_eq!(
+            ClosedCodeError::FileTooLarge { path: "big.bin".into(), size_bytes: 200000, max_bytes: 100000 }.to_string(),
+            "File too large (200000 bytes, max 100000): big.bin"
+        );
+        assert_eq!(
+            ClosedCodeError::BinaryFile { path: "a.out".into() }.to_string(),
+            "Binary file detected: a.out"
+        );
+        assert_eq!(
+            ClosedCodeError::GlobError("invalid [".into()).to_string(),
+            "Invalid glob pattern: invalid ["
+        );
+        assert_eq!(
+            ClosedCodeError::RegexError("bad regex".into()).to_string(),
+            "Invalid regex pattern: bad regex"
         );
     }
 }

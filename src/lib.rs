@@ -4,6 +4,7 @@ pub mod error;
 pub mod gemini;
 pub mod mode;
 pub mod repl;
+pub mod tool;
 pub mod ui;
 
 pub use config::Config;
