@@ -177,6 +177,7 @@ mod tests {
                 }),
                 finish_reason: Some("STOP".into()),
                 safety_ratings: vec![],
+                grounding_metadata: None,
             }],
             usage_metadata: None,
             model_version: None,

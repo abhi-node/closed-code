@@ -8,7 +8,9 @@ use crate::mode::Mode;
 
 pub mod filesystem;
 pub mod registry;
+pub mod report;
 pub mod shell;
+pub mod spawn;
 
 /// A tool that the LLM can invoke via Gemini function calling.
 #[async_trait]

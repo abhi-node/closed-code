@@ -73,6 +73,19 @@ pub enum ClosedCodeError {
 
     #[error("Invalid regex pattern: {0}")]
     RegexError(String),
+
+    // Agent errors (Phase 3)
+    #[error("Agent '{agent_id}' failed: {message}")]
+    AgentError { agent_id: String, message: String },
+
+    #[error("Agent '{agent_id}' timed out after {seconds}s")]
+    AgentTimeout { agent_id: String, seconds: u64 },
+
+    #[error("Orchestrator exceeded max iterations ({max}) for this turn")]
+    OrchestratorMaxIterations { max: usize },
+
+    #[error("Sub-agent tool loop exceeded max iterations ({max}) for agent '{agent_id}'")]
+    SubAgentMaxIterations { agent_id: String, max: usize },
 }
 
 impl ClosedCodeError {
@@ -201,6 +214,19 @@ mod tests {
             ClosedCodeError::BinaryFile { path: "a.out".into() },
             ClosedCodeError::GlobError("bad".into()),
             ClosedCodeError::RegexError("bad".into()),
+        ];
+        for err in &errors {
+            assert!(!err.is_retryable(), "Expected not retryable: {err}");
+        }
+    }
+
+    #[test]
+    fn agent_errors_are_not_retryable() {
+        let errors: Vec<ClosedCodeError> = vec![
+            ClosedCodeError::AgentError { agent_id: "explorer".into(), message: "fail".into() },
+            ClosedCodeError::AgentTimeout { agent_id: "explorer".into(), seconds: 120 },
+            ClosedCodeError::OrchestratorMaxIterations { max: 30 },
+            ClosedCodeError::SubAgentMaxIterations { agent_id: "planner".into(), max: 15 },
         ];
         for err in &errors {
             assert!(!err.is_retryable(), "Expected not retryable: {err}");

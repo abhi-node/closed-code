@@ -1,10 +1,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::gemini::GeminiClient;
+
 use crate::error::{ClosedCodeError, Result};
-use crate::gemini::types::{FunctionCallingConfig, FunctionDeclaration, ToolConfig, ToolDefinition};
+use crate::gemini::types::{
+    FunctionCallingConfig, FunctionDeclaration, GeminiTool, ToolConfig, ToolDefinition,
+};
 use crate::mode::Mode;
 
 use super::Tool;
@@ -60,14 +65,14 @@ impl ToolRegistry {
 
     /// Generate the `tools` array for a Gemini API request.
     /// Returns None if no tools are available for the given mode.
-    pub fn to_gemini_tools(&self, mode: &Mode) -> Option<Vec<ToolDefinition>> {
+    pub fn to_gemini_tools(&self, mode: &Mode) -> Option<Vec<GeminiTool>> {
         let declarations = self.declarations_for_mode(mode);
         if declarations.is_empty() {
             None
         } else {
-            Some(vec![ToolDefinition {
+            Some(vec![GeminiTool::Functions(ToolDefinition {
                 function_declarations: declarations,
-            }])
+            })])
         }
     }
 
@@ -108,6 +113,12 @@ impl std::fmt::Debug for ToolRegistry {
 /// Create a ToolRegistry with all Phase 2 tools registered.
 pub fn create_default_registry(working_directory: PathBuf) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
+    register_filesystem_tools(&mut registry, working_directory);
+    registry
+}
+
+/// Register the common filesystem + shell tools into a registry.
+fn register_filesystem_tools(registry: &mut ToolRegistry, working_directory: PathBuf) {
     registry.register(Box::new(super::filesystem::ReadFileTool::new(
         working_directory.clone(),
     )));
@@ -123,6 +134,74 @@ pub fn create_default_registry(working_directory: PathBuf) -> ToolRegistry {
     registry.register(Box::new(super::shell::ShellCommandTool::new(
         working_directory,
     )));
+}
+
+/// Create a ToolRegistry for Explorer sub-agents.
+/// Includes filesystem tools + create_report. No spawn tools (terminal).
+pub fn create_subagent_registry(working_directory: PathBuf) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    register_filesystem_tools(&mut registry, working_directory);
+    registry.register(Box::new(super::report::CreateReportTool::new()));
+    registry
+}
+
+/// Create a ToolRegistry for Planner sub-agents.
+/// Includes filesystem tools + create_report + spawn_explorer.
+/// The planner can spawn an explorer for deep research but cannot self-spawn.
+pub fn create_planner_registry(
+    working_directory: PathBuf,
+    client: Arc<GeminiClient>,
+) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    register_filesystem_tools(&mut registry, working_directory.clone());
+    registry.register(Box::new(super::report::CreateReportTool::new()));
+    registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
+        client,
+        working_directory,
+    )));
+    registry
+}
+
+/// Create a ToolRegistry for the orchestrator.
+/// Includes filesystem + spawn tools based on mode.
+pub fn create_orchestrator_registry(
+    working_directory: PathBuf,
+    mode: &Mode,
+    client: Arc<GeminiClient>,
+) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    register_filesystem_tools(&mut registry, working_directory.clone());
+
+    // Spawn tools (mode-dependent)
+    match mode {
+        Mode::Explore => {
+            registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
+                client,
+                working_directory,
+            )));
+        }
+        Mode::Plan => {
+            registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
+                client.clone(),
+                working_directory.clone(),
+            )));
+            registry.register(Box::new(super::spawn::SpawnPlannerTool::new(
+                client.clone(),
+                working_directory.clone(),
+            )));
+            registry.register(Box::new(super::spawn::SpawnWebSearchTool::new(
+                client,
+                working_directory,
+            )));
+        }
+        Mode::Execute => {
+            registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
+                client,
+                working_directory,
+            )));
+        }
+    }
+
     registry
 }
 
@@ -255,8 +334,11 @@ mod tests {
         let tools = registry.to_gemini_tools(&Mode::Explore);
         assert!(tools.is_some());
         let tools = tools.unwrap();
-        assert_eq!(tools.len(), 1); // one ToolDefinition wrapper
-        assert_eq!(tools[0].function_declarations.len(), 2);
+        assert_eq!(tools.len(), 1); // one GeminiTool::Functions wrapper
+        match &tools[0] {
+            GeminiTool::Functions(def) => assert_eq!(def.function_declarations.len(), 2),
+            _ => panic!("Expected GeminiTool::Functions"),
+        }
     }
 
     #[test]
@@ -301,5 +383,59 @@ mod tests {
         let debug = format!("{:?}", registry);
         assert!(debug.contains("ToolRegistry"));
         assert!(debug.contains("test_tool"));
+    }
+
+    // ── Phase 3 Registry Factory Tests ──
+
+    #[test]
+    fn create_orchestrator_registry_explore_mode() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let registry =
+            create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Explore, client);
+        // 5 filesystem/shell + spawn_explorer = 6
+        assert_eq!(registry.len(), 6);
+        assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("spawn_planner").is_none());
+        assert!(registry.get("spawn_web_search").is_none());
+    }
+
+    #[test]
+    fn create_orchestrator_registry_plan_mode() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let registry = create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Plan, client);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
+        assert_eq!(registry.len(), 8);
+        assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("spawn_planner").is_some());
+        assert!(registry.get("spawn_web_search").is_some());
+    }
+
+    #[test]
+    fn create_subagent_registry_has_tools() {
+        let registry = create_subagent_registry(PathBuf::from("/tmp"));
+        // 5 filesystem/shell + create_report = 6
+        assert_eq!(registry.len(), 6);
+        assert!(registry.get("create_report").is_some());
+        assert!(registry.get("spawn_explorer").is_none());
+    }
+
+    #[test]
+    fn create_planner_registry_has_spawn_explorer() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let registry = create_planner_registry(PathBuf::from("/tmp"), client);
+        // 5 filesystem/shell + create_report + spawn_explorer = 7
+        assert_eq!(registry.len(), 7);
+        assert!(registry.get("create_report").is_some());
+        assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("spawn_planner").is_none());
     }
 }

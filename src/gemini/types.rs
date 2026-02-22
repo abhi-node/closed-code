@@ -14,7 +14,7 @@ pub struct GenerateContentRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GenerationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<ToolDefinition>>,
+    pub tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<ToolConfig>,
 }
@@ -72,6 +72,80 @@ pub struct ToolConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionCallingConfig {
     pub mode: String,
+}
+
+// ── GeminiTool Polymorphic Type (Phase 3) ──
+
+/// Represents a tool entry in the Gemini API `tools` array.
+/// Can be either function declarations or google_search grounding.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum GeminiTool {
+    /// Function calling tool with declarations.
+    Functions(ToolDefinition),
+    /// Google Search grounding tool.
+    GoogleSearch(GoogleSearchTool),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GoogleSearchTool {
+    pub google_search: GoogleSearchConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GoogleSearchConfig {}
+
+impl Default for GoogleSearchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GoogleSearchTool {
+    pub fn new() -> Self {
+        Self {
+            google_search: GoogleSearchConfig {},
+        }
+    }
+}
+
+// ── Grounding Metadata Types (Phase 3) ──
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingMetadata {
+    #[serde(default)]
+    pub web_search_queries: Vec<String>,
+    #[serde(default)]
+    pub grounding_chunks: Vec<GroundingChunk>,
+    #[serde(default)]
+    pub grounding_supports: Vec<GroundingSupport>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GroundingChunk {
+    pub web: Option<WebSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebSource {
+    pub uri: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingSupport {
+    pub segment: Option<GroundingSegment>,
+    #[serde(default)]
+    pub grounding_chunk_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundingSegment {
+    pub start_index: Option<usize>,
+    pub end_index: Option<usize>,
 }
 
 // ── Part Enum (custom deserialization) ──
@@ -268,6 +342,7 @@ pub struct Candidate {
     pub finish_reason: Option<String>,
     #[serde(default)]
     pub safety_ratings: Vec<SafetyRating>,
+    pub grounding_metadata: Option<GroundingMetadata>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -557,6 +632,7 @@ mod tests {
                 }),
                 finish_reason: Some("STOP".into()),
                 safety_ratings: vec![],
+                grounding_metadata: None,
             }],
             usage_metadata: None,
             model_version: None,
@@ -719,7 +795,7 @@ mod tests {
             contents: vec![Content::user("test")],
             system_instruction: None,
             generation_config: None,
-            tools: Some(vec![ToolDefinition {
+            tools: Some(vec![GeminiTool::Functions(ToolDefinition {
                 function_declarations: vec![FunctionDeclaration {
                     name: "test_tool".into(),
                     description: "A test tool".into(),
@@ -729,7 +805,7 @@ mod tests {
                         required: None,
                     },
                 }],
-            }]),
+            })]),
             tool_config: Some(ToolConfig {
                 function_calling_config: FunctionCallingConfig {
                     mode: "AUTO".into(),
@@ -775,6 +851,7 @@ mod tests {
                 }),
                 finish_reason: Some("STOP".into()),
                 safety_ratings: vec![],
+                grounding_metadata: None,
             }],
             usage_metadata: None,
             model_version: None,
@@ -793,6 +870,7 @@ mod tests {
                 }),
                 finish_reason: Some("STOP".into()),
                 safety_ratings: vec![],
+                grounding_metadata: None,
             }],
             usage_metadata: None,
             model_version: None,
@@ -810,5 +888,98 @@ mod tests {
         };
         assert!(response.function_calls().is_empty());
         assert!(!response.has_function_calls());
+    }
+
+    // ── Phase 3 GeminiTool + Grounding Tests ──
+
+    #[test]
+    fn serialize_gemini_tool_functions() {
+        let tool = GeminiTool::Functions(ToolDefinition {
+            function_declarations: vec![FunctionDeclaration {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: Parameters {
+                    schema_type: "object".into(),
+                    properties: serde_json::Map::new(),
+                    required: None,
+                },
+            }],
+        });
+        let json = serde_json::to_value(&tool).unwrap();
+        assert!(json.get("functionDeclarations").is_some());
+        assert_eq!(json["functionDeclarations"][0]["name"], "read_file");
+    }
+
+    #[test]
+    fn serialize_gemini_tool_google_search() {
+        let tool = GeminiTool::GoogleSearch(GoogleSearchTool::new());
+        let json = serde_json::to_value(&tool).unwrap();
+        assert!(json.get("google_search").is_some());
+        // google_search should be an empty object
+        assert_eq!(json["google_search"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn serialize_request_with_gemini_tools() {
+        let request = GenerateContentRequest {
+            contents: vec![Content::user("test")],
+            system_instruction: None,
+            generation_config: None,
+            tools: Some(vec![
+                GeminiTool::Functions(ToolDefinition {
+                    function_declarations: vec![FunctionDeclaration {
+                        name: "grep".into(),
+                        description: "Search".into(),
+                        parameters: Parameters {
+                            schema_type: "object".into(),
+                            properties: serde_json::Map::new(),
+                            required: None,
+                        },
+                    }],
+                }),
+            ]),
+            tool_config: None,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["tools"][0]["functionDeclarations"][0]["name"], "grep");
+    }
+
+    #[test]
+    fn deserialize_candidate_with_grounding_metadata() {
+        let json = r#"{
+            "content": {
+                "role": "model",
+                "parts": [{"text": "Based on research..."}]
+            },
+            "finishReason": "STOP",
+            "safetyRatings": [],
+            "groundingMetadata": {
+                "webSearchQueries": ["Rust async patterns"],
+                "groundingChunks": [
+                    {
+                        "web": {
+                            "uri": "https://example.com/article",
+                            "title": "Modern Rust Async"
+                        }
+                    }
+                ],
+                "groundingSupports": [
+                    {
+                        "segment": {"startIndex": 0, "endIndex": 45},
+                        "groundingChunkIndices": [0]
+                    }
+                ]
+            }
+        }"#;
+        let candidate: Candidate = serde_json::from_str(json).unwrap();
+        let gm = candidate.grounding_metadata.unwrap();
+        assert_eq!(gm.web_search_queries, vec!["Rust async patterns"]);
+        assert_eq!(gm.grounding_chunks.len(), 1);
+        assert_eq!(
+            gm.grounding_chunks[0].web.as_ref().unwrap().uri,
+            "https://example.com/article"
+        );
+        assert_eq!(gm.grounding_supports.len(), 1);
+        assert_eq!(gm.grounding_supports[0].grounding_chunk_indices, vec![0]);
     }
 }
