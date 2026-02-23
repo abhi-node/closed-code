@@ -11,6 +11,7 @@ use crate::agent::orchestrator::Orchestrator;
 use crate::config::{Config, Personality};
 use crate::gemini::stream::StreamEvent;
 use crate::gemini::GeminiClient;
+use crate::sandbox::create_sandbox;
 use crate::ui::approval::{ApprovalHandler, DiffOnlyApprovalHandler, TerminalApprovalHandler};
 use crate::ui::spinner::Spinner;
 use crate::ui::theme::Theme;
@@ -71,6 +72,7 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
         config.api_key.clone(),
         config.model.clone(),
     ));
+    let sandbox = create_sandbox(config.sandbox_mode, config.working_directory.clone());
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
     let mut orchestrator = Orchestrator::new(
         client,
@@ -80,6 +82,8 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
         approval_handler,
         config.personality,
         config.context_window_turns,
+        sandbox,
+        config.protected_paths.clone(),
     );
     orchestrator.detect_git_context().await;
 
@@ -103,6 +107,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         config.api_key.clone(),
         config.model.clone(),
     ));
+    let sandbox = create_sandbox(config.sandbox_mode, config.working_directory.clone());
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
     let mut orchestrator = Orchestrator::new(
         client,
@@ -112,6 +117,8 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         approval_handler,
         config.personality,
         config.context_window_turns,
+        sandbox,
+        config.protected_paths.clone(),
     );
     orchestrator.detect_git_context().await;
     let mut editor = DefaultEditor::new()?;
@@ -127,6 +134,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         "Working directory: {}",
         config.working_directory.display()
     );
+    println!("Sandbox: {}", orchestrator.sandbox_summary());
     println!("Git: {}", orchestrator.git_summary());
     println!("Type /help for commands, Ctrl+C to interrupt, /quit to exit.\n");
 
@@ -406,6 +414,7 @@ async fn handle_slash_command(
             println!("  /commit [message]  \u{2014} Generate commit message via sub-agent and commit");
             println!("  /model [name]      \u{2014} Show or switch model");
             println!("  /personality [s]   \u{2014} Show or change personality (friendly, pragmatic, none)");
+            println!("  /sandbox           \u{2014} Show sandbox mode, backend, and protected paths");
             println!("  /status            \u{2014} Show session status (tokens, model, mode, etc.)");
             println!("  /clear             \u{2014} Clear conversation history");
             println!("  /quit              \u{2014} Exit");
@@ -444,6 +453,7 @@ async fn handle_slash_command(
                 orchestrator.model(),
                 orchestrator.personality(),
             );
+            println!("Sandbox: {}", orchestrator.sandbox_summary());
             println!("Git: {}", orchestrator.git_summary());
             println!("Tokens: {}", orchestrator.session_usage());
             println!(
@@ -452,6 +462,13 @@ async fn handle_slash_command(
                 orchestrator.context_window_turns(),
                 orchestrator.tool_count(),
             );
+            SlashResult::Continue
+        }
+        "/sandbox" => {
+            println!("Sandbox mode: {}", orchestrator.sandbox_mode());
+            println!("Summary: {}", orchestrator.sandbox_summary());
+            println!("Protected paths (always):");
+            println!("  .git, .closed-code, .env, *.pem, *.key");
             SlashResult::Continue
         }
         "/diff" => {
@@ -684,11 +701,17 @@ async fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::mock::MockSandbox;
+    use crate::sandbox::Sandbox;
     use crate::ui::approval::{ApprovalHandler, AutoApproveHandler};
     use std::path::PathBuf;
 
     fn test_handler() -> Arc<dyn ApprovalHandler> {
         Arc::new(AutoApproveHandler::always_approve())
+    }
+
+    fn mock_sandbox() -> Arc<dyn Sandbox> {
+        Arc::new(MockSandbox::new(PathBuf::from("/tmp")))
     }
 
     fn test_orchestrator() -> Orchestrator {
@@ -701,6 +724,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         )
     }
 
@@ -714,6 +739,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         )
     }
 
@@ -981,5 +1008,31 @@ mod tests {
         let mut orch = test_orchestrator();
         let result = handle_slash_command("/diff branch", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
+    }
+
+    // ── Phase 7: Sandbox Slash Command Tests ──
+
+    #[tokio::test]
+    async fn slash_sandbox_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/sandbox", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[test]
+    fn test_orchestrator_sandbox_mode() {
+        let orch = test_orchestrator();
+        // MockSandbox defaults to FullAccess
+        assert_eq!(
+            orch.sandbox_mode(),
+            crate::sandbox::SandboxMode::FullAccess
+        );
+    }
+
+    #[test]
+    fn test_orchestrator_sandbox_summary_non_empty() {
+        let orch = test_orchestrator();
+        let summary = orch.sandbox_summary();
+        assert!(!summary.is_empty());
     }
 }

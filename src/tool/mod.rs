@@ -116,6 +116,49 @@ impl Default for ParamBuilder {
     }
 }
 
+/// Default hardcoded protected paths.
+const DEFAULT_PROTECTED_PATHS: &[&str] = &[".git", ".closed-code", ".env"];
+
+/// Default protected file extensions (matched case-insensitively).
+const DEFAULT_PROTECTED_EXTENSIONS: &[&str] = &[".pem", ".key"];
+
+/// Check if a path is protected from modification.
+///
+/// A path is protected if it matches any of:
+/// - Hardcoded paths: .git/, .closed-code/, .env
+/// - Hardcoded extensions: *.pem, *.key
+/// - User-configured additional protected paths from config.toml
+pub fn is_protected_path(path: &str, additional_paths: &[String]) -> bool {
+    let normalized = path.replace('\\', "/");
+
+    // Check hardcoded directory/file paths
+    for protected in DEFAULT_PROTECTED_PATHS {
+        if normalized == *protected || normalized.starts_with(&format!("{protected}/")) {
+            return true;
+        }
+    }
+
+    // Check hardcoded extensions
+    let lower = normalized.to_lowercase();
+    for ext in DEFAULT_PROTECTED_EXTENSIONS {
+        if lower.ends_with(ext) {
+            return true;
+        }
+    }
+
+    // Check user-configured additional paths
+    for additional in additional_paths {
+        let additional_normalized = additional.replace('\\', "/");
+        if normalized == additional_normalized
+            || normalized.starts_with(&format!("{additional_normalized}/"))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +230,82 @@ mod tests {
         assert_eq!(json["properties"]["path"]["type"], "string");
         assert_eq!(json["properties"]["line"]["type"], "integer");
         assert_eq!(json["required"], serde_json::json!(["path"]));
+    }
+
+    // ── Protected Path Tests (Phase 7) ──
+
+    #[test]
+    fn protected_path_git() {
+        assert!(is_protected_path(".git", &[]));
+        assert!(is_protected_path(".git/config", &[]));
+        assert!(is_protected_path(".git/hooks/pre-commit", &[]));
+    }
+
+    #[test]
+    fn protected_path_closed_code() {
+        assert!(is_protected_path(".closed-code", &[]));
+        assert!(is_protected_path(".closed-code/config.toml", &[]));
+    }
+
+    #[test]
+    fn protected_path_env() {
+        assert!(is_protected_path(".env", &[]));
+    }
+
+    #[test]
+    fn protected_path_pem_extension() {
+        assert!(is_protected_path("secrets/api.pem", &[]));
+        assert!(is_protected_path("CERT.PEM", &[]));
+    }
+
+    #[test]
+    fn protected_path_key_extension() {
+        assert!(is_protected_path("server.key", &[]));
+        assert!(is_protected_path("SSL.KEY", &[]));
+    }
+
+    #[test]
+    fn not_protected_github() {
+        assert!(!is_protected_path(".github/workflows/ci.yml", &[]));
+    }
+
+    #[test]
+    fn not_protected_gitignore() {
+        assert!(!is_protected_path(".gitignore", &[]));
+        assert!(!is_protected_path("src/.gitignore", &[]));
+    }
+
+    #[test]
+    fn not_protected_src_file() {
+        assert!(!is_protected_path("src/main.rs", &[]));
+    }
+
+    #[test]
+    fn not_protected_env_example() {
+        // .env.example does NOT equal ".env" and does NOT start with ".env/"
+        assert!(!is_protected_path(".env.example", &[]));
+    }
+
+    #[test]
+    fn additional_paths_custom() {
+        let additional = vec![".secrets".to_string(), "credentials.json".to_string()];
+        assert!(is_protected_path(".secrets", &additional));
+        assert!(is_protected_path(".secrets/api_key.txt", &additional));
+        assert!(is_protected_path("credentials.json", &additional));
+        assert!(!is_protected_path("src/main.rs", &additional));
+    }
+
+    #[test]
+    fn additional_paths_empty() {
+        assert!(is_protected_path(".git", &[]));
+        assert!(!is_protected_path("src/main.rs", &[]));
+    }
+
+    #[test]
+    fn additional_paths_nested() {
+        let additional = vec!["config/secrets".to_string()];
+        assert!(is_protected_path("config/secrets", &additional));
+        assert!(is_protected_path("config/secrets/deep/file.txt", &additional));
+        assert!(!is_protected_path("config/other.txt", &additional));
     }
 }

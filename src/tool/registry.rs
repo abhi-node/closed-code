@@ -5,6 +5,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::gemini::GeminiClient;
+use crate::sandbox::Sandbox;
 use crate::ui::approval::ApprovalHandler;
 
 use crate::error::{ClosedCodeError, Result};
@@ -112,9 +113,12 @@ impl std::fmt::Debug for ToolRegistry {
 }
 
 /// Create a ToolRegistry with all Phase 2 tools registered.
-pub fn create_default_registry(working_directory: PathBuf) -> ToolRegistry {
+pub fn create_default_registry(
+    working_directory: PathBuf,
+    sandbox: Arc<dyn Sandbox>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory, false);
+    register_filesystem_tools(&mut registry, working_directory, false, sandbox);
     registry
 }
 
@@ -123,6 +127,7 @@ fn register_filesystem_tools(
     registry: &mut ToolRegistry,
     working_directory: PathBuf,
     bypass_shell_allowlist: bool,
+    sandbox: Arc<dyn Sandbox>,
 ) {
     registry.register(Box::new(super::filesystem::ReadFileTool::new(
         working_directory.clone(),
@@ -138,20 +143,24 @@ fn register_filesystem_tools(
     )));
     if bypass_shell_allowlist {
         registry.register(Box::new(
-            super::shell::ShellCommandTool::with_bypass_allowlist(working_directory),
+            super::shell::ShellCommandTool::with_bypass_allowlist(working_directory, sandbox),
         ));
     } else {
         registry.register(Box::new(super::shell::ShellCommandTool::new(
             working_directory,
+            sandbox,
         )));
     }
 }
 
 /// Create a ToolRegistry for Explorer sub-agents.
 /// Includes filesystem tools + create_report. No spawn tools (terminal).
-pub fn create_subagent_registry(working_directory: PathBuf) -> ToolRegistry {
+pub fn create_subagent_registry(
+    working_directory: PathBuf,
+    sandbox: Arc<dyn Sandbox>,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory, false);
+    register_filesystem_tools(&mut registry, working_directory, false, sandbox);
     registry.register(Box::new(super::report::CreateReportTool::new()));
     registry
 }
@@ -166,10 +175,17 @@ pub fn create_orchestrator_registry(
     mode: &Mode,
     client: Arc<GeminiClient>,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    sandbox: Arc<dyn Sandbox>,
+    protected_paths: Vec<String>,
 ) -> ToolRegistry {
     let bypass_shell = matches!(mode, Mode::Auto);
     let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory.clone(), bypass_shell);
+    register_filesystem_tools(
+        &mut registry,
+        working_directory.clone(),
+        bypass_shell,
+        sandbox.clone(),
+    );
 
     // Spawn tools (mode-dependent)
     match mode {
@@ -177,16 +193,19 @@ pub fn create_orchestrator_registry(
             registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
                 client,
                 working_directory,
+                sandbox,
             )));
         }
         Mode::Plan => {
             registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
                 client.clone(),
                 working_directory.clone(),
+                sandbox.clone(),
             )));
             registry.register(Box::new(super::spawn::SpawnPlannerTool::new(
                 client.clone(),
                 working_directory.clone(),
+                sandbox,
             )));
             registry.register(Box::new(super::spawn::SpawnWebSearchTool::new(
                 client,
@@ -197,20 +216,24 @@ pub fn create_orchestrator_registry(
             registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
                 client.clone(),
                 working_directory.clone(),
+                sandbox.clone(),
             )));
             registry.register(Box::new(super::spawn::SpawnPlannerTool::new(
                 client,
                 working_directory.clone(),
+                sandbox,
             )));
             // Write tools — Guided, Execute, and Auto modes
             if let Some(handler) = approval_handler {
                 registry.register(Box::new(super::file_write::WriteFileTool::new(
                     working_directory.clone(),
                     handler.clone(),
+                    protected_paths.clone(),
                 )));
                 registry.register(Box::new(super::file_edit::EditFileTool::new(
                     working_directory,
                     handler,
+                    protected_paths,
                 )));
             }
         }
@@ -223,8 +246,13 @@ pub fn create_orchestrator_registry(
 mod tests {
     use super::*;
     use crate::gemini::types::Parameters;
+    use crate::sandbox::mock::MockSandbox;
     use async_trait::async_trait;
     use serde_json::json;
+
+    fn mock_sandbox() -> Arc<dyn Sandbox> {
+        Arc::new(MockSandbox::new(PathBuf::from("/tmp")))
+    }
 
     #[derive(Debug)]
     struct MockTool {
@@ -381,7 +409,7 @@ mod tests {
 
     #[test]
     fn create_default_registry_has_all_tools() {
-        let registry = create_default_registry(PathBuf::from("/tmp"));
+        let registry = create_default_registry(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(registry.len(), 5);
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("list_directory").is_some());
@@ -407,8 +435,14 @@ mod tests {
             "key".into(),
             "model".into(),
         ));
-        let registry =
-            create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Explore, client, None);
+        let registry = create_orchestrator_registry(
+            PathBuf::from("/tmp"),
+            &Mode::Explore,
+            client,
+            None,
+            mock_sandbox(),
+            vec![],
+        );
         // 5 filesystem/shell + spawn_explorer = 6
         assert_eq!(registry.len(), 6);
         assert!(registry.get("spawn_explorer").is_some());
@@ -422,8 +456,14 @@ mod tests {
             "key".into(),
             "model".into(),
         ));
-        let registry =
-            create_orchestrator_registry(PathBuf::from("/tmp"), &Mode::Plan, client, None);
+        let registry = create_orchestrator_registry(
+            PathBuf::from("/tmp"),
+            &Mode::Plan,
+            client,
+            None,
+            mock_sandbox(),
+            vec![],
+        );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
         assert_eq!(registry.len(), 8);
         assert!(registry.get("spawn_explorer").is_some());
@@ -446,6 +486,8 @@ mod tests {
             &Mode::Execute,
             client,
             Some(handler),
+            mock_sandbox(),
+            vec![],
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(registry.len(), 9);
@@ -466,6 +508,8 @@ mod tests {
             &Mode::Execute,
             client,
             None,
+            mock_sandbox(),
+            vec![],
         );
         // No write tools, but spawn tools: 5 filesystem/shell + spawn_explorer + spawn_planner = 7
         assert_eq!(registry.len(), 7);
@@ -486,6 +530,8 @@ mod tests {
             &Mode::Explore,
             client,
             Some(handler),
+            mock_sandbox(),
+            vec![],
         );
         // Explore mode: no write tools regardless of handler
         assert_eq!(registry.len(), 6);
@@ -505,6 +551,8 @@ mod tests {
             &Mode::Guided,
             client,
             Some(handler),
+            mock_sandbox(),
+            vec![],
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(registry.len(), 9);
@@ -518,7 +566,7 @@ mod tests {
 
     #[test]
     fn create_subagent_registry_has_tools() {
-        let registry = create_subagent_registry(PathBuf::from("/tmp"));
+        let registry = create_subagent_registry(PathBuf::from("/tmp"), mock_sandbox());
         // 5 filesystem/shell + create_report = 6
         assert_eq!(registry.len(), 6);
         assert!(registry.get("create_report").is_some());
@@ -538,6 +586,8 @@ mod tests {
             &Mode::Auto,
             client,
             Some(handler),
+            mock_sandbox(),
+            vec![],
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(registry.len(), 9);

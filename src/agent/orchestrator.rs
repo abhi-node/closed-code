@@ -15,6 +15,7 @@ use crate::gemini::types::{Content, GenerateContentRequest, GenerationConfig, Pa
 use crate::gemini::GeminiClient;
 use crate::git::GitContext;
 use crate::mode::Mode;
+use crate::sandbox::{Sandbox, SandboxMode};
 use crate::tool::registry::{create_orchestrator_registry, ToolRegistry};
 use crate::ui::approval::ApprovalHandler;
 use crate::ui::spinner::Spinner;
@@ -45,6 +46,9 @@ pub struct Orchestrator {
     model_name: String,
     // Phase 6
     git_context: Option<GitContext>,
+    // Phase 7
+    sandbox: Arc<dyn Sandbox>,
+    protected_paths: Vec<String>,
 }
 
 impl Orchestrator {
@@ -56,15 +60,19 @@ impl Orchestrator {
         approval_handler: Arc<dyn ApprovalHandler>,
         personality: Personality,
         context_window_turns: usize,
+        sandbox: Arc<dyn Sandbox>,
+        protected_paths: Vec<String>,
     ) -> Self {
         let registry = create_orchestrator_registry(
             working_directory.clone(),
             &mode,
             client.clone(),
             Some(approval_handler.clone()),
+            sandbox.clone(),
+            protected_paths.clone(),
         );
         let system_prompt =
-            Self::build_system_prompt(&mode, &working_directory, personality, None);
+            Self::build_system_prompt(&mode, &working_directory, personality, None, &*sandbox);
         let model_name = client.model().to_string();
 
         Self {
@@ -83,6 +91,8 @@ impl Orchestrator {
             session_usage: SessionUsage::new(),
             model_name,
             git_context: None,
+            sandbox,
+            protected_paths,
         }
     }
 
@@ -402,6 +412,7 @@ impl Orchestrator {
         working_directory: &std::path::Path,
         personality: Personality,
         git_context: Option<&GitContext>,
+        sandbox: &dyn Sandbox,
     ) -> String {
         let personality_prefix = match personality {
             Personality::Friendly => {
@@ -573,7 +584,36 @@ impl Orchestrator {
             None => String::new(),
         };
 
-        format!("{}{}{}", base, mode_section, git_section)
+        let sandbox_section = if sandbox.mode() != SandboxMode::FullAccess {
+            let (read_policy, write_policy, network_policy) = match sandbox.mode() {
+                SandboxMode::WorkspaceOnly => (
+                    "workspace + system paths only",
+                    "workspace directory only",
+                    "blocked",
+                ),
+                SandboxMode::WorkspaceWrite => (
+                    "everywhere",
+                    "workspace directory only",
+                    "allowed",
+                ),
+                SandboxMode::FullAccess => unreachable!(),
+            };
+            format!(
+                "\n\nSandbox: {} ({})\n  \
+                 - File reads: {}. File writes: {}.\n  \
+                 - Network: {}.\n  \
+                 - Protected paths: .git/, .closed-code/, .env, *.pem, *.key",
+                sandbox.mode(),
+                sandbox.backend(),
+                read_policy,
+                write_policy,
+                network_policy,
+            )
+        } else {
+            String::new()
+        };
+
+        format!("{}{}{}{}", base, mode_section, git_section, sandbox_section)
     }
 
     /// Switch to a different mode at runtime.
@@ -585,12 +625,15 @@ impl Orchestrator {
             &self.mode,
             self.client.clone(),
             Some(self.approval_handler.clone()),
+            self.sandbox.clone(),
+            self.protected_paths.clone(),
         );
         self.system_prompt = Self::build_system_prompt(
             &self.mode,
             &self.working_directory,
             self.personality,
             self.git_context.as_ref(),
+            &*self.sandbox,
         );
     }
 
@@ -742,6 +785,7 @@ impl Orchestrator {
             &self.working_directory,
             self.personality,
             self.git_context.as_ref(),
+            &*self.sandbox,
         );
     }
 
@@ -762,6 +806,8 @@ impl Orchestrator {
             &self.mode,
             self.client.clone(),
             Some(self.approval_handler.clone()),
+            self.sandbox.clone(),
+            self.protected_paths.clone(),
         );
     }
 
@@ -792,6 +838,7 @@ impl Orchestrator {
             &self.working_directory,
             self.personality,
             self.git_context.as_ref(),
+            &*self.sandbox,
         );
     }
 
@@ -803,6 +850,18 @@ impl Orchestrator {
     /// Reference to the working directory.
     pub fn working_directory(&self) -> &std::path::Path {
         &self.working_directory
+    }
+
+    // ── Phase 7: Sandbox accessors ──
+
+    /// Get the current sandbox mode.
+    pub fn sandbox_mode(&self) -> SandboxMode {
+        self.sandbox.mode()
+    }
+
+    /// One-line sandbox summary for display.
+    pub fn sandbox_summary(&self) -> String {
+        format!("{} ({})", self.sandbox.mode(), self.sandbox.backend())
     }
 
     /// Get the detected default branch name, if any.
@@ -827,7 +886,7 @@ impl Orchestrator {
     pub async fn run_commit_agent(&self, diff: &str) -> Result<String> {
         use crate::agent::Agent;
 
-        let agent = CommitAgent::new(self.working_directory.clone());
+        let agent = CommitAgent::new(self.working_directory.clone(), self.sandbox.clone());
         let request = AgentRequest::new(
             "Generate a commit message for the following code changes.".to_string(),
             self.working_directory.to_string_lossy().to_string(),
@@ -844,7 +903,7 @@ impl Orchestrator {
     pub async fn run_review_agent(&mut self, diff: &str) -> Result<String> {
         use crate::agent::Agent;
 
-        let agent = ReviewAgent::new(self.working_directory.clone());
+        let agent = ReviewAgent::new(self.working_directory.clone(), self.sandbox.clone());
         let request = AgentRequest::new(
             "Review the following code changes thoroughly.".to_string(),
             self.working_directory.to_string_lossy().to_string(),
@@ -925,6 +984,7 @@ pub(crate) fn format_tool_call(name: &str, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::mock::MockSandbox;
     use crate::ui::approval::AutoApproveHandler;
 
     fn test_client() -> Arc<GeminiClient> {
@@ -935,6 +995,12 @@ mod tests {
         Arc::new(AutoApproveHandler::always_approve())
     }
 
+    fn mock_sandbox() -> Arc<dyn Sandbox> {
+        Arc::new(MockSandbox::new(PathBuf::from("/tmp")))
+    }
+
+
+
     fn test_orchestrator() -> Orchestrator {
         Orchestrator::new(
             test_client(),
@@ -944,6 +1010,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         )
     }
 
@@ -967,6 +1035,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
         assert_eq!(orch.tool_count(), 8);
@@ -985,6 +1055,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(orch.tool_count(), 9);
@@ -1049,6 +1121,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             20, // smaller context window
+            mock_sandbox(),
+            vec![],
         );
 
         for i in 0..30 {
@@ -1151,6 +1225,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
 
         assert!(orch.current_plan().is_none());
@@ -1168,6 +1244,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
 
         orch.set_current_plan("The plan content".into());
@@ -1200,6 +1278,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
 
         let plan = orch.accept_plan(Mode::Execute);
@@ -1217,6 +1297,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
 
         orch.set_current_plan("The plan content".into());
@@ -1237,6 +1319,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
 
         assert_eq!(*orch.mode(), Mode::Explore);
@@ -1268,6 +1352,8 @@ mod tests {
             test_handler(),
             Personality::Friendly,
             50,
+            mock_sandbox(),
+            vec![],
         );
         assert!(orch.system_prompt().contains("warm"));
         assert!(orch.system_prompt().contains("encouraging"));
@@ -1283,6 +1369,8 @@ mod tests {
             test_handler(),
             Personality::Pragmatic,
             50,
+            mock_sandbox(),
+            vec![],
         );
         assert!(orch.system_prompt().contains("direct"));
         assert!(orch.system_prompt().contains("concise"));
@@ -1298,6 +1386,8 @@ mod tests {
             test_handler(),
             Personality::None,
             50,
+            mock_sandbox(),
+            vec![],
         );
         assert!(!orch.system_prompt().contains("warm"));
         assert!(!orch.system_prompt().contains("concise, and code-focused"));
@@ -1325,6 +1415,8 @@ mod tests {
             test_handler(),
             Personality::Friendly,
             50,
+            mock_sandbox(),
+            vec![],
         );
         assert!(orch.system_prompt().contains("warm"));
 
@@ -1369,6 +1461,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             100,
+            mock_sandbox(),
+            vec![],
         );
         assert_eq!(orch2.context_window_turns(), 100);
     }
@@ -1385,6 +1479,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(orch.tool_count(), 9);
@@ -1428,11 +1524,13 @@ mod tests {
             }],
             recent_commits: vec!["abc1234 Initial commit".into()],
         };
+        let sandbox = MockSandbox::new(PathBuf::from("/tmp"));
         let prompt = Orchestrator::build_system_prompt(
             &Mode::Explore,
             std::path::Path::new("/tmp"),
             Personality::default(),
             Some(&git_ctx),
+            &sandbox,
         );
         assert!(prompt.contains("Git context:"));
         assert!(prompt.contains("On branch `main`"));
@@ -1442,11 +1540,13 @@ mod tests {
 
     #[test]
     fn system_prompt_no_git_context() {
+        let sandbox = MockSandbox::new(PathBuf::from("/tmp"));
         let prompt = Orchestrator::build_system_prompt(
             &Mode::Explore,
             std::path::Path::new("/tmp"),
             Personality::default(),
             None,
+            &sandbox,
         );
         assert!(!prompt.contains("Git context:"));
         // Should still have the normal content
@@ -1482,6 +1582,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
         orch.detect_git_context().await;
         assert_eq!(orch.git_summary(), "not a git repository");
@@ -1540,6 +1642,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
         orch.detect_git_context().await;
 
@@ -1596,6 +1700,8 @@ mod tests {
             test_handler(),
             Personality::default(),
             50,
+            mock_sandbox(),
+            vec![],
         );
         orch.detect_git_context().await;
         assert!(orch.system_prompt().contains("Git context:"));
@@ -1612,7 +1718,7 @@ mod tests {
     fn commit_agent_accessible() {
         use crate::agent::commit_agent::CommitAgent;
         use crate::agent::Agent;
-        let agent = CommitAgent::new(PathBuf::from("/tmp"));
+        let agent = CommitAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "commit");
     }
 
@@ -1620,7 +1726,7 @@ mod tests {
     fn review_agent_accessible() {
         use crate::agent::review_agent::ReviewAgent;
         use crate::agent::Agent;
-        let agent = ReviewAgent::new(PathBuf::from("/tmp"));
+        let agent = ReviewAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "reviewer");
     }
 }

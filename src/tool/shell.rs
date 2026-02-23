@@ -1,11 +1,13 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::PathBuf;
-use std::time::Duration;
-use tokio::process::Command;
 
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::types::FunctionDeclaration;
+use crate::sandbox::Sandbox;
 
 use super::{ParamBuilder, Tool};
 
@@ -22,21 +24,24 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ShellCommandTool {
     working_directory: PathBuf,
     bypass_allowlist: bool,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl ShellCommandTool {
-    pub fn new(working_directory: PathBuf) -> Self {
+    pub fn new(working_directory: PathBuf, sandbox: Arc<dyn Sandbox>) -> Self {
         Self {
             working_directory,
             bypass_allowlist: false,
+            sandbox,
         }
     }
 
     /// Create a shell tool that bypasses the command allowlist (for Auto mode).
-    pub fn with_bypass_allowlist(working_directory: PathBuf) -> Self {
+    pub fn with_bypass_allowlist(working_directory: PathBuf, sandbox: Arc<dyn Sandbox>) -> Self {
         Self {
             working_directory,
             bypass_allowlist: true,
+            sandbox,
         }
     }
 
@@ -136,14 +141,11 @@ impl Tool for ShellCommandTool {
 
         let output = tokio::time::timeout(
             COMMAND_TIMEOUT,
-            Command::new(&cmd)
-                .args(&cmd_args)
-                .current_dir(&self.working_directory)
-                .output(),
+            self.sandbox
+                .execute_command(&cmd, &cmd_args, &self.working_directory),
         )
         .await
-        .map_err(|_| ClosedCodeError::ShellTimeout { seconds: 30 })?
-        .map_err(|e| ClosedCodeError::ShellError(format!("Failed to execute '{}': {}", cmd, e)))?;
+        .map_err(|_| ClosedCodeError::ShellTimeout { seconds: 30 })??;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -174,11 +176,17 @@ impl Tool for ShellCommandTool {
 mod tests {
     use super::*;
     use crate::mode::Mode;
+    use crate::sandbox::mock::MockSandbox;
+
+    fn mock_sandbox(dir: &std::path::Path) -> Arc<dyn Sandbox> {
+        Arc::new(MockSandbox::new(dir.to_path_buf()))
+    }
 
     #[tokio::test]
     async fn shell_allowed_command() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellCommandTool::new(dir.path().to_path_buf());
+        let sandbox = mock_sandbox(dir.path());
+        let tool = ShellCommandTool::new(dir.path().to_path_buf(), sandbox);
         let result = tool
             .execute(json!({"command": "echo hello"}))
             .await
@@ -190,7 +198,8 @@ mod tests {
     #[tokio::test]
     async fn shell_blocked_command() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellCommandTool::new(dir.path().to_path_buf());
+        let sandbox = mock_sandbox(dir.path());
+        let tool = ShellCommandTool::new(dir.path().to_path_buf(), sandbox);
         let result = tool.execute(json!({"command": "rm -rf /"})).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -245,7 +254,8 @@ mod tests {
     #[tokio::test]
     async fn shell_missing_command_arg() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellCommandTool::new(dir.path().to_path_buf());
+        let sandbox = mock_sandbox(dir.path());
+        let tool = ShellCommandTool::new(dir.path().to_path_buf(), sandbox);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -259,7 +269,9 @@ mod tests {
 
     #[test]
     fn shell_tool_trait_methods() {
-        let tool = ShellCommandTool::new(PathBuf::from("/tmp"));
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(MockSandbox::new(PathBuf::from("/tmp")));
+        let tool = ShellCommandTool::new(PathBuf::from("/tmp"), sandbox);
         assert_eq!(tool.name(), "shell");
         assert!(tool.description().contains("allowlisted"));
         assert_eq!(tool.declaration().name, "shell");
@@ -271,7 +283,9 @@ mod tests {
 
     #[test]
     fn shell_bypass_description() {
-        let tool = ShellCommandTool::with_bypass_allowlist(PathBuf::from("/tmp"));
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(MockSandbox::new(PathBuf::from("/tmp")));
+        let tool = ShellCommandTool::with_bypass_allowlist(PathBuf::from("/tmp"), sandbox);
         assert!(tool.description().contains("without restrictions"));
         assert!(!tool.description().contains("allowlisted"));
     }
@@ -279,7 +293,8 @@ mod tests {
     #[tokio::test]
     async fn shell_bypass_allows_any_command() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellCommandTool::with_bypass_allowlist(dir.path().to_path_buf());
+        let sandbox = mock_sandbox(dir.path());
+        let tool = ShellCommandTool::with_bypass_allowlist(dir.path().to_path_buf(), sandbox);
         // 'rm' is normally blocked by the allowlist
         let result = tool
             .execute(json!({"command": "echo bypass_test"}))
@@ -305,5 +320,21 @@ mod tests {
     fn parse_without_validation_mismatched_quotes() {
         let result = ShellCommandTool::parse_without_validation("echo 'hello");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn shell_routes_through_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = mock_sandbox(dir.path());
+        let tool = ShellCommandTool::new(dir.path().to_path_buf(), sandbox);
+        let result = tool
+            .execute(json!({"command": "echo sandbox_routed"}))
+            .await
+            .unwrap();
+        assert!(result["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("sandbox_routed"));
+        assert_eq!(result["exit_code"], 0);
     }
 }

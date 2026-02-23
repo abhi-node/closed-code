@@ -12,28 +12,22 @@ use crate::ui::approval::{ApprovalDecision, ApprovalHandler, FileChange};
 
 use super::{ParamBuilder, Tool};
 
-/// Check if a path is protected and should not be modified.
-fn is_protected_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    normalized == ".git"
-        || normalized.starts_with(".git/")
-        || normalized == ".closed-code"
-        || normalized.starts_with(".closed-code/")
-}
-
 pub struct WriteFileTool {
     working_directory: PathBuf,
     approval_handler: Arc<dyn ApprovalHandler>,
+    protected_paths: Vec<String>,
 }
 
 impl WriteFileTool {
     pub fn new(
         working_directory: PathBuf,
         approval_handler: Arc<dyn ApprovalHandler>,
+        protected_paths: Vec<String>,
     ) -> Self {
         Self {
             working_directory,
             approval_handler,
+            protected_paths,
         }
     }
 
@@ -102,7 +96,7 @@ impl Tool for WriteFileTool {
             })?;
 
         // Check protected paths
-        if is_protected_path(path_str) {
+        if super::is_protected_path(path_str, &self.protected_paths) {
             return Err(ClosedCodeError::ProtectedPath {
                 path: path_str.to_string(),
             });
@@ -212,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn write_new_file_approved() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "hello.rs",
@@ -231,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn write_new_file_rejected() {
         let (dir, handler) = setup_reject();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "hello.rs",
@@ -250,7 +244,7 @@ mod tests {
         let file_path = dir.path().join("existing.rs");
         std::fs::write(&file_path, "old content").unwrap();
 
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "existing.rs",
@@ -268,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn write_creates_parent_dirs() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "nested/deep/file.rs",
@@ -287,7 +281,7 @@ mod tests {
         let file_path = dir.path().join("same.rs");
         std::fs::write(&file_path, "same content").unwrap();
 
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "same.rs",
@@ -302,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn write_missing_path_arg() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool.execute(json!({"content": "x"})).await;
         assert!(result.is_err());
     }
@@ -310,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn write_missing_content_arg() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool.execute(json!({"path": "x.rs"})).await;
         assert!(result.is_err());
     }
@@ -318,14 +312,14 @@ mod tests {
     #[test]
     fn write_available_modes() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         assert_eq!(tool.available_modes(), vec![Mode::Guided, Mode::Execute, Mode::Auto]);
     }
 
     #[test]
     fn write_tool_debug() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let debug = format!("{:?}", tool);
         assert!(debug.contains("WriteFileTool"));
     }
@@ -333,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn write_protected_git_path_rejected() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": ".git/config",
@@ -350,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn write_protected_closed_code_rejected() {
         let (dir, handler) = setup();
-        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": ".closed-code/config.toml",
@@ -364,17 +358,58 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn is_protected_path_variants() {
-        assert!(is_protected_path(".git"));
-        assert!(is_protected_path(".git/config"));
-        assert!(is_protected_path(".git/hooks/pre-commit"));
-        assert!(is_protected_path(".closed-code"));
-        assert!(is_protected_path(".closed-code/config.toml"));
+    #[tokio::test]
+    async fn write_protected_env_rejected() {
+        let (dir, handler) = setup();
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
+        let result = tool
+            .execute(json!({
+                "path": ".env",
+                "content": "SECRET=bad"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
+    }
 
-        assert!(!is_protected_path(".github/workflows/ci.yml"));
-        assert!(!is_protected_path("src/.gitignore"));
-        assert!(!is_protected_path(".gitignore"));
-        assert!(!is_protected_path("src/main.rs"));
+    #[tokio::test]
+    async fn write_protected_pem_rejected() {
+        let (dir, handler) = setup();
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
+        let result = tool
+            .execute(json!({
+                "path": "secrets/key.pem",
+                "content": "bad"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_custom_protected_path() {
+        let (dir, handler) = setup();
+        let tool = WriteFileTool::new(
+            dir.path().to_path_buf(),
+            handler,
+            vec!["credentials.json".to_string()],
+        );
+        let result = tool
+            .execute(json!({
+                "path": "credentials.json",
+                "content": "bad"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
     }
 }

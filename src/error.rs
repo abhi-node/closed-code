@@ -100,6 +100,13 @@ pub enum ClosedCodeError {
 
     #[error("Invalid personality '{0}'. Expected: friendly, pragmatic, none")]
     InvalidPersonality(String),
+
+    // Sandbox errors (Phase 7)
+    #[error("Sandbox denied: command '{command}' — {reason}")]
+    SandboxDenied { command: String, reason: String },
+
+    #[error("Invalid sandbox mode '{0}'. Expected: workspace-only, workspace-write, full-access")]
+    InvalidSandboxMode(String),
 }
 
 impl ClosedCodeError {
@@ -335,5 +342,39 @@ mod tests {
             ClosedCodeError::RegexError("bad regex".into()).to_string(),
             "Invalid regex pattern: bad regex"
         );
+    }
+
+    #[test]
+    fn sandbox_denied_display_message() {
+        assert_eq!(
+            ClosedCodeError::SandboxDenied {
+                command: "touch".into(),
+                reason: "Seatbelt denied operation (mode: workspace-write)".into(),
+            }
+            .to_string(),
+            "Sandbox denied: command 'touch' \u{2014} Seatbelt denied operation (mode: workspace-write)"
+        );
+    }
+
+    #[test]
+    fn invalid_sandbox_mode_display_message() {
+        assert_eq!(
+            ClosedCodeError::InvalidSandboxMode("bad".into()).to_string(),
+            "Invalid sandbox mode 'bad'. Expected: workspace-only, workspace-write, full-access"
+        );
+    }
+
+    #[test]
+    fn sandbox_errors_are_not_retryable() {
+        let errors: Vec<ClosedCodeError> = vec![
+            ClosedCodeError::SandboxDenied {
+                command: "touch".into(),
+                reason: "denied".into(),
+            },
+            ClosedCodeError::InvalidSandboxMode("bad".into()),
+        ];
+        for err in &errors {
+            assert!(!err.is_retryable(), "Expected not retryable: {err}");
+        }
     }
 }

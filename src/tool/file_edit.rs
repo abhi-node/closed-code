@@ -12,28 +12,22 @@ use crate::ui::approval::{ApprovalDecision, ApprovalHandler, FileChange};
 
 use super::{ParamBuilder, Tool};
 
-/// Check if a path is protected and should not be modified.
-fn is_protected_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    normalized == ".git"
-        || normalized.starts_with(".git/")
-        || normalized == ".closed-code"
-        || normalized.starts_with(".closed-code/")
-}
-
 pub struct EditFileTool {
     working_directory: PathBuf,
     approval_handler: Arc<dyn ApprovalHandler>,
+    protected_paths: Vec<String>,
 }
 
 impl EditFileTool {
     pub fn new(
         working_directory: PathBuf,
         approval_handler: Arc<dyn ApprovalHandler>,
+        protected_paths: Vec<String>,
     ) -> Self {
         Self {
             working_directory,
             approval_handler,
+            protected_paths,
         }
     }
 
@@ -116,7 +110,7 @@ impl Tool for EditFileTool {
             })?;
 
         // Check protected paths
-        if is_protected_path(path_str) {
+        if super::is_protected_path(path_str, &self.protected_paths) {
             return Err(ClosedCodeError::ProtectedPath {
                 path: path_str.to_string(),
             });
@@ -244,7 +238,7 @@ mod tests {
         let (dir, handler) = setup();
         create_file(&dir, "test.rs", "fn main() {\n    old_code();\n}\n");
 
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "test.rs",
@@ -267,7 +261,7 @@ mod tests {
         let original = "fn main() {\n    original();\n}\n";
         create_file(&dir, "test.rs", original);
 
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "test.rs",
@@ -289,7 +283,7 @@ mod tests {
         let (dir, handler) = setup();
         create_file(&dir, "test.rs", "fn main() {}\n");
 
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "test.rs",
@@ -307,7 +301,7 @@ mod tests {
         let (dir, handler) = setup();
         create_file(&dir, "test.rs", "foo\nfoo\nfoo\n");
 
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "test.rs",
@@ -330,7 +324,7 @@ mod tests {
     #[tokio::test]
     async fn edit_nonexistent_file() {
         let (dir, handler) = setup();
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "missing.rs",
@@ -345,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn edit_missing_args() {
         let (dir, handler) = setup();
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
 
         // Missing old_text
         let result = tool
@@ -371,7 +365,7 @@ mod tests {
         let (dir, handler) = setup();
         create_file(&dir, "test.rs", "line 1\ndelete me\nline 3\n");
 
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": "test.rs",
@@ -389,14 +383,14 @@ mod tests {
     #[test]
     fn edit_available_modes() {
         let (dir, handler) = setup();
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         assert_eq!(tool.available_modes(), vec![Mode::Guided, Mode::Execute, Mode::Auto]);
     }
 
     #[test]
     fn edit_tool_debug() {
         let (dir, handler) = setup();
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let debug = format!("{:?}", tool);
         assert!(debug.contains("EditFileTool"));
     }
@@ -404,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn edit_protected_git_path_rejected() {
         let (dir, handler) = setup();
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": ".git/config",
@@ -422,10 +416,28 @@ mod tests {
     #[tokio::test]
     async fn edit_protected_closed_code_rejected() {
         let (dir, handler) = setup();
-        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
         let result = tool
             .execute(json!({
                 "path": ".closed-code/config.toml",
+                "old_text": "old",
+                "new_text": "new"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_protected_env_rejected() {
+        let (dir, handler) = setup();
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
+        let result = tool
+            .execute(json!({
+                "path": ".env",
                 "old_text": "old",
                 "new_text": "new"
             }))

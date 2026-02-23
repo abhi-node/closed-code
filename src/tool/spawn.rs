@@ -12,6 +12,7 @@ use crate::error::Result;
 use crate::gemini::types::FunctionDeclaration;
 use crate::gemini::GeminiClient;
 use crate::mode::Mode;
+use crate::sandbox::Sandbox;
 
 use super::{ParamBuilder, Tool};
 
@@ -21,13 +22,19 @@ use super::{ParamBuilder, Tool};
 pub struct SpawnExplorerTool {
     client: Arc<GeminiClient>,
     working_directory: PathBuf,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl SpawnExplorerTool {
-    pub fn new(client: Arc<GeminiClient>, working_directory: PathBuf) -> Self {
+    pub fn new(
+        client: Arc<GeminiClient>,
+        working_directory: PathBuf,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Self {
         Self {
             client,
             working_directory,
+            sandbox,
         }
     }
 }
@@ -83,7 +90,7 @@ impl Tool for SpawnExplorerTool {
 
         tracing::info!("Spawning explorer agent: {}", request.task);
 
-        let agent = ExplorerAgent::new(self.working_directory.clone());
+        let agent = ExplorerAgent::new(self.working_directory.clone(), self.sandbox.clone());
         let response = agent.run(&self.client, request).await?;
 
         Ok(json!({
@@ -111,13 +118,19 @@ impl Tool for SpawnExplorerTool {
 pub struct SpawnPlannerTool {
     client: Arc<GeminiClient>,
     working_directory: PathBuf,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl SpawnPlannerTool {
-    pub fn new(client: Arc<GeminiClient>, working_directory: PathBuf) -> Self {
+    pub fn new(
+        client: Arc<GeminiClient>,
+        working_directory: PathBuf,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Self {
         Self {
             client,
             working_directory,
+            sandbox,
         }
     }
 }
@@ -171,7 +184,7 @@ impl Tool for SpawnPlannerTool {
 
         tracing::info!("Spawning planner agent: {}", request.task);
 
-        let agent = PlannerAgent::new(self.working_directory.clone());
+        let agent = PlannerAgent::new(self.working_directory.clone(), self.sandbox.clone());
         let response = agent.run(&self.client, request).await?;
 
         Ok(json!({
@@ -279,11 +292,16 @@ impl Tool for SpawnWebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::mock::MockSandbox;
+
+    fn mock_sandbox() -> Arc<dyn Sandbox> {
+        Arc::new(MockSandbox::new(PathBuf::from("/tmp")))
+    }
 
     #[test]
     fn spawn_explorer_tool_properties() {
         let client = Arc::new(GeminiClient::new("key".into(), "model".into()));
-        let tool = SpawnExplorerTool::new(client, PathBuf::from("/tmp"));
+        let tool = SpawnExplorerTool::new(client, PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(tool.name(), "spawn_explorer");
         assert!(tool.available_modes().contains(&Mode::Explore));
         assert!(tool.available_modes().contains(&Mode::Plan));
@@ -294,7 +312,7 @@ mod tests {
     #[test]
     fn spawn_planner_tool_properties() {
         let client = Arc::new(GeminiClient::new("key".into(), "model".into()));
-        let tool = SpawnPlannerTool::new(client, PathBuf::from("/tmp"));
+        let tool = SpawnPlannerTool::new(client, PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(tool.name(), "spawn_planner");
         assert!(tool.available_modes().contains(&Mode::Plan));
         assert!(tool.available_modes().contains(&Mode::Guided));

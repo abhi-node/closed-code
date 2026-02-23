@@ -36,6 +36,10 @@ pub struct Cli {
     #[arg(long)]
     pub max_output_tokens: Option<u32>,
 
+    /// Sandbox mode: workspace-only, workspace-write, full-access
+    #[arg(long, value_name = "MODE")]
+    pub sandbox: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -127,5 +131,12 @@ mod tests {
         assert!(cli.personality.is_none());
         assert!(cli.context_window_turns.is_none());
         assert!(cli.max_output_tokens.is_none());
+        assert!(cli.sandbox.is_none());
+    }
+
+    #[test]
+    fn parse_sandbox_flag() {
+        let cli = Cli::parse_from(["closed-code", "--sandbox", "workspace-only"]);
+        assert_eq!(cli.sandbox.as_deref(), Some("workspace-only"));
     }
 }

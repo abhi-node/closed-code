@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::cli::Cli;
 use crate::error::ClosedCodeError;
 use crate::mode::Mode;
+use crate::sandbox::SandboxMode;
 
 // ── Personality ──
 
@@ -64,11 +65,19 @@ pub struct TomlConfig {
     pub verbose: Option<bool>,
     #[serde(default)]
     pub shell: Option<ShellConfig>,
+    #[serde(default)]
+    pub security: Option<SecurityConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ShellConfig {
     pub additional_allowlist: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SecurityConfig {
+    pub sandbox_mode: Option<String>,
+    pub protected_paths: Option<Vec<String>>,
 }
 
 // ── Final Config ──
@@ -84,6 +93,8 @@ pub struct Config {
     pub context_window_turns: usize,
     pub verbose: bool,
     pub max_output_tokens: u32,
+    pub sandbox_mode: SandboxMode,
+    pub protected_paths: Vec<String>,
 }
 
 impl Config {
@@ -163,6 +174,24 @@ impl Config {
             .and_then(|s| s.additional_allowlist)
             .unwrap_or_default();
 
+        // Resolve sandbox mode: CLI → TOML → default (WorkspaceWrite)
+        let sandbox_mode = if let Some(ref s) = cli.sandbox {
+            s.parse::<SandboxMode>()?
+        } else if let Some(ref sec) = merged.security {
+            if let Some(ref s) = sec.sandbox_mode {
+                s.parse::<SandboxMode>()?
+            } else {
+                SandboxMode::default()
+            }
+        } else {
+            SandboxMode::default()
+        };
+
+        let protected_paths = merged
+            .security
+            .and_then(|s| s.protected_paths)
+            .unwrap_or_default();
+
         Ok(Self {
             api_key,
             model,
@@ -173,6 +202,8 @@ impl Config {
             context_window_turns,
             verbose,
             max_output_tokens,
+            sandbox_mode,
+            protected_paths,
         })
     }
 
@@ -204,6 +235,7 @@ impl Config {
             max_output_tokens: overlay.max_output_tokens.or(base.max_output_tokens),
             verbose: overlay.verbose.or(base.verbose),
             shell: overlay.shell.or(base.shell),
+            security: overlay.security.or(base.security),
         }
     }
 
@@ -240,6 +272,8 @@ mod tests {
         assert_eq!(config.max_output_tokens, 8192);
         assert!(!config.verbose);
         assert!(config.shell_additional_allowlist.is_empty());
+        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceWrite);
+        assert!(config.protected_paths.is_empty());
     }
 
     #[test]
@@ -400,5 +434,66 @@ additional_allowlist = ["docker", "cargo"]
         assert_eq!(Personality::Friendly.to_string(), "friendly");
         assert_eq!(Personality::Pragmatic.to_string(), "pragmatic");
         assert_eq!(Personality::None.to_string(), "none");
+    }
+
+    // ── Sandbox / Security Config ──
+
+    #[test]
+    fn config_from_cli_with_sandbox() {
+        let cli = Cli::parse_from([
+            "closed-code",
+            "--api-key",
+            "k",
+            "--sandbox",
+            "workspace-only",
+        ]);
+        let config = Config::from_cli(&cli).unwrap();
+        assert_eq!(config.sandbox_mode, SandboxMode::WorkspaceOnly);
+    }
+
+    #[test]
+    fn config_from_cli_invalid_sandbox() {
+        let cli = Cli::parse_from(["closed-code", "--api-key", "k", "--sandbox", "bad"]);
+        let result = Config::from_cli(&cli);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_toml_security_section() {
+        let toml_str = r#"
+api_key = "key"
+
+[security]
+sandbox_mode = "full-access"
+protected_paths = ["secrets/", "credentials.json"]
+"#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let sec = config.security.unwrap();
+        assert_eq!(sec.sandbox_mode.as_deref(), Some("full-access"));
+        assert_eq!(
+            sec.protected_paths.unwrap(),
+            vec!["secrets/", "credentials.json"]
+        );
+    }
+
+    #[test]
+    fn config_merge_security() {
+        let base = TomlConfig {
+            security: Some(SecurityConfig {
+                sandbox_mode: Some("workspace-only".into()),
+                protected_paths: Some(vec!["base.key".into()]),
+            }),
+            ..Default::default()
+        };
+        let overlay = TomlConfig {
+            security: Some(SecurityConfig {
+                sandbox_mode: Some("full-access".into()),
+                protected_paths: Some(vec!["overlay.key".into()]),
+            }),
+            ..Default::default()
+        };
+        let merged = Config::merge(base, overlay);
+        let sec = merged.security.unwrap();
+        assert_eq!(sec.sandbox_mode.as_deref(), Some("full-access"));
     }
 }

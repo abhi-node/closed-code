@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::message::{AgentResponse, Artifact, ArtifactType};
@@ -7,6 +8,7 @@ use crate::agent::{Agent, AgentRequest};
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::types::*;
 use crate::gemini::GeminiClient;
+use crate::sandbox::Sandbox;
 use crate::tool::registry::{create_subagent_registry, ToolRegistry};
 
 const REVIEW_MAX_ITERATIONS: usize = 15;
@@ -39,11 +41,15 @@ IMPORTANT:
 #[derive(Debug)]
 pub struct ReviewAgent {
     working_directory: PathBuf,
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl ReviewAgent {
-    pub fn new(working_directory: PathBuf) -> Self {
-        Self { working_directory }
+    pub fn new(working_directory: PathBuf, sandbox: Arc<dyn Sandbox>) -> Self {
+        Self {
+            working_directory,
+            sandbox,
+        }
     }
 
     /// Run the sub-agent's tool-call loop.
@@ -56,7 +62,7 @@ impl ReviewAgent {
         tools: Option<Vec<GeminiTool>>,
         tool_config: Option<ToolConfig>,
     ) -> Result<Option<AgentResponse>> {
-        let registry = create_subagent_registry(self.working_directory.clone());
+        let registry = create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
 
         for iteration in 0..self.max_iterations() {
             tracing::debug!(
@@ -241,7 +247,7 @@ impl Agent for ReviewAgent {
         client: &GeminiClient,
         request: AgentRequest,
     ) -> Result<AgentResponse> {
-        let registry = create_subagent_registry(self.working_directory.clone());
+        let registry = create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
         let tools = registry.to_gemini_tools(&crate::mode::Mode::Explore);
         let tool_config = Some(ToolRegistry::tool_config());
         let system_instruction = Content::system(self.system_prompt());
@@ -297,10 +303,15 @@ impl Agent for ReviewAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::mock::MockSandbox;
+
+    fn mock_sandbox() -> Arc<dyn Sandbox> {
+        Arc::new(MockSandbox::new(PathBuf::from("/tmp")))
+    }
 
     #[test]
     fn review_agent_properties() {
-        let agent = ReviewAgent::new(PathBuf::from("/tmp"));
+        let agent = ReviewAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "reviewer");
         assert_eq!(agent.max_iterations(), 15);
         assert!(agent.system_prompt().contains("code reviewer"));

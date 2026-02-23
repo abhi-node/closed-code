@@ -6,6 +6,7 @@ pub mod gemini;
 pub mod git;
 pub mod mode;
 pub mod repl;
+pub mod sandbox;
 pub mod tool;
 pub mod ui;
 
