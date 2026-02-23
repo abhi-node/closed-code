@@ -126,10 +126,12 @@ impl ExplorerAgent {
             for (name, args) in &function_calls {
                 // Check if this is a create_report call — intercept and extract
                 if name == "create_report" {
+                    println!("│  \u{2713} create_report(...)");
                     let report = Self::extract_report(args)?;
                     return Ok(Some(report));
                 }
 
+                let display = crate::agent::orchestrator::format_tool_call(name, args);
                 let result = match registry.execute(name, args.clone()).await {
                     Ok(value) => value,
                     Err(e) => {
@@ -137,6 +139,7 @@ impl ExplorerAgent {
                         serde_json::json!({"error": e.to_string()})
                     }
                 };
+                println!("│  \u{2713} {}", display);
 
                 response_parts.push(Part::FunctionResponse {
                     name: name.clone(),

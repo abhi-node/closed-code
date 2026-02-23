@@ -171,7 +171,7 @@ impl Tool for SpawnPlannerTool {
 
         tracing::info!("Spawning planner agent: {}", request.task);
 
-        let agent = PlannerAgent::new(self.working_directory.clone(), self.client.clone());
+        let agent = PlannerAgent::new(self.working_directory.clone());
         let response = agent.run(&self.client, request).await?;
 
         Ok(json!({

@@ -156,23 +156,6 @@ pub fn create_subagent_registry(working_directory: PathBuf) -> ToolRegistry {
     registry
 }
 
-/// Create a ToolRegistry for Planner sub-agents.
-/// Includes filesystem tools + create_report + spawn_explorer.
-/// The planner can spawn an explorer for deep research but cannot self-spawn.
-pub fn create_planner_registry(
-    working_directory: PathBuf,
-    client: Arc<GeminiClient>,
-) -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory.clone(), false);
-    registry.register(Box::new(super::report::CreateReportTool::new()));
-    registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
-        client,
-        working_directory,
-    )));
-    registry
-}
-
 /// Create a ToolRegistry for the orchestrator.
 /// Includes filesystem + spawn tools based on mode.
 ///
@@ -540,20 +523,6 @@ mod tests {
         assert_eq!(registry.len(), 6);
         assert!(registry.get("create_report").is_some());
         assert!(registry.get("spawn_explorer").is_none());
-    }
-
-    #[test]
-    fn create_planner_registry_has_spawn_explorer() {
-        let client = Arc::new(crate::gemini::GeminiClient::new(
-            "key".into(),
-            "model".into(),
-        ));
-        let registry = create_planner_registry(PathBuf::from("/tmp"), client);
-        // 5 filesystem/shell + create_report + spawn_explorer = 7
-        assert_eq!(registry.len(), 7);
-        assert!(registry.get("create_report").is_some());
-        assert!(registry.get("spawn_explorer").is_some());
-        assert!(registry.get("spawn_planner").is_none());
     }
 
     #[test]

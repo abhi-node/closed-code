@@ -173,20 +173,7 @@ impl Orchestrator {
                 let mut response_parts = Vec::new();
                 for part in response.function_calls() {
                     if let Part::FunctionCall { name, args, .. } = part {
-                        let display = format_tool_call(name, args);
-                        let tool_spinner = Spinner::new(&format!("[tool] {}", display));
-                        // Clear spinner before executing — tool may show interactive UI
-                        tool_spinner.finish();
-
-                        let result = match self.registry.execute(name, args.clone()).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!("Tool '{}' failed: {}", name, e);
-                                serde_json::json!({"error": e.to_string()})
-                            }
-                        };
-
-                        println!("\u{2713} [tool] {}", display);
+                        let result = self.execute_and_display_tool(name, args).await;
                         response_parts.push(Part::FunctionResponse {
                             name: name.clone(),
                             response: result,
@@ -313,22 +300,7 @@ impl Orchestrator {
                             break;
                         }
                         if let Part::FunctionCall { name, args, .. } = part {
-                            let display = format_tool_call(name, args);
-                            let tool_spinner =
-                                Spinner::new(&format!("[tool] {}", display));
-                            // Clear spinner before executing — tool may show interactive UI
-                            tool_spinner.finish();
-
-                            let result =
-                                match self.registry.execute(name, args.clone()).await {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        tracing::warn!("Tool '{}' failed: {}", name, e);
-                                        serde_json::json!({"error": e.to_string()})
-                                    }
-                                };
-
-                            println!("\u{2713} [tool] {}", display);
+                            let result = self.execute_and_display_tool(name, args).await;
                             response_parts.push(Part::FunctionResponse {
                                 name: name.clone(),
                                 response: result,
@@ -350,6 +322,59 @@ impl Orchestrator {
         }
 
         Ok(final_text)
+    }
+
+    /// Execute a tool call and display appropriate UI.
+    ///
+    /// For `spawn_*` tools (sub-agents), shows a box-drawing header/footer:
+    /// ```text
+    /// ┌ [agent:explorer] Find how auth works
+    /// │  ✓ read_file(path: "src/auth.rs")
+    /// └ [agent:explorer] done
+    /// ```
+    ///
+    /// For regular tools, shows the standard spinner + checkmark pattern.
+    async fn execute_and_display_tool(&self, name: &str, args: &serde_json::Value) -> serde_json::Value {
+        if name.starts_with("spawn_") {
+            let agent_type = &name["spawn_".len()..];
+            let task = args["task"]
+                .as_str()
+                .or_else(|| args["query"].as_str())
+                .unwrap_or("...");
+            let task_display = if task.len() > 80 {
+                format!("{}...", &task[..77])
+            } else {
+                task.to_string()
+            };
+
+            println!("┌ [agent:{}] {}", agent_type, task_display);
+
+            let result = match self.registry.execute(name, args.clone()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Tool '{}' failed: {}", name, e);
+                    serde_json::json!({"error": e.to_string()})
+                }
+            };
+
+            println!("└ [agent:{}] done", agent_type);
+            result
+        } else {
+            let display = format_tool_call(name, args);
+            let tool_spinner = Spinner::new(&format!("[tool] {}", display));
+            tool_spinner.finish();
+
+            let result = match self.registry.execute(name, args.clone()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Tool '{}' failed: {}", name, e);
+                    serde_json::json!({"error": e.to_string()})
+                }
+            };
+
+            println!("\u{2713} [tool] {}", display);
+            result
+        }
     }
 
     /// Build a GenerateContentRequest from current state.
@@ -819,10 +844,7 @@ impl Orchestrator {
     pub async fn run_review_agent(&mut self, diff: &str) -> Result<String> {
         use crate::agent::Agent;
 
-        let agent = ReviewAgent::new(
-            self.working_directory.clone(),
-            self.client.clone(),
-        );
+        let agent = ReviewAgent::new(self.working_directory.clone());
         let request = AgentRequest::new(
             "Review the following code changes thoroughly.".to_string(),
             self.working_directory.to_string_lossy().to_string(),
@@ -1598,7 +1620,7 @@ mod tests {
     fn review_agent_accessible() {
         use crate::agent::review_agent::ReviewAgent;
         use crate::agent::Agent;
-        let agent = ReviewAgent::new(PathBuf::from("/tmp"), test_client());
+        let agent = ReviewAgent::new(PathBuf::from("/tmp"));
         assert_eq!(agent.agent_type(), "reviewer");
     }
 }

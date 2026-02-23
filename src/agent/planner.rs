@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::agent::message::{AgentResponse, Artifact, ArtifactType};
@@ -8,7 +7,7 @@ use crate::agent::{Agent, AgentRequest};
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::types::*;
 use crate::gemini::GeminiClient;
-use crate::tool::registry::{create_planner_registry, ToolRegistry};
+use crate::tool::registry::{create_subagent_registry, ToolRegistry};
 
 const PLANNER_MAX_ITERATIONS: usize = 20;
 const PLANNER_TIMEOUT_SECS: u64 = 180;
@@ -17,15 +16,14 @@ const PLANNER_SYSTEM_PROMPT: &str = "\
 You are an expert software architect and planning agent. Your job is to analyze a codebase \
 and create detailed, actionable implementation plans.
 
-You have access to filesystem tools (read_file, list_directory, search_files, grep, shell), \
-a spawn_explorer tool for deep codebase research, and a create_report tool. Your workflow:
+You have access to filesystem tools (read_file, list_directory, search_files, grep, shell) \
+and a create_report tool. Your workflow:
 
-1. For complex tasks, use spawn_explorer to get a thorough analysis of relevant code areas.
-2. For simple file reads, use the filesystem tools directly.
-3. Understand the current codebase structure and patterns.
-4. Identify dependencies, affected files, and potential challenges.
-5. Create a structured plan with clear steps.
-6. Call create_report with your plan.
+1. Use the filesystem tools to understand the codebase structure and patterns.
+2. Read relevant files, search for patterns, and trace dependencies.
+3. Identify affected files and potential challenges.
+4. Create a structured plan with clear steps.
+5. Call create_report with your plan.
 
 Your plan should include:
 - Step-by-step implementation order (numbered)
@@ -41,15 +39,11 @@ showing proposed implementations or patterns to follow.";
 #[derive(Debug)]
 pub struct PlannerAgent {
     working_directory: PathBuf,
-    client: Arc<GeminiClient>,
 }
 
 impl PlannerAgent {
-    pub fn new(working_directory: PathBuf, client: Arc<GeminiClient>) -> Self {
-        Self {
-            working_directory,
-            client,
-        }
+    pub fn new(working_directory: PathBuf) -> Self {
+        Self { working_directory }
     }
 
     /// Run the sub-agent's tool-call loop.
@@ -62,10 +56,7 @@ impl PlannerAgent {
         tools: Option<Vec<GeminiTool>>,
         tool_config: Option<ToolConfig>,
     ) -> Result<Option<AgentResponse>> {
-        let registry = create_planner_registry(
-            self.working_directory.clone(),
-            self.client.clone(),
-        );
+        let registry = create_subagent_registry(self.working_directory.clone());
 
         for iteration in 0..self.max_iterations() {
             tracing::debug!(
@@ -138,10 +129,12 @@ impl PlannerAgent {
             let mut response_parts = Vec::new();
             for (name, args) in &function_calls {
                 if name == "create_report" {
+                    println!("│  \u{2713} create_report(...)");
                     let report = Self::extract_report(args)?;
                     return Ok(Some(report));
                 }
 
+                let display = crate::agent::orchestrator::format_tool_call(name, args);
                 let result = match registry.execute(name, args.clone()).await {
                     Ok(value) => value,
                     Err(e) => {
@@ -149,6 +142,7 @@ impl PlannerAgent {
                         serde_json::json!({"error": e.to_string()})
                     }
                 };
+                println!("│  \u{2713} {}", display);
 
                 response_parts.push(Part::FunctionResponse {
                     name: name.clone(),
@@ -247,11 +241,8 @@ impl Agent for PlannerAgent {
         client: &GeminiClient,
         request: AgentRequest,
     ) -> Result<AgentResponse> {
-        let registry = create_planner_registry(
-            self.working_directory.clone(),
-            self.client.clone(),
-        );
-        let tools = registry.to_gemini_tools(&crate::mode::Mode::Plan);
+        let registry = create_subagent_registry(self.working_directory.clone());
+        let tools = registry.to_gemini_tools(&crate::mode::Mode::Explore);
         let tool_config = Some(ToolRegistry::tool_config());
         let system_instruction = Content::system(self.system_prompt());
 
@@ -309,8 +300,7 @@ mod tests {
 
     #[test]
     fn planner_agent_properties() {
-        let client = Arc::new(GeminiClient::new("key".into(), "model".into()));
-        let agent = PlannerAgent::new(PathBuf::from("/tmp"), client);
+        let agent = PlannerAgent::new(PathBuf::from("/tmp"));
         assert_eq!(agent.agent_type(), "planner");
         assert_eq!(agent.max_iterations(), 20);
         assert!(agent.system_prompt().contains("software architect"));
