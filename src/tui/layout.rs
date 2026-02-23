@@ -42,6 +42,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.tick_count,
     );
     render_divider(frame, input_divider);
+    app.input_pane.set_viewport_width(input_area.width);
     frame.render_widget(app.input_pane.textarea(), input_area);
     render_divider(frame, status_divider);
     status_bar::render(frame, status_area, app);

@@ -8,10 +8,8 @@ pub fn render_message<'a>(msg: &ChatMessage, width: usize, tick: usize) -> Vec<L
     match msg {
         ChatMessage::User { text } => render_user(text, width),
         ChatMessage::Assistant {
-            text,
-            tool_calls,
-            is_streaming,
-        } => render_assistant(text, tool_calls, *is_streaming, width, tick),
+            text, tool_calls, ..
+        } => render_assistant(text, tool_calls, width, tick),
         ChatMessage::System { text } => render_system(text, width),
     }
 }
@@ -54,7 +52,6 @@ fn render_user<'a>(text: &str, width: usize) -> Vec<Line<'a>> {
 fn render_assistant<'a>(
     text: &str,
     tool_calls: &[ToolCallDisplay],
-    is_streaming: bool,
     width: usize,
     tick: usize,
 ) -> Vec<Line<'a>> {
@@ -75,15 +72,6 @@ fn render_assistant<'a>(
                 )));
             }
         }
-    }
-
-    // Streaming cursor
-    if is_streaming {
-        let cursor = if tick.is_multiple_of(2) { "▌" } else { " " };
-        lines.push(Line::from(Span::styled(
-            cursor.to_string(),
-            Style::new().fg(TuiTheme::ASSISTANT),
-        )));
     }
 
     lines
@@ -206,7 +194,7 @@ pub fn truncate_display(s: &str, max_width: usize) -> String {
 
 /// Wrap a string into lines of at most `max_width` characters.
 /// Prefers breaking at word boundaries (spaces). Falls back to hard break.
-fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
+pub(crate) fn wrap_text(s: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 || s.len() <= max_width {
         return vec![s.to_string()];
     }

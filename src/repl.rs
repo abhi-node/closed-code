@@ -87,6 +87,7 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
         approval_handler,
         personality: config.personality,
         context_window_turns: config.context_window_turns,
+        context_limit_tokens: config.context_limit_tokens,
         sandbox,
         protected_paths: config.protected_paths.clone(),
     });
@@ -122,6 +123,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         approval_handler,
         personality: config.personality,
         context_window_turns: config.context_window_turns,
+        context_limit_tokens: config.context_limit_tokens,
         sandbox,
         protected_paths: config.protected_paths.clone(),
     });
@@ -354,6 +356,7 @@ pub async fn run_resume(config: &Config, session_id_str: Option<&str>) -> anyhow
         approval_handler,
         personality: config.personality,
         context_window_turns: config.context_window_turns,
+        context_limit_tokens: config.context_limit_tokens,
         sandbox,
         protected_paths: config.protected_paths.clone(),
     });
@@ -686,12 +689,25 @@ async fn handle_slash_command(input: &str, orchestrator: &mut Orchestrator) -> S
             );
             println!("Sandbox: {}", orchestrator.sandbox_summary());
             println!("Git: {}", orchestrator.git_summary());
-            println!("Tokens: {}", orchestrator.session_usage());
+            println!("Usage: {}", orchestrator.session_usage());
+            let prompt_tokens = orchestrator.last_prompt_tokens();
+            if prompt_tokens > 0 {
+                println!(
+                    "Context: {} / {} tokens",
+                    prompt_tokens,
+                    orchestrator.context_limit_tokens()
+                );
+            } else {
+                println!(
+                    "Context: {} / {} turns (no token data yet)",
+                    orchestrator.turn_count(),
+                    orchestrator.context_window_turns()
+                );
+            }
             println!(
-                "Turns: {} / {} | Tools: {}",
+                "Turns: {} | Tools: {}",
                 orchestrator.turn_count(),
-                orchestrator.context_window_turns(),
-                orchestrator.tool_count(),
+                orchestrator.tool_count()
             );
             if let Some(id) = orchestrator.session_id() {
                 println!("Session: {} (auto-save enabled)", &id.as_str()[..8]);
@@ -1148,6 +1164,7 @@ mod tests {
             approval_handler: test_handler(),
             personality: Personality::default(),
             context_window_turns: 50,
+            context_limit_tokens: 1_000_000,
             sandbox: mock_sandbox(),
             protected_paths: vec![],
         })
@@ -1162,6 +1179,7 @@ mod tests {
             approval_handler: test_handler(),
             personality: Personality::default(),
             context_window_turns: 50,
+            context_limit_tokens: 1_000_000,
             sandbox: mock_sandbox(),
             protected_paths: vec![],
         })

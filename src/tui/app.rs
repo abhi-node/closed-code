@@ -40,6 +40,8 @@ pub struct StatusSnapshot {
     pub model: String,
     pub turn_count: usize,
     pub context_window_turns: usize,
+    pub last_prompt_tokens: u32,
+    pub context_limit_tokens: u32,
     pub session_id: Option<SessionId>,
     pub git_branch: Option<String>,
     pub git_change_count: usize,
@@ -56,6 +58,8 @@ impl StatusSnapshot {
             model: orch.model().to_string(),
             turn_count: orch.turn_count(),
             context_window_turns: orch.context_window_turns(),
+            last_prompt_tokens: orch.last_prompt_tokens(),
+            context_limit_tokens: orch.context_limit_tokens(),
             session_id: orch.session_id().cloned(),
             git_branch,
             git_change_count,
@@ -314,6 +318,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         approval_handler,
         personality: config.personality,
         context_window_turns: config.context_window_turns,
+        context_limit_tokens: config.context_limit_tokens,
         sandbox,
         protected_paths: config.protected_paths.clone(),
     });
@@ -468,6 +473,108 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                         // Phase 9d
                         app.messages.push(ChatMessage::System {
                             text: "Feature coming in Phase 9d.".into(),
+                        });
+                    }
+                    CommandResult::RunCommitAgent { diff, working_dir } => {
+                        app.messages.push(ChatMessage::Assistant {
+                            text: String::new(),
+                            tool_calls: Vec::new(),
+                            is_streaming: true,
+                        });
+                        app.state = AppState::Thinking;
+
+                        let orch_clone = orchestrator.clone();
+                        let tx = app_event_tx.clone();
+                        tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            let _ = tx.send(AppEvent::AgentStart {
+                                agent_type: "commit".into(),
+                                task: "Generating commit message...".into(),
+                            });
+
+                            let orch = orch_clone.lock().await;
+                            let result = orch.run_commit_agent(&diff).await;
+                            drop(orch);
+
+                            let _ = tx.send(AppEvent::AgentComplete {
+                                agent_type: "commit".into(),
+                                duration: start.elapsed(),
+                            });
+                            let _ = tx.send(AppEvent::StreamDone);
+
+                            match result {
+                                Ok(msg) => {
+                                    let msg = msg.trim().trim_matches('"').to_string();
+                                    match crate::git::commit::commit_all(&working_dir, &msg).await {
+                                        Ok(sha) => {
+                                            let mut orch = orch_clone.lock().await;
+                                            orch.refresh_git_context().await;
+                                            drop(orch);
+                                            let _ = tx.send(AppEvent::SystemMessage(format!(
+                                                "Committed: {} ({})",
+                                                sha, msg
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(AppEvent::Error(format!(
+                                                "Commit failed: {}",
+                                                e
+                                            )));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::Error(format!(
+                                        "Error generating commit message: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                            let _ = tx.send(AppEvent::OrchestratorDone);
+                        });
+                    }
+                    CommandResult::RunReviewAgent { diff, working_dir } => {
+                        let _ = working_dir; // not needed for review
+                        app.messages.push(ChatMessage::Assistant {
+                            text: String::new(),
+                            tool_calls: Vec::new(),
+                            is_streaming: true,
+                        });
+                        app.state = AppState::Thinking;
+
+                        let orch_clone = orchestrator.clone();
+                        let tx = app_event_tx.clone();
+                        tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            let _ = tx.send(AppEvent::AgentStart {
+                                agent_type: "review".into(),
+                                task: "Reviewing code changes...".into(),
+                            });
+
+                            let mut orch = orch_clone.lock().await;
+                            let result = orch.run_review_agent(&diff).await;
+                            drop(orch);
+
+                            let _ = tx.send(AppEvent::AgentComplete {
+                                agent_type: "review".into(),
+                                duration: start.elapsed(),
+                            });
+
+                            match result {
+                                Ok(review) => {
+                                    let _ = tx.send(AppEvent::TextDelta(review));
+                                    let _ = tx.send(AppEvent::StreamDone);
+                                    let _ = tx.send(AppEvent::SystemMessage(
+                                        "(Review added to context)".into(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::StreamDone);
+                                    let _ =
+                                        tx.send(AppEvent::Error(format!("Review failed: {}", e)));
+                                }
+                            }
+                            let _ = tx.send(AppEvent::OrchestratorDone);
                         });
                     }
                     CommandResult::Continue => {}

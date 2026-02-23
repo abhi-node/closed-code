@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crate::agent::orchestrator::Orchestrator;
 use crate::config::Personality;
 use crate::mode::Mode;
@@ -20,6 +22,10 @@ pub enum CommandResult {
     ShowSessionPicker,
     /// Show the mode picker overlay (Phase 9d).
     ShowModePicker,
+    /// Run commit agent asynchronously (no args provided).
+    RunCommitAgent { diff: String, working_dir: PathBuf },
+    /// Run review agent asynchronously.
+    RunReviewAgent { diff: String, working_dir: PathBuf },
 }
 
 /// Dispatch a slash command and return messages to display + result.
@@ -218,31 +224,19 @@ pub async fn dispatch(
                     messages.push(ChatMessage::System {
                         text: "No changes to review.".into(),
                     });
+                    CommandResult::Continue
                 }
-                Ok(d) => match orchestrator.run_review_agent(&d).await {
-                    Ok(review) => {
-                        messages.push(ChatMessage::Assistant {
-                            text: review,
-                            tool_calls: vec![],
-                            is_streaming: false,
-                        });
-                        messages.push(ChatMessage::System {
-                            text: "(Review added to context)".into(),
-                        });
-                    }
-                    Err(e) => {
-                        messages.push(ChatMessage::System {
-                            text: format!("Error: {}", e),
-                        });
-                    }
+                Ok(d) => CommandResult::RunReviewAgent {
+                    diff: d,
+                    working_dir,
                 },
                 Err(e) => {
                     messages.push(ChatMessage::System {
                         text: format!("Error: {}", e),
                     });
+                    CommandResult::Continue
                 }
             }
-            CommandResult::Continue
         }
 
         "/commit" => {
@@ -264,36 +258,26 @@ pub async fn dispatch(
                 }
             };
 
-            let message = if !arg.is_empty() {
-                arg.to_string()
-            } else {
-                match orchestrator.run_commit_agent(&diff).await {
-                    Ok(msg) => msg.trim().trim_matches('"').to_string(),
+            if !arg.is_empty() {
+                // User provided commit message — commit directly (fast, no agent)
+                match crate::git::commit::commit_all(&working_dir, arg).await {
+                    Ok(sha) => {
+                        orchestrator.refresh_git_context().await;
+                        messages.push(ChatMessage::System {
+                            text: format!("Committed: {} ({})", sha, arg),
+                        });
+                    }
                     Err(e) => {
                         messages.push(ChatMessage::System {
-                            text: format!("Error generating commit message: {}", e),
+                            text: format!("Commit failed: {}", e),
                         });
-                        return (messages, CommandResult::Continue);
                     }
                 }
-            };
-
-            // In TUI mode, commit directly with the generated message
-            // (Phase 9d adds confirmation overlay)
-            match crate::git::commit::commit_all(&working_dir, &message).await {
-                Ok(sha) => {
-                    orchestrator.refresh_git_context().await;
-                    messages.push(ChatMessage::System {
-                        text: format!("Committed: {} ({})", sha, message),
-                    });
-                }
-                Err(e) => {
-                    messages.push(ChatMessage::System {
-                        text: format!("Commit failed: {}", e),
-                    });
-                }
+                CommandResult::Continue
+            } else {
+                // No message — need commit agent (async)
+                CommandResult::RunCommitAgent { diff, working_dir }
             }
-            CommandResult::Continue
         }
 
         "/model" => {
@@ -334,20 +318,35 @@ pub async fn dispatch(
         }
 
         "/status" => {
+            let prompt_tokens = orchestrator.last_prompt_tokens();
+            let context_info = if prompt_tokens > 0 {
+                format!(
+                    "Context: {} / {} tokens",
+                    prompt_tokens,
+                    orchestrator.context_limit_tokens()
+                )
+            } else {
+                format!(
+                    "Context: {} / {} turns (no token data yet)",
+                    orchestrator.turn_count(),
+                    orchestrator.context_window_turns()
+                )
+            };
             let mut status_text = format!(
                 "Mode: {} | Model: {} | Personality: {}\n\
                  Sandbox: {}\n\
                  Git: {}\n\
-                 Tokens: {}\n\
-                 Turns: {} / {} | Tools: {}",
+                 Usage: {}\n\
+                 {}\n\
+                 Turns: {} | Tools: {}",
                 orchestrator.mode(),
                 orchestrator.model(),
                 orchestrator.personality(),
                 orchestrator.sandbox_summary(),
                 orchestrator.git_summary(),
                 orchestrator.session_usage(),
+                context_info,
                 orchestrator.turn_count(),
-                orchestrator.context_window_turns(),
                 orchestrator.tool_count(),
             );
             if let Some(id) = orchestrator.session_id() {

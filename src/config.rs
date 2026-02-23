@@ -56,6 +56,7 @@ pub struct TomlConfig {
     pub default_mode: Option<String>,
     pub personality: Option<String>,
     pub context_window_turns: Option<usize>,
+    pub context_limit_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub verbose: Option<bool>,
     #[serde(default)]
@@ -95,6 +96,7 @@ pub struct Config {
     pub personality: Personality,
     pub shell_additional_allowlist: Vec<String>,
     pub context_window_turns: usize,
+    pub context_limit_tokens: u32,
     pub verbose: bool,
     pub max_output_tokens: u32,
     pub sandbox_mode: SandboxMode,
@@ -170,6 +172,8 @@ impl Config {
             .or(merged.context_window_turns)
             .unwrap_or(50);
 
+        let context_limit_tokens = merged.context_limit_tokens.unwrap_or(1_000_000);
+
         let max_output_tokens = cli
             .max_output_tokens
             .or(merged.max_output_tokens)
@@ -225,6 +229,7 @@ impl Config {
             personality,
             shell_additional_allowlist,
             context_window_turns,
+            context_limit_tokens,
             verbose,
             max_output_tokens,
             sandbox_mode,
@@ -261,6 +266,7 @@ impl Config {
             default_mode: overlay.default_mode.or(base.default_mode),
             personality: overlay.personality.or(base.personality),
             context_window_turns: overlay.context_window_turns.or(base.context_window_turns),
+            context_limit_tokens: overlay.context_limit_tokens.or(base.context_limit_tokens),
             max_output_tokens: overlay.max_output_tokens.or(base.max_output_tokens),
             verbose: overlay.verbose.or(base.verbose),
             shell: overlay.shell.or(base.shell),

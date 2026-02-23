@@ -50,21 +50,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App<'_>) {
         model_area,
     );
 
-    // Turn counter
-    render_turn_counter(
-        frame,
-        turns_area,
-        status.turn_count,
-        status.context_window_turns,
-    );
+    // Token / turn counter
+    render_context_counter(frame, turns_area, status);
 
-    // Context gauge
-    gauge::render(
-        frame,
-        gauge_area,
-        status.turn_count,
-        status.context_window_turns,
-    );
+    // Context gauge (token-based when available, falls back to turns)
+    let (used, total) = if status.last_prompt_tokens > 0 {
+        (
+            status.last_prompt_tokens as usize,
+            status.context_limit_tokens as usize,
+        )
+    } else {
+        (status.turn_count, status.context_window_turns)
+    };
+    gauge::render(frame, gauge_area, used, total);
 
     // Git info
     render_git_info(frame, git_area, status);
@@ -101,23 +99,64 @@ fn render_mode_badge(frame: &mut Frame, area: Rect, mode: &crate::mode::Mode) {
     );
 }
 
-fn render_turn_counter(frame: &mut Frame, area: Rect, turns: usize, max: usize) {
-    let ratio = if max > 0 {
-        turns as f64 / max as f64
+fn render_context_counter(frame: &mut Frame, area: Rect, status: &super::app::StatusSnapshot) {
+    if status.last_prompt_tokens > 0 {
+        // Token-based display
+        let ratio = if status.context_limit_tokens > 0 {
+            status.last_prompt_tokens as f64 / status.context_limit_tokens as f64
+        } else {
+            0.0
+        };
+        let color = if ratio >= 0.85 {
+            TuiTheme::ERROR
+        } else if ratio >= 0.60 {
+            TuiTheme::WARNING
+        } else {
+            TuiTheme::FG
+        };
+        let display = format!(
+            " {}/{}",
+            format_token_count(status.last_prompt_tokens),
+            format_token_count(status.context_limit_tokens),
+        );
+        frame.render_widget(
+            Paragraph::new(display).style(Style::default().fg(color)),
+            area,
+        );
     } else {
-        0.0
-    };
-    let color = if ratio >= 0.95 {
-        TuiTheme::ERROR
-    } else if ratio >= 0.80 {
-        TuiTheme::WARNING
+        // Fallback: turns-based
+        let ratio = if status.context_window_turns > 0 {
+            status.turn_count as f64 / status.context_window_turns as f64
+        } else {
+            0.0
+        };
+        let color = if ratio >= 0.95 {
+            TuiTheme::ERROR
+        } else if ratio >= 0.80 {
+            TuiTheme::WARNING
+        } else {
+            TuiTheme::FG
+        };
+        frame.render_widget(
+            Paragraph::new(format!(
+                " {}/{} turns",
+                status.turn_count, status.context_window_turns
+            ))
+            .style(Style::default().fg(color)),
+            area,
+        );
+    }
+}
+
+/// Format a token count with K/M suffixes: 1234 → "1.2K", 1234567 → "1.2M".
+fn format_token_count(count: u32) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.0}K", count as f64 / 1_000.0)
     } else {
-        TuiTheme::FG
-    };
-    frame.render_widget(
-        Paragraph::new(format!(" {}/{} turns", turns, max)).style(Style::default().fg(color)),
-        area,
-    );
+        count.to_string()
+    }
 }
 
 fn render_git_info(frame: &mut Frame, area: Rect, status: &super::app::StatusSnapshot) {

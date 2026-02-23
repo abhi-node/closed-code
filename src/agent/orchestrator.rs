@@ -68,6 +68,7 @@ pub struct OrchestratorConfig {
     pub approval_handler: Arc<dyn ApprovalHandler>,
     pub personality: Personality,
     pub context_window_turns: usize,
+    pub context_limit_tokens: u32,
     pub sandbox: Arc<dyn Sandbox>,
     pub protected_paths: Vec<String>,
 }
@@ -90,6 +91,8 @@ pub struct Orchestrator {
     // Phase 5
     personality: Personality,
     context_window_turns: usize,
+    context_limit_tokens: u32,
+    last_prompt_tokens: u32,
     session_usage: SessionUsage,
     model_name: String,
     // Phase 6
@@ -138,6 +141,8 @@ impl Orchestrator {
             cancelled: Arc::new(AtomicBool::new(false)),
             personality: config.personality,
             context_window_turns: config.context_window_turns,
+            context_limit_tokens: config.context_limit_tokens,
+            last_prompt_tokens: 0,
             session_usage: SessionUsage::new(),
             model_name,
             git_context: None,
@@ -225,11 +230,14 @@ impl Orchestrator {
             }
         };
 
-        // Accumulate usage
+        // Accumulate usage and track prompt tokens for context management
         match &stream_result {
             StreamResult::Text { usage, .. } | StreamResult::FunctionCall { usage, .. } => {
                 if let Some(u) = usage {
                     self.session_usage.accumulate(u);
+                    if let Some(pt) = u.prompt_token_count {
+                        self.last_prompt_tokens = pt;
+                    }
                 }
             }
         }
@@ -359,11 +367,14 @@ impl Orchestrator {
                 }
             };
 
-            // Accumulate usage
+            // Accumulate usage and track prompt tokens for context management
             match &stream_result {
                 StreamResult::Text { usage, .. } | StreamResult::FunctionCall { usage, .. } => {
                     if let Some(u) = usage {
                         self.session_usage.accumulate(u);
+                        if let Some(pt) = u.prompt_token_count {
+                            self.last_prompt_tokens = pt;
+                        }
                     }
                 }
             }
@@ -800,24 +811,24 @@ impl Orchestrator {
         self.set_mode(mode);
     }
 
-    /// Prune conversation history when it exceeds context_window_turns.
-    /// Drops the oldest half, ensuring the first entry has role "user".
+    /// Prune conversation history when context is too large.
+    /// Uses token-based pruning when token data is available (from Gemini API),
+    /// falls back to turns-based pruning otherwise.
     pub fn prune_history(&mut self) {
-        // Warn at 80% threshold
-        let threshold = (self.context_window_turns as f64 * 0.8) as usize;
-        if self.history.len() == threshold {
-            eprintln!(
-                "Warning: Approaching context limit ({}/{} turns). Consider /clear or conversation will be pruned.",
-                self.history.len(),
-                self.context_window_turns,
-            );
-        }
+        let should_prune = if self.last_prompt_tokens > 0 && self.context_limit_tokens > 0 {
+            // Token-based: prune when prompt tokens exceed 85% of context limit
+            let threshold = (self.context_limit_tokens as f64 * 0.85) as u32;
+            self.last_prompt_tokens >= threshold
+        } else {
+            // Fallback: turns-based
+            self.history.len() > self.context_window_turns
+        };
 
-        if self.history.len() <= self.context_window_turns {
+        if !should_prune {
             return;
         }
 
-        let keep = self.context_window_turns / 2;
+        let keep = self.history.len() / 2;
         let pruned_count = self.history.len() - keep;
         self.history = self.history.split_off(self.history.len() - keep);
 
@@ -836,10 +847,11 @@ impl Orchestrator {
             );
         }
 
-        eprintln!(
-            "Context pruned: removed {} oldest turns ({} remaining)",
+        tracing::info!(
+            "Context pruned: removed {} oldest turns ({} remaining, last prompt: {} tokens)",
             pruned_count,
-            self.history.len()
+            self.history.len(),
+            self.last_prompt_tokens,
         );
     }
 
@@ -987,6 +999,16 @@ impl Orchestrator {
     /// Get configured context window size.
     pub fn context_window_turns(&self) -> usize {
         self.context_window_turns
+    }
+
+    /// Get last prompt token count from the most recent API call.
+    pub fn last_prompt_tokens(&self) -> u32 {
+        self.last_prompt_tokens
+    }
+
+    /// Get the model's context limit in tokens.
+    pub fn context_limit_tokens(&self) -> u32 {
+        self.context_limit_tokens
     }
 
     // ── Phase 8a: Session Management ──
@@ -1515,6 +1537,7 @@ mod tests {
             approval_handler: test_handler(),
             personality: Personality::default(),
             context_window_turns: 50,
+            context_limit_tokens: 1_000_000,
             sandbox: mock_sandbox(),
             protected_paths: vec![],
         }

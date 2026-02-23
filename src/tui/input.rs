@@ -6,7 +6,7 @@ use tui_textarea::TextArea;
 use super::theme::TuiTheme;
 
 const INPUT_MIN_HEIGHT: u16 = 3;
-const INPUT_MAX_HEIGHT: u16 = 8;
+const INPUT_MAX_HEIGHT: u16 = 12;
 const HISTORY_MAX: usize = 200;
 
 pub struct InputPane<'a> {
@@ -14,6 +14,7 @@ pub struct InputPane<'a> {
     pub(crate) history: Vec<String>,
     history_index: Option<usize>,
     saved_input: Option<String>,
+    viewport_width: u16,
     #[allow(dead_code)] // Used in Phase 9c for file path completion
     working_directory: PathBuf,
 }
@@ -28,8 +29,14 @@ impl<'a> InputPane<'a> {
             history: Vec::new(),
             history_index: None,
             saved_input: None,
+            viewport_width: 80,
             working_directory,
         }
+    }
+
+    /// Set the viewport width for text wrapping.
+    pub fn set_viewport_width(&mut self, width: u16) {
+        self.viewport_width = width;
     }
 
     // ── Text Operations ──
@@ -37,6 +44,7 @@ impl<'a> InputPane<'a> {
     pub fn insert_char(&mut self, c: char) {
         self.textarea.insert_char(c);
         self.reset_history_cycling();
+        self.reflow();
     }
 
     pub fn insert_newline(&mut self) {
@@ -46,10 +54,12 @@ impl<'a> InputPane<'a> {
 
     pub fn delete_char_before(&mut self) {
         self.textarea.delete_char();
+        self.reflow();
     }
 
     pub fn delete_char_at(&mut self) {
         self.textarea.delete_next_char();
+        self.reflow();
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -174,6 +184,7 @@ impl<'a> InputPane<'a> {
         // Move cursor to end of content
         self.textarea.move_cursor(tui_textarea::CursorMove::Bottom);
         self.textarea.move_cursor(tui_textarea::CursorMove::End);
+        self.reflow();
     }
 
     // ── External Editor (Ctrl+G) ──
@@ -214,6 +225,73 @@ impl<'a> InputPane<'a> {
         } else {
             Ok(false)
         }
+    }
+
+    // ── Text Reflow (soft wrapping) ──
+
+    /// Reflow text to fit within `viewport_width`, wrapping at word boundaries.
+    /// Preserves cursor position across the reflow.
+    fn reflow(&mut self) {
+        let width = self.viewport_width as usize;
+        if width < 4 {
+            return;
+        }
+
+        // 1. Calculate cursor text offset before reflow
+        let (cur_row, cur_col) = self.textarea.cursor();
+        let mut text_offset: usize = 0;
+        for (i, line) in self.textarea.lines().iter().enumerate() {
+            if i == cur_row {
+                text_offset += cur_col.min(line.len());
+                break;
+            }
+            text_offset += line.len() + 1; // +1 for newline
+        }
+
+        // 2. Get full text and wrap each logical line
+        let text = self.text();
+        let wrapped: Vec<String> = text
+            .lines()
+            .flat_map(|line| super::message::wrap_text(line, width))
+            .collect();
+        let wrapped = if wrapped.is_empty() {
+            vec![String::new()]
+        } else {
+            wrapped
+        };
+
+        // 3. Check if reflow actually changed anything
+        let current_lines: Vec<&str> = self.textarea.lines().iter().map(|s| s.as_str()).collect();
+        let wrapped_refs: Vec<&str> = wrapped.iter().map(|s| s.as_str()).collect();
+        if current_lines == wrapped_refs {
+            return; // No change needed
+        }
+
+        // 4. Rebuild TextArea with wrapped lines
+        self.textarea = TextArea::new(wrapped.clone());
+        apply_textarea_config(&mut self.textarea);
+
+        // 5. Restore cursor position
+        self.textarea.move_cursor(tui_textarea::CursorMove::Top);
+        self.textarea.move_cursor(tui_textarea::CursorMove::Head);
+
+        let mut remaining = text_offset;
+        for (i, line) in wrapped.iter().enumerate() {
+            if remaining <= line.len() {
+                for _ in 0..i {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Down);
+                }
+                self.textarea.move_cursor(tui_textarea::CursorMove::Head);
+                for _ in 0..remaining {
+                    self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
+                }
+                return;
+            }
+            remaining = remaining.saturating_sub(line.len() + 1);
+        }
+        // If we couldn't position exactly, go to the end
+        self.textarea.move_cursor(tui_textarea::CursorMove::Bottom);
+        self.textarea.move_cursor(tui_textarea::CursorMove::End);
     }
 
     // ── Rendering ──
