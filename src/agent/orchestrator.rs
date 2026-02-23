@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::agent::commit_agent::CommitAgent;
+use crate::agent::review_agent::ReviewAgent;
+use crate::agent::AgentRequest;
 use crate::config::Personality;
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::stream::{consume_stream, StreamEvent, StreamResult};
@@ -716,6 +719,51 @@ impl Orchestrator {
             None => "not a git repository".to_string(),
         }
     }
+
+    // ── Phase 6: Sub-Agent Runners ──
+
+    /// Run a commit agent to generate a commit message from a diff.
+    /// Returns the commit message string. Does not modify conversation history.
+    pub async fn run_commit_agent(&self, diff: &str) -> Result<String> {
+        use crate::agent::Agent;
+
+        let agent = CommitAgent::new(self.working_directory.clone());
+        let request = AgentRequest::new(
+            "Generate a commit message for the following code changes.".to_string(),
+            self.working_directory.to_string_lossy().to_string(),
+        )
+        .with_context(vec![format!("```diff\n{}\n```", diff)]);
+
+        let response = agent.run(&self.client, request).await?;
+        Ok(response.summary)
+    }
+
+    /// Run a review agent to produce a structured code review from a diff.
+    /// Returns the review text and injects it into conversation history
+    /// so the main LLM has the review as context for follow-up questions.
+    pub async fn run_review_agent(&mut self, diff: &str) -> Result<String> {
+        use crate::agent::Agent;
+
+        let agent = ReviewAgent::new(
+            self.working_directory.clone(),
+            self.client.clone(),
+        );
+        let request = AgentRequest::new(
+            "Review the following code changes thoroughly.".to_string(),
+            self.working_directory.to_string_lossy().to_string(),
+        )
+        .with_context(vec![format!("```diff\n{}\n```", diff)]);
+
+        let response = agent.run(&self.client, request).await?;
+
+        // Inject the review into conversation history as context for the main LLM
+        self.history.push(Content::user(&format!(
+            "[CODE REVIEW — Sub-agent analysis of recent changes]\n\n{}",
+            response.detailed_report
+        )));
+
+        Ok(response.detailed_report)
+    }
 }
 
 impl std::fmt::Debug for Orchestrator {
@@ -1412,5 +1460,23 @@ mod tests {
         orch.set_mode(Mode::Execute);
         assert!(orch.system_prompt().contains("Git context:"));
         assert!(orch.system_prompt().contains("EXECUTE"));
+    }
+
+    // ── Phase 6: Sub-Agent Runner Tests ──
+
+    #[test]
+    fn commit_agent_accessible() {
+        use crate::agent::commit_agent::CommitAgent;
+        use crate::agent::Agent;
+        let agent = CommitAgent::new(PathBuf::from("/tmp"));
+        assert_eq!(agent.agent_type(), "commit");
+    }
+
+    #[test]
+    fn review_agent_accessible() {
+        use crate::agent::review_agent::ReviewAgent;
+        use crate::agent::Agent;
+        let agent = ReviewAgent::new(PathBuf::from("/tmp"), test_client());
+        assert_eq!(agent.agent_type(), "reviewer");
     }
 }

@@ -17,6 +17,9 @@
   │         │
   │         ▼
   └──► 6.4 Git Slash Commands (repl.rs)
+              │
+              ▼
+        6.5 Sub-Agent Powered /commit + /review
 ```
 
 ---
@@ -31,11 +34,14 @@ src/
     diff.rs            # NEW: Git diff functions (unstaged, staged, branch, range)
     commit.rs          # NEW: Commit operations (commit_all, commit_files)
   agent/
-    orchestrator.rs    # MODIFIED: git_context field, system prompt injection, new accessors
+    commit_agent.rs    # NEW: CommitAgent — sub-agent for generating commit messages
+    review_agent.rs    # NEW: ReviewAgent — sub-agent for structured code reviews
+    mod.rs             # MODIFIED: Added pub mod commit_agent, review_agent
+    orchestrator.rs    # MODIFIED: git_context field, system prompt injection, sub-agent runners
   tool/
     file_write.rs      # MODIFIED: Protected path check before writes
     file_edit.rs       # MODIFIED: Protected path check before edits
-  repl.rs              # MODIFIED: async handle_slash_command, /diff, /review, /commit, updated /help + /status
+  repl.rs              # MODIFIED: async handle_slash_command, /diff, /review, /commit with sub-agents
   lib.rs               # MODIFIED: Added `pub mod git;`
 ```
 
@@ -312,16 +318,24 @@ Displays colorized output via `colorize_git_diff()`. Shows "No changes found." w
 
 ### `/review [HEAD~N]`
 
-Sends uncommitted changes (or a commit range) to the LLM for streaming code review:
+Spawns a **ReviewAgent** sub-agent to analyze changes and produce a structured code review:
 
 | Usage | Behavior |
 |-------|----------|
 | `/review` | Review all uncommitted changes |
 | `/review HEAD~N` | Review changes in a commit range |
 
-The diff is wrapped in a code review prompt and sent through `orchestrator.handle_user_input_streaming()` with the default stream handler, so the review streams to stdout in real time.
+**Flow:**
 
-Shows "No changes to review." when the diff is empty.
+1. Get the diff (uncommitted or commit range).
+2. Spawn a ReviewAgent sub-agent with the diff as context. The agent can explore files, read related code, and use spawn_explorer for deep research.
+3. The sub-agent returns a structured review via `create_report`.
+4. Print the review to the terminal.
+5. Inject the review into the main conversation history as `[CODE REVIEW — Sub-agent analysis]`, so the user can ask follow-up questions.
+
+Shows "No changes to review." when the diff is empty. A spinner displays while the sub-agent is working.
+
+**Key benefit**: The raw diff never enters the main conversation history — only the compact, structured review does.
 
 ### `/commit [message]`
 
@@ -329,17 +343,20 @@ Generates a commit message and commits with user approval:
 
 | Usage | Behavior |
 |-------|----------|
-| `/commit` | LLM generates commit message from diff, user confirms |
+| `/commit` | Sub-agent generates commit message from diff, user confirms |
 | `/commit fix auth bug` | Uses provided message directly, user confirms |
 
 **Flow:**
 
 1. Get all uncommitted changes via `all_uncommitted()`. Exit early if nothing to commit.
-2. If no message argument, send the diff to the LLM with a prompt to generate a concise commit message (max 72 chars subject line). The response streams to stdout.
-3. Display the proposed commit message.
-4. Prompt for confirmation using `dialoguer::Confirm` (default: No).
-5. If approved, run `commit_all()` and display the short SHA.
-6. After successful commit, call `orchestrator.refresh_git_context().await` to update the system prompt.
+2. If no message argument, spawn a **CommitAgent** sub-agent with the diff as context. The agent can explore files for context and returns the commit message via `create_report`. A spinner displays during generation.
+3. If message argument is provided, use it directly (no sub-agent involved).
+4. Display the proposed commit message.
+5. Prompt for confirmation using `dialoguer::Confirm` (default: No).
+6. If approved, run `commit_all()` and display the short SHA.
+7. After successful commit, call `orchestrator.refresh_git_context().await` to update the system prompt.
+
+**Key benefit**: The sub-agent can explore related files to understand changes in context, producing better commit messages than a simple prompt-based approach. No diff or LLM response enters the main conversation history.
 
 ### `/help` (updated)
 
@@ -364,6 +381,72 @@ Turns: 4 / 50 | Tools: 6
 
 ---
 
+## Sub-Phase 6.5: Sub-Agent Powered `/commit` and `/review`
+
+### Problem
+
+The initial `/commit` and `/review` implementations used `orchestrator.handle_user_input_streaming()` to send diffs to the main LLM. This had two problems:
+
+1. **History pollution**: Raw diffs and LLM responses were added to the main conversation history, wasting context window tokens on temporary content.
+2. **Limited analysis**: The main LLM could only see the diff text — it couldn't explore related files for context.
+
+### Solution
+
+Specialized sub-agents that follow the existing ExplorerAgent/PlannerAgent pattern:
+
+### New File: `src/agent/commit_agent.rs` — CommitAgent
+
+An explorer-like agent specialized for commit message generation:
+
+- **System prompt**: Focused on analyzing code changes and generating conventional commit messages
+- **Tools**: `read_file`, `list_directory`, `search_files`, `grep`, `shell` (read-only), `create_report` — same as ExplorerAgent
+- **Max iterations**: 10 (lighter than Explorer's 15)
+- **Timeout**: 90s (shorter than Explorer's 120s)
+- **Output**: The `summary` field of `create_report` contains the commit message text
+
+The agent receives the diff in its initial context and can optionally explore related files to understand the changes better before generating the message.
+
+### New File: `src/agent/review_agent.rs` — ReviewAgent
+
+A planner-like agent specialized for code review:
+
+- **System prompt**: Focused on thorough code review (bugs, quality, suggestions)
+- **Tools**: `read_file`, `list_directory`, `search_files`, `grep`, `shell`, `spawn_explorer`, `create_report` — same as PlannerAgent
+- **Max iterations**: 15
+- **Timeout**: 120s
+- **Output**: The `detailed_report` field of `create_report` contains the structured review
+
+The agent receives the diff in its initial context and can explore the codebase, check existing patterns, read tests, and even spawn explorer sub-agents for deep research.
+
+### `src/agent/orchestrator.rs` — Sub-Agent Runner Methods
+
+Two new methods run sub-agents directly from slash commands (not via tool calls):
+
+```rust
+/// Run a commit agent to generate a commit message from a diff.
+/// Returns the commit message string. Does not modify conversation history.
+pub async fn run_commit_agent(&self, diff: &str) -> Result<String>
+
+/// Run a review agent to produce a structured code review.
+/// Returns the review text and injects it into conversation history
+/// so the main LLM has the review as context for follow-up questions.
+pub async fn run_review_agent(&mut self, diff: &str) -> Result<String>
+```
+
+Key difference: `run_commit_agent` takes `&self` (no history mutation), while `run_review_agent` takes `&mut self` (injects review into history as `[CODE REVIEW — Sub-agent analysis of recent changes]`).
+
+### `src/repl.rs` — Updated Handlers
+
+Both `/commit` and `/review` now use `Spinner` for progress indication while the sub-agent runs. The `/review` handler prints a hint after the review: `"(Review added to context — ask follow-up questions if needed)"`.
+
+Updated `/help` descriptions:
+```
+/review [HEAD~N]   — Review changes with sub-agent (adds to context)
+/commit [message]  — Generate commit message via sub-agent and commit
+```
+
+---
+
 ## Test Summary
 
 | File | New Tests | Category |
@@ -374,13 +457,15 @@ Turns: 4 / 50 | Tools: 6
 | `src/git/commit.rs` | 6 | commit_all, commit_files, nothing to commit, SHA format, message preserved, non-repo error |
 | `src/tool/file_write.rs` | 3 | Protected .git/ path, protected .closed-code/ path, is_protected_path variants |
 | `src/tool/file_edit.rs` | 2 | Protected .git/ path, protected .closed-code/ path |
-| `src/agent/orchestrator.rs` | 7 | System prompt with/without git context, git_summary, git_default_branch, working_directory, detect in repo/non-repo, set_mode preserves git context |
+| `src/agent/commit_agent.rs` | 4 | Agent properties, extract_report, missing fields, constants |
+| `src/agent/review_agent.rs` | 4 | Agent properties, extract_report with artifact/snippets, constants |
+| `src/agent/orchestrator.rs` | 9 | System prompt with/without git context, git_summary, git_default_branch, working_directory, detect in repo/non-repo, set_mode preserves git context, commit/review agent accessible |
 | `src/repl.rs` | 6 | /diff, /diff staged, /diff branch, /diff bad arg, /review, /commit |
-| **Total** | **51 new tests** | |
+| **Total** | **61 new tests** | |
 
 All existing tests were updated where needed (repl.rs tests converted to `#[tokio::test]` for the async `handle_slash_command`).
 
-**Final count**: 325 tests passing, clean compilation with no warnings.
+**Final count**: 335 tests passing, clean compilation with no warnings.
 
 ---
 
@@ -419,6 +504,8 @@ pub struct Orchestrator {
 | `working_directory(&self) -> &Path` | Returns the working directory path. |
 | `git_default_branch(&self) -> Option<&str>` | Returns detected default branch name. |
 | `git_summary(&self) -> String` | One-line git summary for display. |
+| `run_commit_agent(&self, diff) -> Result<String>` | Async. Runs CommitAgent sub-agent, returns commit message. No history mutation. |
+| `run_review_agent(&mut self, diff) -> Result<String>` | Async. Runs ReviewAgent sub-agent, returns review text, injects into history. |
 
 **Updated methods:**
 
@@ -453,19 +540,25 @@ cargo run
 # > /diff branch
 # ...changes since branching from main...
 
-# Code review
+# Code review (sub-agent powered)
 # > /review
-# (streams LLM review of uncommitted changes)
+# ⠋ Reviewing changes...
+# (ReviewAgent explores codebase, analyzes diff)
+# ## Summary
+# The changes add git integration with diff review...
+# ## Issues
+# ...
+# (Review added to context — ask follow-up questions if needed)
 
-# Auto-commit
+# Auto-commit (sub-agent powered)
 # > /commit
-# Generating commit message...
-# (LLM streams a message)
+# ⠋ Generating commit message...
+# (CommitAgent explores files, analyzes diff)
 # Proposed commit message: "Add git integration with diff review"
 # Commit with this message? [y/N] y
 # ✓ Committed: abc1234
 
-# Manual commit message
+# Manual commit message (no sub-agent)
 # > /commit fix auth bug
 # Proposed commit message: "fix auth bug"
 # Commit with this message? [y/N] y
@@ -500,10 +593,15 @@ cargo run -- --working-directory /tmp
 7. `cargo test` checkpoint
 8. `src/agent/orchestrator.rs` — git context in system prompt, new accessors
 9. `src/repl.rs` — async `handle_slash_command`, `/diff`, `/review`, `/commit`, updated `/help` + `/status`
-10. `cargo test` — all 325 tests pass
+10. `cargo test` — 325 tests pass
+11. `src/agent/commit_agent.rs` + `src/agent/review_agent.rs` — sub-agents
+12. `src/agent/mod.rs` — register new modules
+13. `src/agent/orchestrator.rs` — add `run_commit_agent()` and `run_review_agent()`
+14. `src/repl.rs` — replace `handle_user_input_streaming` with sub-agent calls in `/commit` and `/review`
+15. `cargo test` — all 335 tests pass
 
 ---
 
 ## Complexity: **Medium**
 
-No new Cargo dependencies. All git operations are subprocess shell-outs via `tokio::process::Command`. The main complexity is in making `handle_slash_command` async (requiring all repl tests to be converted to `#[tokio::test]`) and threading git context through the orchestrator's system prompt rebuild methods. ~4 new files, ~6 modified files, ~51 new tests.
+No new Cargo dependencies. All git operations are subprocess shell-outs via `tokio::process::Command`. The main complexity is in making `handle_slash_command` async (requiring all repl tests to be converted to `#[tokio::test]`), threading git context through the orchestrator's system prompt rebuild methods, and creating the CommitAgent/ReviewAgent sub-agents that follow the existing ExplorerAgent/PlannerAgent pattern. ~6 new files, ~8 modified files, ~61 new tests.

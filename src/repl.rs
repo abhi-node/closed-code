@@ -12,6 +12,7 @@ use crate::config::{Config, Personality};
 use crate::gemini::stream::StreamEvent;
 use crate::gemini::GeminiClient;
 use crate::ui::approval::AutoApproveHandler;
+use crate::ui::spinner::Spinner;
 use crate::ui::theme::Theme;
 
 fn styled_text(text: &str, color: crossterm::style::Color) -> String {
@@ -323,8 +324,8 @@ async fn handle_slash_command(
             println!("  /auto              \u{2014} Switch to Auto mode (unrestricted shell)");
             println!("  /accept            \u{2014} Accept the current plan and switch to Execute mode");
             println!("  /diff [opts]       \u{2014} Show git diff (staged, branch, HEAD~N)");
-            println!("  /review [HEAD~N]   \u{2014} Send changes to LLM for code review");
-            println!("  /commit [message]  \u{2014} Generate commit message and commit");
+            println!("  /review [HEAD~N]   \u{2014} Review changes with sub-agent (adds to context)");
+            println!("  /commit [message]  \u{2014} Generate commit message via sub-agent and commit");
             println!("  /model [name]      \u{2014} Show or switch model");
             println!("  /personality [s]   \u{2014} Show or change personality (friendly, pragmatic, none)");
             println!("  /status            \u{2014} Show session status (tokens, model, mode, etc.)");
@@ -414,21 +415,21 @@ async fn handle_slash_command(
                     println!("No changes to review.");
                 }
                 Ok(d) => {
-                    let prompt = format!(
-                        "Please review the following code changes and provide feedback on:\n\
-                         - Potential bugs or issues\n\
-                         - Code quality and best practices\n\
-                         - Suggestions for improvement\n\n\
-                         ```diff\n{}\n```",
-                        d
-                    );
-                    orchestrator.reset_cancel();
-                    match orchestrator
-                        .handle_user_input_streaming(&prompt, default_stream_handler)
-                        .await
-                    {
-                        Ok(_) => {}
+                    let spinner = Spinner::new("Reviewing changes...");
+                    match orchestrator.run_review_agent(&d).await {
+                        Ok(review) => {
+                            spinner.finish();
+                            println!("{}", review);
+                            println!(
+                                "\n{}",
+                                styled_text(
+                                    "(Review added to context \u{2014} ask follow-up questions if needed)",
+                                    Theme::DIM,
+                                )
+                            );
+                        }
                         Err(e) => {
+                            spinner.finish();
                             eprintln!(
                                 "{}: {}",
                                 styled_text("Error", Theme::ERROR),
@@ -436,7 +437,6 @@ async fn handle_slash_command(
                             );
                         }
                     }
-                    drain_stdin();
                 }
                 Err(e) => {
                     println!("{}: {}", styled_text("Error", Theme::ERROR), e);
@@ -464,24 +464,18 @@ async fn handle_slash_command(
                 }
             };
 
-            // Get commit message: user-provided or LLM-generated
+            // Get commit message: user-provided or sub-agent-generated
             let message = if !arg.is_empty() {
                 arg.to_string()
             } else {
-                let prompt = format!(
-                    "Generate a concise git commit message (max 72 chars subject line) \
-                     for these changes.\n\
-                     Return ONLY the commit message text, nothing else.\n\n\
-                     ```diff\n{}\n```",
-                    diff
-                );
-                println!("Generating commit message...");
-                match orchestrator
-                    .handle_user_input_streaming(&prompt, default_stream_handler)
-                    .await
-                {
-                    Ok(msg) => msg.trim().trim_matches('"').to_string(),
+                let spinner = Spinner::new("Generating commit message...");
+                match orchestrator.run_commit_agent(&diff).await {
+                    Ok(msg) => {
+                        spinner.finish();
+                        msg.trim().trim_matches('"').to_string()
+                    }
                     Err(e) => {
+                        spinner.finish();
                         eprintln!(
                             "{}: {}",
                             styled_text("Error", Theme::ERROR),

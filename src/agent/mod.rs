@@ -1,7 +1,9 @@
+pub mod commit_agent;
 pub mod explorer;
 pub mod message;
 pub mod orchestrator;
 pub mod planner;
+pub mod review_agent;
 pub mod web_searcher;
 
 use async_trait::async_trait;
