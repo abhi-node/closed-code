@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod gemini;
+pub mod git;
 pub mod mode;
 pub mod repl;
 pub mod tool;

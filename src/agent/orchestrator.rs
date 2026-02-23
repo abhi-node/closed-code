@@ -10,6 +10,7 @@ use crate::error::{ClosedCodeError, Result};
 use crate::gemini::stream::{consume_stream, StreamEvent, StreamResult};
 use crate::gemini::types::{Content, GenerateContentRequest, GenerationConfig, Part};
 use crate::gemini::GeminiClient;
+use crate::git::GitContext;
 use crate::mode::Mode;
 use crate::tool::registry::{create_orchestrator_registry, ToolRegistry};
 use crate::ui::approval::ApprovalHandler;
@@ -39,6 +40,8 @@ pub struct Orchestrator {
     context_window_turns: usize,
     session_usage: SessionUsage,
     model_name: String,
+    // Phase 6
+    git_context: Option<GitContext>,
 }
 
 impl Orchestrator {
@@ -58,7 +61,7 @@ impl Orchestrator {
             Some(approval_handler.clone()),
         );
         let system_prompt =
-            Self::build_system_prompt(&mode, &working_directory, personality);
+            Self::build_system_prompt(&mode, &working_directory, personality, None);
         let model_name = client.model().to_string();
 
         Self {
@@ -76,6 +79,7 @@ impl Orchestrator {
             context_window_turns,
             session_usage: SessionUsage::new(),
             model_name,
+            git_context: None,
         }
     }
 
@@ -369,6 +373,7 @@ impl Orchestrator {
         mode: &Mode,
         working_directory: &std::path::Path,
         personality: Personality,
+        git_context: Option<&GitContext>,
     ) -> String {
         let personality_prefix = match personality {
             Personality::Friendly => {
@@ -467,7 +472,19 @@ impl Orchestrator {
             }
         };
 
-        format!("{}{}", base, mode_section)
+        let git_section = match git_context {
+            Some(ctx) => {
+                let section = ctx.system_prompt_section();
+                if section.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n\n{}", section)
+                }
+            }
+            None => String::new(),
+        };
+
+        format!("{}{}{}", base, mode_section, git_section)
     }
 
     /// Switch to a different mode at runtime.
@@ -480,8 +497,12 @@ impl Orchestrator {
             self.client.clone(),
             Some(self.approval_handler.clone()),
         );
-        self.system_prompt =
-            Self::build_system_prompt(&self.mode, &self.working_directory, self.personality);
+        self.system_prompt = Self::build_system_prompt(
+            &self.mode,
+            &self.working_directory,
+            self.personality,
+            self.git_context.as_ref(),
+        );
     }
 
     /// Prune conversation history when it exceeds context_window_turns.
@@ -613,8 +634,12 @@ impl Orchestrator {
     /// Set personality and rebuild system prompt.
     pub fn set_personality(&mut self, personality: Personality) {
         self.personality = personality;
-        self.system_prompt =
-            Self::build_system_prompt(&self.mode, &self.working_directory, self.personality);
+        self.system_prompt = Self::build_system_prompt(
+            &self.mode,
+            &self.working_directory,
+            self.personality,
+            self.git_context.as_ref(),
+        );
     }
 
     /// Get current model name.
@@ -645,6 +670,51 @@ impl Orchestrator {
     /// Get configured context window size.
     pub fn context_window_turns(&self) -> usize {
         self.context_window_turns
+    }
+
+    // ── Phase 6: Git Context ──
+
+    /// Detect git context for the working directory.
+    /// Call after `new()` in async contexts (REPL, oneshot).
+    /// Rebuilds the system prompt with git info if in a git repo.
+    pub async fn detect_git_context(&mut self) {
+        let ctx = GitContext::detect(&self.working_directory).await;
+        if ctx.is_git_repo {
+            self.git_context = Some(ctx);
+        } else {
+            self.git_context = None;
+        }
+        self.system_prompt = Self::build_system_prompt(
+            &self.mode,
+            &self.working_directory,
+            self.personality,
+            self.git_context.as_ref(),
+        );
+    }
+
+    /// Re-detect git context (e.g., after a commit).
+    pub async fn refresh_git_context(&mut self) {
+        self.detect_git_context().await;
+    }
+
+    /// Reference to the working directory.
+    pub fn working_directory(&self) -> &std::path::Path {
+        &self.working_directory
+    }
+
+    /// Get the detected default branch name, if any.
+    pub fn git_default_branch(&self) -> Option<&str> {
+        self.git_context
+            .as_ref()
+            .and_then(|ctx| ctx.default_branch.as_deref())
+    }
+
+    /// One-line git summary for display.
+    pub fn git_summary(&self) -> String {
+        match &self.git_context {
+            Some(ctx) => ctx.summary(),
+            None => "not a git repository".to_string(),
+        }
     }
 }
 
@@ -1149,5 +1219,198 @@ mod tests {
         assert_eq!(*orch.mode(), Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
         assert!(!orch.system_prompt().contains("AUTO"));
+    }
+
+    // ── Phase 6: Git Context Tests ──
+
+    #[test]
+    fn system_prompt_includes_git_context() {
+        let git_ctx = crate::git::GitContext {
+            is_git_repo: true,
+            current_branch: Some("main".into()),
+            default_branch: Some("main".into()),
+            has_uncommitted_changes: true,
+            changed_files: vec![crate::git::context::ChangedFile {
+                path: "src/main.rs".into(),
+                status: crate::git::context::FileStatus::Modified,
+            }],
+            recent_commits: vec!["abc1234 Initial commit".into()],
+        };
+        let prompt = Orchestrator::build_system_prompt(
+            &Mode::Explore,
+            std::path::Path::new("/tmp"),
+            Personality::default(),
+            Some(&git_ctx),
+        );
+        assert!(prompt.contains("Git context:"));
+        assert!(prompt.contains("On branch `main`"));
+        assert!(prompt.contains("src/main.rs (modified)"));
+        assert!(prompt.contains("abc1234 Initial commit"));
+    }
+
+    #[test]
+    fn system_prompt_no_git_context() {
+        let prompt = Orchestrator::build_system_prompt(
+            &Mode::Explore,
+            std::path::Path::new("/tmp"),
+            Personality::default(),
+            None,
+        );
+        assert!(!prompt.contains("Git context:"));
+        // Should still have the normal content
+        assert!(prompt.contains("READ-ONLY"));
+    }
+
+    #[test]
+    fn git_summary_without_context() {
+        let orch = test_orchestrator();
+        assert_eq!(orch.git_summary(), "not a git repository");
+    }
+
+    #[test]
+    fn git_default_branch_without_context() {
+        let orch = test_orchestrator();
+        assert!(orch.git_default_branch().is_none());
+    }
+
+    #[test]
+    fn working_directory_accessor() {
+        let orch = test_orchestrator();
+        assert_eq!(orch.working_directory(), std::path::Path::new("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn detect_git_context_in_non_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            dir.path().to_path_buf(),
+            8192,
+            test_handler(),
+            Personality::default(),
+            50,
+        );
+        orch.detect_git_context().await;
+        assert_eq!(orch.git_summary(), "not a git repository");
+        assert!(orch.git_default_branch().is_none());
+        assert!(!orch.system_prompt().contains("Git context:"));
+    }
+
+    #[tokio::test]
+    async fn detect_git_context_in_repo() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Init a git repo
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        // Create initial commit on "main" branch
+        tokio::process::Command::new("git")
+            .args(["checkout", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            dir.path().to_path_buf(),
+            8192,
+            test_handler(),
+            Personality::default(),
+            50,
+        );
+        orch.detect_git_context().await;
+
+        assert!(orch.git_summary().contains("main"));
+        assert!(orch.system_prompt().contains("Git context:"));
+    }
+
+    #[tokio::test]
+    async fn set_mode_preserves_git_context() {
+        let dir = tempfile::TempDir::new().unwrap();
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["checkout", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
+        tokio::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        tokio::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            dir.path().to_path_buf(),
+            8192,
+            test_handler(),
+            Personality::default(),
+            50,
+        );
+        orch.detect_git_context().await;
+        assert!(orch.system_prompt().contains("Git context:"));
+
+        // Switch mode — git context should be preserved in the new prompt
+        orch.set_mode(Mode::Execute);
+        assert!(orch.system_prompt().contains("Git context:"));
+        assert!(orch.system_prompt().contains("EXECUTE"));
     }
 }

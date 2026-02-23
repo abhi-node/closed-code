@@ -12,6 +12,15 @@ use crate::ui::approval::{ApprovalDecision, ApprovalHandler, FileChange};
 
 use super::{ParamBuilder, Tool};
 
+/// Check if a path is protected and should not be modified.
+fn is_protected_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == ".git"
+        || normalized.starts_with(".git/")
+        || normalized == ".closed-code"
+        || normalized.starts_with(".closed-code/")
+}
+
 pub struct EditFileTool {
     working_directory: PathBuf,
     approval_handler: Arc<dyn ApprovalHandler>,
@@ -105,6 +114,13 @@ impl Tool for EditFileTool {
                 name: "edit_file".into(),
                 message: "Missing required parameter 'new_text'".into(),
             })?;
+
+        // Check protected paths
+        if is_protected_path(path_str) {
+            return Err(ClosedCodeError::ProtectedPath {
+                path: path_str.to_string(),
+            });
+        }
 
         let resolved = self.resolve_path(path_str);
 
@@ -383,5 +399,41 @@ mod tests {
         let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
         let debug = format!("{:?}", tool);
         assert!(debug.contains("EditFileTool"));
+    }
+
+    #[tokio::test]
+    async fn edit_protected_git_path_rejected() {
+        let (dir, handler) = setup();
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let result = tool
+            .execute(json!({
+                "path": ".git/config",
+                "old_text": "old",
+                "new_text": "new"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_protected_closed_code_rejected() {
+        let (dir, handler) = setup();
+        let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
+        let result = tool
+            .execute(json!({
+                "path": ".closed-code/config.toml",
+                "old_text": "old",
+                "new_text": "new"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
     }
 }

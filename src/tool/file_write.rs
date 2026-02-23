@@ -12,6 +12,15 @@ use crate::ui::approval::{ApprovalDecision, ApprovalHandler, FileChange};
 
 use super::{ParamBuilder, Tool};
 
+/// Check if a path is protected and should not be modified.
+fn is_protected_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    normalized == ".git"
+        || normalized.starts_with(".git/")
+        || normalized == ".closed-code"
+        || normalized.starts_with(".closed-code/")
+}
+
 pub struct WriteFileTool {
     working_directory: PathBuf,
     approval_handler: Arc<dyn ApprovalHandler>,
@@ -91,6 +100,13 @@ impl Tool for WriteFileTool {
                 name: "write_file".into(),
                 message: "Missing required parameter 'content'".into(),
             })?;
+
+        // Check protected paths
+        if is_protected_path(path_str) {
+            return Err(ClosedCodeError::ProtectedPath {
+                path: path_str.to_string(),
+            });
+        }
 
         let resolved = self.resolve_path(path_str);
 
@@ -312,5 +328,53 @@ mod tests {
         let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
         let debug = format!("{:?}", tool);
         assert!(debug.contains("WriteFileTool"));
+    }
+
+    #[tokio::test]
+    async fn write_protected_git_path_rejected() {
+        let (dir, handler) = setup();
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let result = tool
+            .execute(json!({
+                "path": ".git/config",
+                "content": "bad"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_protected_closed_code_rejected() {
+        let (dir, handler) = setup();
+        let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
+        let result = tool
+            .execute(json!({
+                "path": ".closed-code/config.toml",
+                "content": "bad"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ClosedCodeError::ProtectedPath { .. }
+        ));
+    }
+
+    #[test]
+    fn is_protected_path_variants() {
+        assert!(is_protected_path(".git"));
+        assert!(is_protected_path(".git/config"));
+        assert!(is_protected_path(".git/hooks/pre-commit"));
+        assert!(is_protected_path(".closed-code"));
+        assert!(is_protected_path(".closed-code/config.toml"));
+
+        assert!(!is_protected_path(".github/workflows/ci.yml"));
+        assert!(!is_protected_path("src/.gitignore"));
+        assert!(!is_protected_path(".gitignore"));
+        assert!(!is_protected_path("src/main.rs"));
     }
 }

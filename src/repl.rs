@@ -80,6 +80,7 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
         config.personality,
         config.context_window_turns,
     );
+    orchestrator.detect_git_context().await;
 
     match orchestrator
         .handle_user_input_streaming(question, default_stream_handler)
@@ -111,6 +112,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         config.personality,
         config.context_window_turns,
     );
+    orchestrator.detect_git_context().await;
     let mut editor = DefaultEditor::new()?;
 
     println!("{}", styled_text("closed-code", Theme::ACCENT));
@@ -124,6 +126,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         "Working directory: {}",
         config.working_directory.display()
     );
+    println!("Git: {}", orchestrator.git_summary());
     println!("Type /help for commands, Ctrl+C to interrupt, /quit to exit.\n");
 
     // Spawn a background task that sets the cancellation flag on Ctrl+C.
@@ -176,7 +179,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
                 }
 
                 if line.starts_with('/') {
-                    match handle_slash_command(line, &mut orchestrator)
+                    match handle_slash_command(line, &mut orchestrator).await
                     {
                         SlashResult::Continue => continue,
                         SlashResult::Quit => break,
@@ -268,7 +271,7 @@ enum SlashResult {
     ExecutePlan,
 }
 
-fn handle_slash_command(
+async fn handle_slash_command(
     input: &str,
     orchestrator: &mut Orchestrator,
 ) -> SlashResult {
@@ -319,6 +322,9 @@ fn handle_slash_command(
             println!("  /execute           \u{2014} Switch to Execute mode");
             println!("  /auto              \u{2014} Switch to Auto mode (unrestricted shell)");
             println!("  /accept            \u{2014} Accept the current plan and switch to Execute mode");
+            println!("  /diff [opts]       \u{2014} Show git diff (staged, branch, HEAD~N)");
+            println!("  /review [HEAD~N]   \u{2014} Send changes to LLM for code review");
+            println!("  /commit [message]  \u{2014} Generate commit message and commit");
             println!("  /model [name]      \u{2014} Show or switch model");
             println!("  /personality [s]   \u{2014} Show or change personality (friendly, pragmatic, none)");
             println!("  /status            \u{2014} Show session status (tokens, model, mode, etc.)");
@@ -359,6 +365,7 @@ fn handle_slash_command(
                 orchestrator.model(),
                 orchestrator.personality(),
             );
+            println!("Git: {}", orchestrator.git_summary());
             println!("Tokens: {}", orchestrator.session_usage());
             println!(
                 "Turns: {} / {} | Tools: {}",
@@ -366,6 +373,160 @@ fn handle_slash_command(
                 orchestrator.context_window_turns(),
                 orchestrator.tool_count(),
             );
+            SlashResult::Continue
+        }
+        "/diff" => {
+            let working_dir = orchestrator.working_directory();
+            let result = if arg.is_empty() || arg == "all" {
+                crate::git::diff::all_uncommitted(working_dir).await
+            } else if arg == "staged" {
+                crate::git::diff::staged(working_dir).await
+            } else if arg == "branch" {
+                let base = orchestrator.git_default_branch().unwrap_or("main");
+                crate::git::diff::branch_diff(working_dir, base).await
+            } else if arg.starts_with("HEAD") {
+                crate::git::diff::commit_range(working_dir, arg).await
+            } else {
+                println!("Usage: /diff [staged|branch|HEAD~N]");
+                return SlashResult::Continue;
+            };
+
+            match result {
+                Ok(diff) if diff.is_empty() => println!("No changes found."),
+                Ok(diff) => crate::git::diff::colorize_git_diff(&diff),
+                Err(e) => println!("{}: {}", styled_text("Error", Theme::ERROR), e),
+            }
+            SlashResult::Continue
+        }
+        "/review" => {
+            let working_dir = orchestrator.working_directory();
+            let diff = if arg.is_empty() {
+                crate::git::diff::all_uncommitted(working_dir).await
+            } else if arg.starts_with("HEAD") {
+                crate::git::diff::commit_range(working_dir, arg).await
+            } else {
+                println!("Usage: /review [HEAD~N]");
+                return SlashResult::Continue;
+            };
+
+            match diff {
+                Ok(d) if d.is_empty() => {
+                    println!("No changes to review.");
+                }
+                Ok(d) => {
+                    let prompt = format!(
+                        "Please review the following code changes and provide feedback on:\n\
+                         - Potential bugs or issues\n\
+                         - Code quality and best practices\n\
+                         - Suggestions for improvement\n\n\
+                         ```diff\n{}\n```",
+                        d
+                    );
+                    orchestrator.reset_cancel();
+                    match orchestrator
+                        .handle_user_input_streaming(&prompt, default_stream_handler)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "{}: {}",
+                                styled_text("Error", Theme::ERROR),
+                                e
+                            );
+                        }
+                    }
+                    drain_stdin();
+                }
+                Err(e) => {
+                    println!("{}: {}", styled_text("Error", Theme::ERROR), e);
+                }
+            }
+            SlashResult::Continue
+        }
+        "/commit" => {
+            let working_dir = orchestrator.working_directory();
+
+            // Check for uncommitted changes
+            let diff = match crate::git::diff::all_uncommitted(working_dir).await {
+                Ok(d) if d.is_empty() => {
+                    println!("Nothing to commit.");
+                    return SlashResult::Continue;
+                }
+                Ok(d) => d,
+                Err(e) => {
+                    println!(
+                        "{}: {}",
+                        styled_text("Error", Theme::ERROR),
+                        e
+                    );
+                    return SlashResult::Continue;
+                }
+            };
+
+            // Get commit message: user-provided or LLM-generated
+            let message = if !arg.is_empty() {
+                arg.to_string()
+            } else {
+                let prompt = format!(
+                    "Generate a concise git commit message (max 72 chars subject line) \
+                     for these changes.\n\
+                     Return ONLY the commit message text, nothing else.\n\n\
+                     ```diff\n{}\n```",
+                    diff
+                );
+                println!("Generating commit message...");
+                match orchestrator
+                    .handle_user_input_streaming(&prompt, default_stream_handler)
+                    .await
+                {
+                    Ok(msg) => msg.trim().trim_matches('"').to_string(),
+                    Err(e) => {
+                        eprintln!(
+                            "{}: {}",
+                            styled_text("Error", Theme::ERROR),
+                            e
+                        );
+                        return SlashResult::Continue;
+                    }
+                }
+            };
+
+            println!("\nProposed commit message: \"{}\"", message);
+
+            // Prompt for confirmation
+            let approved = tokio::task::spawn_blocking(move || {
+                dialoguer::Confirm::new()
+                    .with_prompt("Commit with this message?")
+                    .default(false)
+                    .interact()
+            })
+            .await
+            .unwrap_or(Ok(false))
+            .unwrap_or(false);
+
+            if approved {
+                let working_dir = orchestrator.working_directory();
+                match crate::git::commit::commit_all(working_dir, &message).await {
+                    Ok(sha) => {
+                        println!(
+                            "{} Committed: {}",
+                            styled_text("\u{2713}", Theme::SUCCESS),
+                            sha
+                        );
+                        orchestrator.refresh_git_context().await;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{}: {}",
+                            styled_text("Commit failed", Theme::ERROR),
+                            e
+                        );
+                    }
+                }
+            } else {
+                println!("Commit cancelled.");
+            }
             SlashResult::Continue
         }
         "/explore" => {
@@ -472,74 +633,74 @@ mod tests {
         )
     }
 
-    #[test]
-    fn slash_quit_returns_quit() {
+    #[tokio::test]
+    async fn slash_quit_returns_quit() {
         let mut orch = test_orchestrator();
         assert!(matches!(
-            handle_slash_command("/quit", &mut orch),
+            handle_slash_command("/quit", &mut orch).await,
             SlashResult::Quit
         ));
         assert!(matches!(
-            handle_slash_command("/exit", &mut orch),
+            handle_slash_command("/exit", &mut orch).await,
             SlashResult::Quit
         ));
         assert!(matches!(
-            handle_slash_command("/q", &mut orch),
+            handle_slash_command("/q", &mut orch).await,
             SlashResult::Quit
         ));
     }
 
-    #[test]
-    fn slash_clear_clears_history() {
+    #[tokio::test]
+    async fn slash_clear_clears_history() {
         let mut orch = test_orchestrator();
         assert_eq!(orch.turn_count(), 0);
-        handle_slash_command("/clear", &mut orch);
+        handle_slash_command("/clear", &mut orch).await;
         assert_eq!(orch.turn_count(), 0);
     }
 
-    #[test]
-    fn slash_help_returns_continue() {
+    #[tokio::test]
+    async fn slash_help_returns_continue() {
         let mut orch = test_orchestrator();
         assert!(matches!(
-            handle_slash_command("/help", &mut orch),
+            handle_slash_command("/help", &mut orch).await,
             SlashResult::Continue
         ));
     }
 
-    #[test]
-    fn unknown_command_returns_continue() {
+    #[tokio::test]
+    async fn unknown_command_returns_continue() {
         let mut orch = test_orchestrator();
         assert!(matches!(
-            handle_slash_command("/unknown", &mut orch),
+            handle_slash_command("/unknown", &mut orch).await,
             SlashResult::Continue
         ));
     }
 
-    #[test]
-    fn slash_mode_switches_mode() {
+    #[tokio::test]
+    async fn slash_mode_switches_mode() {
         let mut orch = test_orchestrator();
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
 
-        let result = handle_slash_command("/mode plan", &mut orch);
+        let result = handle_slash_command("/mode plan", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Plan);
         assert_eq!(orch.tool_count(), 8);
     }
 
-    #[test]
-    fn slash_mode_invalid_stays_unchanged() {
+    #[tokio::test]
+    async fn slash_mode_invalid_stays_unchanged() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/mode bad", &mut orch);
+        let result = handle_slash_command("/mode bad", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
         assert_eq!(orch.tool_count(), 6);
     }
 
-    #[test]
-    fn slash_mode_no_arg_shows_current() {
+    #[tokio::test]
+    async fn slash_mode_no_arg_shows_current() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/mode", &mut orch);
+        let result = handle_slash_command("/mode", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
     }
@@ -552,128 +713,173 @@ mod tests {
 
     // ── Phase 4 /accept Tests ──
 
-    #[test]
-    fn slash_accept_in_plan_mode_with_plan() {
+    #[tokio::test]
+    async fn slash_accept_in_plan_mode_with_plan() {
         let mut orch = test_plan_orchestrator();
         orch.set_current_plan("My implementation plan".into());
-        let result = handle_slash_command("/accept", &mut orch);
+        let result = handle_slash_command("/accept", &mut orch).await;
         assert!(matches!(result, SlashResult::ExecutePlan));
         assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
     }
 
-    #[test]
-    fn slash_accept_in_plan_mode_no_plan() {
+    #[tokio::test]
+    async fn slash_accept_in_plan_mode_no_plan() {
         let mut orch = test_plan_orchestrator();
-        let result = handle_slash_command("/accept", &mut orch);
+        let result = handle_slash_command("/accept", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Plan); // unchanged
     }
 
-    #[test]
-    fn slash_accept_in_explore_mode() {
+    #[tokio::test]
+    async fn slash_accept_in_explore_mode() {
         let mut orch = test_orchestrator(); // Explore mode
-        let result = handle_slash_command("/accept", &mut orch);
+        let result = handle_slash_command("/accept", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore); // unchanged
     }
 
-    #[test]
-    fn slash_accept_shorthand() {
+    #[tokio::test]
+    async fn slash_accept_shorthand() {
         let mut orch = test_plan_orchestrator();
         orch.set_current_plan("plan".into());
-        let result = handle_slash_command("/a", &mut orch);
+        let result = handle_slash_command("/a", &mut orch).await;
         assert!(matches!(result, SlashResult::ExecutePlan));
     }
 
     // ── Phase 5: New Slash Command Tests ──
 
-    #[test]
-    fn slash_model_show() {
+    #[tokio::test]
+    async fn slash_model_show() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/model", &mut orch);
+        let result = handle_slash_command("/model", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(orch.model(), "model"); // unchanged
     }
 
-    #[test]
-    fn slash_model_switch() {
+    #[tokio::test]
+    async fn slash_model_switch() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/model gemini-2.0-flash", &mut orch);
+        let result = handle_slash_command("/model gemini-2.0-flash", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(orch.model(), "gemini-2.0-flash");
     }
 
-    #[test]
-    fn slash_personality_show() {
+    #[tokio::test]
+    async fn slash_personality_show() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/personality", &mut orch);
+        let result = handle_slash_command("/personality", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(orch.personality(), Personality::Pragmatic); // default
     }
 
-    #[test]
-    fn slash_personality_switch() {
+    #[tokio::test]
+    async fn slash_personality_switch() {
         let mut orch = test_orchestrator();
         let result =
-            handle_slash_command("/personality friendly", &mut orch);
+            handle_slash_command("/personality friendly", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(orch.personality(), Personality::Friendly);
     }
 
-    #[test]
-    fn slash_status_returns_continue() {
+    #[tokio::test]
+    async fn slash_status_returns_continue() {
         let mut orch = test_orchestrator();
-        let result = handle_slash_command("/status", &mut orch);
+        let result = handle_slash_command("/status", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
     }
 
-    #[test]
-    fn slash_explore_shorthand() {
+    #[tokio::test]
+    async fn slash_explore_shorthand() {
         let mut orch = test_plan_orchestrator(); // Start in plan
-        let result = handle_slash_command("/explore", &mut orch);
+        let result = handle_slash_command("/explore", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore);
     }
 
-    #[test]
-    fn slash_plan_shorthand() {
+    #[tokio::test]
+    async fn slash_plan_shorthand() {
         let mut orch = test_orchestrator(); // Start in explore
-        let result = handle_slash_command("/plan", &mut orch);
+        let result = handle_slash_command("/plan", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Plan);
     }
 
-    #[test]
-    fn slash_execute_shorthand() {
+    #[tokio::test]
+    async fn slash_execute_shorthand() {
         let mut orch = test_orchestrator(); // Start in explore
-        let result = handle_slash_command("/execute", &mut orch);
+        let result = handle_slash_command("/execute", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
     }
 
-    #[test]
-    fn slash_auto_shorthand() {
+    #[tokio::test]
+    async fn slash_auto_shorthand() {
         let mut orch = test_orchestrator(); // Start in explore
-        let result = handle_slash_command("/auto", &mut orch);
+        let result = handle_slash_command("/auto", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Auto);
     }
 
-    #[test]
-    fn slash_command_arg_splitting() {
+    #[tokio::test]
+    async fn slash_command_arg_splitting() {
         // Verify command/arg splitting works for multi-word args
         let mut orch = test_orchestrator();
 
         // /mode with arg
-        handle_slash_command("/mode execute", &mut orch);
+        handle_slash_command("/mode execute", &mut orch).await;
         assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
 
         // /mode auto
-        handle_slash_command("/mode auto", &mut orch);
+        handle_slash_command("/mode auto", &mut orch).await;
         assert_eq!(*orch.mode(), crate::mode::Mode::Auto);
 
         // /model with arg containing spaces-like model name
-        handle_slash_command("/model gemini-2.0-flash", &mut orch);
+        handle_slash_command("/model gemini-2.0-flash", &mut orch).await;
         assert_eq!(orch.model(), "gemini-2.0-flash");
+    }
+
+    // ── Phase 6: Git Slash Command Tests ──
+
+    #[tokio::test]
+    async fn slash_diff_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/diff", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_diff_usage_on_bad_arg() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/diff badarg", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_review_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/review", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_commit_returns_continue() {
+        let mut orch = test_orchestrator();
+        // In a non-git dir, /commit should show error and return Continue
+        let result = handle_slash_command("/commit", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_diff_staged_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/diff staged", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_diff_branch_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/diff branch", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
     }
 }
