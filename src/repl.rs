@@ -897,7 +897,7 @@ mod tests {
         let result = handle_slash_command("/guided", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Guided);
-        assert_eq!(orch.tool_count(), 8); // write tools registered
+        assert_eq!(orch.tool_count(), 9); // write + spawn_planner tools registered
     }
 
     #[tokio::test]

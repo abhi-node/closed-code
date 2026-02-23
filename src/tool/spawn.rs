@@ -189,7 +189,7 @@ impl Tool for SpawnPlannerTool {
     }
 
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Plan]
+        vec![Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto]
     }
 }
 
@@ -292,11 +292,15 @@ mod tests {
     }
 
     #[test]
-    fn spawn_planner_tool_plan_mode_only() {
+    fn spawn_planner_tool_properties() {
         let client = Arc::new(GeminiClient::new("key".into(), "model".into()));
         let tool = SpawnPlannerTool::new(client, PathBuf::from("/tmp"));
         assert_eq!(tool.name(), "spawn_planner");
-        assert_eq!(tool.available_modes(), vec![Mode::Plan]);
+        assert!(tool.available_modes().contains(&Mode::Plan));
+        assert!(tool.available_modes().contains(&Mode::Guided));
+        assert!(tool.available_modes().contains(&Mode::Execute));
+        assert!(tool.available_modes().contains(&Mode::Auto));
+        assert!(!tool.available_modes().contains(&Mode::Explore));
     }
 
     #[test]

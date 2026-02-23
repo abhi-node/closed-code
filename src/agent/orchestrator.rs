@@ -411,6 +411,13 @@ impl Orchestrator {
                  - Run read-only shell commands (git log, cargo check, etc.)\n\
                  - Use spawn_explorer for deep codebase research\n\
                  \n\
+                 CONTEXT CONSERVATION: When your task involves researching multiple \
+                 files, tracing code paths, or understanding unfamiliar areas of the \
+                 codebase, prefer spawn_explorer over reading files directly. Sub-agents \
+                 run in isolated contexts and return structured reports, keeping your \
+                 main context window clean. Use direct tools (read_file, grep) only for \
+                 quick single-file lookups where you already know exactly what you need.\n\
+                 \n\
                  Explain code architecture, patterns, data flow, and answer questions.\n\
                  NEVER suggest creating or modifying files in this mode."
             }
@@ -426,10 +433,17 @@ impl Orchestrator {
                     - Potential risks or trade-offs\n\
                  \n\
                  Available tools:\n\
-                 - spawn_explorer: Deep codebase research\n\
+                 - spawn_explorer: Deep codebase research (use for multi-file analysis)\n\
                  - spawn_planner: Create detailed implementation plans\n\
                  - spawn_web_search: Research topics online\n\
                  - All filesystem read tools\n\
+                 \n\
+                 CONTEXT CONSERVATION: Delegate research to sub-agents whenever possible. \
+                 Use spawn_explorer to investigate code architecture, trace dependencies, \
+                 or analyze multiple files. Use spawn_planner for generating detailed \
+                 step-by-step plans from complex requirements. This keeps your main context \
+                 focused on the user conversation rather than raw file contents. Reserve \
+                 direct tool use (read_file, grep) for quick, targeted lookups.\n\
                  \n\
                  The user will either:\n\
                  - Give feedback to refine the plan (continue the conversation)\n\
@@ -443,15 +457,24 @@ impl Orchestrator {
                  - write_file: Create/overwrite files (requires user approval)\n\
                  - edit_file: Targeted search/replace changes (requires user approval)\n\
                  - spawn_explorer: Research code before making changes\n\
+                 - spawn_planner: Plan complex multi-step changes before executing\n\
                  - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
                  - shell: Run allowlisted commands only (ls, cat, grep, git, cargo, etc.)\n\
                  \n\
+                 CONTEXT CONSERVATION: Before making changes, use sub-agents to research \
+                 the codebase. spawn_explorer for understanding code you need to modify, \
+                 spawn_planner for breaking down complex tasks into steps. This avoids \
+                 filling your context with raw file contents and produces better plans. \
+                 Use direct tools (read_file) only for quick lookups of files you already \
+                 know about.\n\
+                 \n\
                  IMPORTANT workflow:\n\
-                 1. Always read the file first (read_file) before editing it\n\
-                 2. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
-                 3. Use write_file for new files or complete rewrites\n\
-                 4. Each change shows a diff the user must approve or reject\n\
-                 5. If the user rejects a change, adjust your approach based on their feedback\n\
+                 1. Research first: use sub-agents to understand the code before editing\n\
+                 2. Always read the file (read_file) immediately before editing it\n\
+                 3. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 4. Use write_file for new files or complete rewrites\n\
+                 5. Each change shows a diff the user must approve or reject\n\
+                 6. If the user rejects a change, adjust your approach based on their feedback\n\
                  \n\
                  Make changes methodically: one file at a time, with clear purpose."
             }
@@ -462,15 +485,24 @@ impl Orchestrator {
                  - write_file: Create new files or overwrite existing ones\n\
                  - edit_file: Make targeted changes using search/replace\n\
                  - spawn_explorer: Research code before making changes\n\
+                 - spawn_planner: Plan complex multi-step changes before executing\n\
                  - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
                  - shell: Run allowlisted commands only (ls, cat, grep, git, cargo, etc.)\n\
                  \n\
+                 CONTEXT CONSERVATION: Before making changes, use sub-agents to research \
+                 the codebase. spawn_explorer for understanding code you need to modify, \
+                 spawn_planner for breaking down complex tasks into steps. This avoids \
+                 filling your context with raw file contents and produces better plans. \
+                 Use direct tools (read_file) only for quick lookups of files you already \
+                 know about.\n\
+                 \n\
                  IMPORTANT workflow:\n\
-                 1. Always read the file first (read_file) before editing it\n\
-                 2. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
-                 3. Use write_file for new files or complete rewrites\n\
-                 4. File writes are auto-approved\n\
-                 5. If something goes wrong, use /explore to investigate\n\
+                 1. Research first: use sub-agents to understand the code before editing\n\
+                 2. Always read the file (read_file) immediately before editing it\n\
+                 3. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 4. Use write_file for new files or complete rewrites\n\
+                 5. File writes are auto-approved\n\
+                 6. If something goes wrong, use /explore to investigate\n\
                  \n\
                  Make changes methodically: one file at a time, with clear purpose."
             }
@@ -482,14 +514,23 @@ impl Orchestrator {
                  - edit_file: Make targeted changes using search/replace\n\
                  - shell: Execute ANY shell command (no allowlist restrictions)\n\
                  - spawn_explorer: Research code before making changes\n\
+                 - spawn_planner: Plan complex multi-step changes before executing\n\
                  - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
                  \n\
+                 CONTEXT CONSERVATION: Before making changes, use sub-agents to research \
+                 the codebase. spawn_explorer for understanding code you need to modify, \
+                 spawn_planner for breaking down complex tasks into steps. This avoids \
+                 filling your context with raw file contents and produces better plans. \
+                 Use direct tools (read_file) only for quick lookups of files you already \
+                 know about.\n\
+                 \n\
                  IMPORTANT: File writes are auto-approved and shell commands are unrestricted.\n\
-                 1. Always read the file first (read_file) before editing it\n\
-                 2. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
-                 3. Use write_file for new files or complete rewrites\n\
-                 4. Double-check destructive shell commands before executing\n\
-                 5. Never run commands that could damage the system or delete important data\n\
+                 1. Research first: use sub-agents to understand the code before editing\n\
+                 2. Always read the file (read_file) immediately before editing it\n\
+                 3. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 4. Use write_file for new files or complete rewrites\n\
+                 5. Double-check destructive shell commands before executing\n\
+                 6. Never run commands that could damage the system or delete important data\n\
                  \n\
                  Make changes methodically: one file at a time, with clear purpose."
             }
@@ -923,11 +964,12 @@ mod tests {
             Personality::default(),
             50,
         );
-        // 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
-        assert_eq!(orch.tool_count(), 8);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
+        assert_eq!(orch.tool_count(), 9);
         assert!(orch.system_prompt().contains("EXECUTE"));
         assert!(orch.system_prompt().contains("write_file"));
         assert!(orch.system_prompt().contains("edit_file"));
+        assert!(orch.system_prompt().contains("spawn_planner"));
     }
 
     #[test]
@@ -1059,13 +1101,14 @@ mod tests {
         // Switch to Execute mode
         orch.set_mode(Mode::Execute);
         assert_eq!(*orch.mode(), Mode::Execute);
-        assert_eq!(orch.tool_count(), 8);
+        assert_eq!(orch.tool_count(), 9);
         assert!(orch.system_prompt().contains("write_file"));
+        assert!(orch.system_prompt().contains("spawn_planner"));
 
         // Switch to Auto mode
         orch.set_mode(Mode::Auto);
         assert_eq!(*orch.mode(), Mode::Auto);
-        assert_eq!(orch.tool_count(), 8);
+        assert_eq!(orch.tool_count(), 9);
         assert!(orch.system_prompt().contains("AUTO"));
         assert!(orch.system_prompt().contains("ANY shell command"));
 
@@ -1111,7 +1154,7 @@ mod tests {
         assert!(plan.is_some());
         assert_eq!(plan.unwrap(), "The plan content");
         assert_eq!(*orch.mode(), Mode::Execute);
-        assert_eq!(orch.tool_count(), 8); // Now has write tools
+        assert_eq!(orch.tool_count(), 9); // Now has write + spawn_planner tools
         assert!(orch.current_plan().is_none()); // Plan consumed
 
         // Plan should be in history
@@ -1159,7 +1202,7 @@ mod tests {
 
         assert!(plan.is_some());
         assert_eq!(*orch.mode(), Mode::Guided);
-        assert_eq!(orch.tool_count(), 8); // Same tools as Execute
+        assert_eq!(orch.tool_count(), 9); // Same tools as Execute
     }
 
     #[test]
@@ -1183,7 +1226,7 @@ mod tests {
         orch.set_mode_with_handler(Mode::Guided, Some(new_handler));
 
         assert_eq!(*orch.mode(), Mode::Guided);
-        assert_eq!(orch.tool_count(), 8); // write tools registered
+        assert_eq!(orch.tool_count(), 9); // write + spawn_planner tools registered
     }
 
     #[test]
@@ -1321,13 +1364,14 @@ mod tests {
             Personality::default(),
             50,
         );
-        // Same as Execute: 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
-        assert_eq!(orch.tool_count(), 8);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
+        assert_eq!(orch.tool_count(), 9);
         assert_eq!(*orch.mode(), Mode::Auto);
         assert!(orch.system_prompt().contains("AUTO"));
         assert!(orch.system_prompt().contains("ANY shell command"));
         assert!(orch.system_prompt().contains("write_file"));
         assert!(orch.system_prompt().contains("unrestricted"));
+        assert!(orch.system_prompt().contains("spawn_planner"));
     }
 
     #[test]
@@ -1337,7 +1381,7 @@ mod tests {
 
         orch.set_mode(Mode::Auto);
         assert_eq!(*orch.mode(), Mode::Auto);
-        assert_eq!(orch.tool_count(), 8);
+        assert_eq!(orch.tool_count(), 9);
         assert!(orch.system_prompt().contains("AUTO"));
 
         // Switch back

@@ -212,6 +212,10 @@ pub fn create_orchestrator_registry(
         }
         Mode::Guided | Mode::Execute | Mode::Auto => {
             registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
+                client.clone(),
+                working_directory.clone(),
+            )));
+            registry.register(Box::new(super::spawn::SpawnPlannerTool::new(
                 client,
                 working_directory.clone(),
             )));
@@ -460,11 +464,12 @@ mod tests {
             client,
             Some(handler),
         );
-        // 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
-        assert_eq!(registry.len(), 8);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
+        assert_eq!(registry.len(), 9);
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
         assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("spawn_planner").is_some());
     }
 
     #[test]
@@ -479,8 +484,8 @@ mod tests {
             client,
             None,
         );
-        // No write tools registered without handler
-        assert_eq!(registry.len(), 6);
+        // No write tools, but spawn tools: 5 filesystem/shell + spawn_explorer + spawn_planner = 7
+        assert_eq!(registry.len(), 7);
         assert!(registry.get("write_file").is_none());
         assert!(registry.get("edit_file").is_none());
     }
@@ -518,11 +523,12 @@ mod tests {
             client,
             Some(handler),
         );
-        // 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
-        assert_eq!(registry.len(), 8);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
+        assert_eq!(registry.len(), 9);
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
         assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("spawn_planner").is_some());
         // Guided does not bypass shell allowlist
         assert!(registry.get("shell").is_some());
     }
@@ -564,11 +570,12 @@ mod tests {
             client,
             Some(handler),
         );
-        // Same as Execute: 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
-        assert_eq!(registry.len(), 8);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
+        assert_eq!(registry.len(), 9);
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
         assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("spawn_planner").is_some());
         assert!(registry.get("shell").is_some());
     }
 }
