@@ -189,6 +189,44 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Resolve a short session ID prefix to a full SessionId.
+    /// Scans .jsonl filenames in the sessions directory.
+    /// Returns error if no match or multiple matches (ambiguous).
+    pub fn find_by_prefix(&self, prefix: &str) -> Result<SessionId> {
+        self.ensure_dir()?;
+        let prefix_lower = prefix.to_lowercase().replace('-', "");
+        let mut matches = Vec::new();
+
+        for entry in std::fs::read_dir(&self.sessions_dir)
+            .map_err(crate::error::ClosedCodeError::Io)?
+        {
+            let entry = entry.map_err(crate::error::ClosedCodeError::Io)?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "jsonl") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    // Compare without hyphens for flexible matching
+                    let stem_normalized = stem.to_lowercase().replace('-', "");
+                    if stem_normalized.starts_with(&prefix_lower) {
+                        if let Ok(id) = SessionId::parse(stem) {
+                            matches.push(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        match matches.len() {
+            0 => Err(crate::error::ClosedCodeError::SessionNotFound(
+                prefix.to_string(),
+            )),
+            1 => Ok(matches.remove(0)),
+            n => Err(crate::error::ClosedCodeError::SessionError(format!(
+                "Ambiguous prefix '{}': matches {} sessions",
+                prefix, n
+            ))),
+        }
+    }
+
     /// Reconstruct conversation history from session events.
     /// Starts from the last Compact event if present, maps events to `Vec<Content>`.
     pub fn reconstruct_history(events: &[SessionEvent]) -> Vec<Content> {
@@ -617,5 +655,50 @@ mod tests {
             &history[0].parts[0],
             crate::gemini::types::Part::InlineData { mime_type, .. } if mime_type == "image/png"
         ));
+    }
+
+    #[test]
+    fn find_by_prefix_single_match() {
+        let (store, _dir) = test_store();
+        let id = SessionId::new();
+        store.save_event(&id, &make_session_start(&id)).unwrap();
+
+        let prefix = &id.as_str()[..8];
+        let found = store.find_by_prefix(prefix).unwrap();
+        assert_eq!(found, id);
+    }
+
+    #[test]
+    fn find_by_prefix_full_uuid() {
+        let (store, _dir) = test_store();
+        let id = SessionId::new();
+        store.save_event(&id, &make_session_start(&id)).unwrap();
+
+        let found = store.find_by_prefix(&id.as_str()).unwrap();
+        assert_eq!(found, id);
+    }
+
+    #[test]
+    fn find_by_prefix_no_match() {
+        let (store, _dir) = test_store();
+        let result = store.find_by_prefix("nonexist");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn find_by_prefix_ambiguous() {
+        let (store, _dir) = test_store();
+
+        // Create two sessions — use a single-char prefix that both will match
+        let id1 = SessionId::new();
+        let id2 = SessionId::new();
+        store.save_event(&id1, &make_session_start(&id1)).unwrap();
+        store.save_event(&id2, &make_session_start(&id2)).unwrap();
+
+        // Empty prefix matches all
+        let result = store.find_by_prefix("");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Ambiguous") || err_msg.contains("matches 2"));
     }
 }

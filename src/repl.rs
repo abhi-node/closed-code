@@ -299,37 +299,54 @@ pub async fn run_resume(config: &Config, session_id_str: Option<&str>) -> anyhow
     let store = SessionStore::new(config.sessions_dir.clone());
 
     let session_id = if let Some(id_str) = session_id_str {
-        SessionId::parse(id_str).map_err(|e| anyhow::anyhow!("Invalid session ID: {}", e))?
+        // Try full UUID first, then prefix match
+        match SessionId::parse(id_str) {
+            Ok(id) => id,
+            Err(_) => store
+                .find_by_prefix(id_str)
+                .map_err(|e| anyhow::anyhow!("{}", e))?,
+        }
     } else {
-        // List recent sessions
-        let sessions = store.list_sessions().map_err(|e| anyhow::anyhow!("{}", e))?;
+        // Interactive session picker
+        let sessions = store
+            .list_sessions()
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
         if sessions.is_empty() {
             println!("No sessions found.");
             return Ok(());
         }
 
-        println!("Recent sessions:");
-        let show = sessions.len().min(10);
-        for (i, meta) in sessions.iter().take(show).enumerate() {
-            println!(
-                "  {}. {} ({}) — {} — {}",
-                i + 1,
-                &meta.session_id.as_str()[..8],
-                meta.relative_time(),
-                meta.mode,
-                meta.truncated_preview(),
-            );
-        }
+        let items: Vec<String> = sessions
+            .iter()
+            .map(|meta| {
+                format!(
+                    "{} ({}) \u{2014} {} \u{2014} {}",
+                    &meta.session_id.as_str()[..8],
+                    meta.relative_time(),
+                    meta.mode,
+                    meta.truncated_preview(),
+                )
+            })
+            .collect();
 
-        // Read selection from stdin
-        println!("\nEnter session number (1-{}):", show);
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let idx: usize = input.trim().parse().map_err(|_| anyhow::anyhow!("Invalid selection"))?;
-        if idx < 1 || idx > show {
-            return Err(anyhow::anyhow!("Selection out of range"));
+        let selection = tokio::task::spawn_blocking(move || {
+            dialoguer::Select::new()
+                .with_prompt("Select session to resume")
+                .items(&items)
+                .default(0)
+                .interact_opt()
+        })
+        .await
+        .unwrap_or(Ok(None))
+        .unwrap_or(None);
+
+        match selection {
+            Some(idx) => sessions[idx].session_id.clone(),
+            None => {
+                println!("Cancelled.");
+                return Ok(());
+            }
         }
-        sessions[idx - 1].session_id.clone()
     };
 
     let events = store.load_events(&session_id).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -949,8 +966,10 @@ async fn handle_slash_command(
         "/compact" => {
             let user_prompt = if arg.is_empty() { None } else { Some(arg) };
             let turns_before = orchestrator.turn_count();
+            let spinner = Spinner::new("Compacting...");
             match orchestrator.compact_history(user_prompt).await {
                 Ok(summary) => {
+                    spinner.finish();
                     println!(
                         "{} Compacted: {} turns \u{2192} {} turns",
                         styled_text("\u{2713}", Theme::SUCCESS),
@@ -970,6 +989,7 @@ async fn handle_slash_command(
                     println!("{}", preview);
                 }
                 Err(e) => {
+                    spinner.finish();
                     eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
                 }
             }
@@ -1062,26 +1082,83 @@ async fn handle_slash_command(
             SlashResult::Continue
         }
         "/resume" => {
-            if let Some(store) = orchestrator.session_store() {
+            if let Some(store) = orchestrator.session_store().cloned() {
                 match store.list_sessions() {
                     Ok(sessions) if sessions.is_empty() => {
                         println!("No sessions found.");
                     }
                     Ok(sessions) => {
-                        println!("Recent sessions:");
-                        for (i, meta) in sessions.iter().take(10).enumerate() {
-                            println!(
-                                "  {}. {} ({}) \u{2014} {} \u{2014} {}",
-                                i + 1,
-                                &meta.session_id.as_str()[..8],
-                                meta.relative_time(),
-                                meta.mode,
-                                meta.truncated_preview(),
-                            );
+                        // Find current session index for default selection
+                        let current_idx = orchestrator
+                            .session_id()
+                            .and_then(|current| {
+                                sessions.iter().position(|m| m.session_id == *current)
+                            })
+                            .unwrap_or(0);
+
+                        let current_session_id = orchestrator.session_id().cloned();
+                        let items: Vec<String> = sessions
+                            .iter()
+                            .map(|meta| {
+                                let marker =
+                                    if Some(&meta.session_id) == current_session_id.as_ref() {
+                                        " (current)"
+                                    } else {
+                                        ""
+                                    };
+                                format!(
+                                    "{} ({}) \u{2014} {} \u{2014} {}{}",
+                                    &meta.session_id.as_str()[..8],
+                                    meta.relative_time(),
+                                    meta.mode,
+                                    meta.truncated_preview(),
+                                    marker,
+                                )
+                            })
+                            .collect();
+
+                        let selection = tokio::task::spawn_blocking(move || {
+                            dialoguer::Select::new()
+                                .with_prompt("Select session to resume")
+                                .items(&items)
+                                .default(current_idx)
+                                .interact_opt()
+                        })
+                        .await
+                        .unwrap_or(Ok(None))
+                        .unwrap_or(None);
+
+                        if let Some(idx) = selection {
+                            let selected = &sessions[idx];
+                            if Some(&selected.session_id) == current_session_id.as_ref() {
+                                println!("Already on this session.");
+                            } else {
+                                match store.load_events(&selected.session_id) {
+                                    Ok(events) => {
+                                        let history =
+                                            SessionStore::reconstruct_history(&events);
+                                        let turn_count = history.len();
+                                        orchestrator.set_history(history);
+                                        orchestrator.set_session(
+                                            selected.session_id.clone(),
+                                            store.clone(),
+                                        );
+                                        println!(
+                                            "Switched to session {} ({} turns restored)",
+                                            &selected.session_id.as_str()[..8],
+                                            turn_count
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "{}: {}",
+                                            styled_text("Error", Theme::ERROR),
+                                            e
+                                        );
+                                    }
+                                }
+                            }
                         }
-                        println!(
-                            "\nTo resume, run: closed-code resume <session-id>"
-                        );
                     }
                     Err(e) => {
                         eprintln!(
