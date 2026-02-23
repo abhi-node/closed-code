@@ -141,6 +141,62 @@ impl ApprovalHandler for AutoApproveHandler {
     }
 }
 
+/// Diff-display handler that auto-approves without prompting.
+///
+/// Shows the colorized unified diff so the user sees what changed,
+/// then auto-approves. Used in Execute and Auto modes where writes
+/// don't require confirmation but visibility is still desired.
+#[derive(Debug)]
+pub struct DiffOnlyApprovalHandler;
+
+impl DiffOnlyApprovalHandler {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DiffOnlyApprovalHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ApprovalHandler for DiffOnlyApprovalHandler {
+    async fn request_approval(&self, change: &FileChange) -> Result<ApprovalDecision> {
+        use crossterm::style::Stylize;
+        use crate::ui::theme::Theme;
+
+        let operation = if change.is_new_file { "CREATE" } else { "MODIFY" };
+
+        // Print header banner (same style as TerminalApprovalHandler)
+        println!();
+        println!(
+            "{}",
+            format!("── {} {} ──", operation, change.resolved_path)
+                .with(Theme::ACCENT)
+                .bold()
+        );
+        println!();
+
+        // Display the colorized diff
+        crate::ui::diff::display_diff(
+            &change.file_path,
+            &change.old_content,
+            &change.new_content,
+        );
+
+        // Auto-approve without prompting
+        println!(
+            "  {} {}",
+            "\u{2713}".with(Theme::SUCCESS),
+            "Auto-approved.".with(Theme::DIM)
+        );
+
+        Ok(ApprovalDecision::Approved)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,4 +249,24 @@ mod tests {
         assert!(debug.contains("TerminalApprovalHandler"));
     }
 
+    #[tokio::test]
+    async fn diff_only_handler_approves() {
+        let handler = DiffOnlyApprovalHandler::new();
+        let change = FileChange {
+            file_path: "test.rs".into(),
+            resolved_path: "/tmp/test.rs".into(),
+            old_content: "old".into(),
+            new_content: "new".into(),
+            is_new_file: false,
+        };
+        let decision = handler.request_approval(&change).await.unwrap();
+        assert_eq!(decision, ApprovalDecision::Approved);
+    }
+
+    #[test]
+    fn diff_only_handler_debug() {
+        let handler = DiffOnlyApprovalHandler::new();
+        let debug = format!("{:?}", handler);
+        assert!(debug.contains("DiffOnlyApprovalHandler"));
+    }
 }

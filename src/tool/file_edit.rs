@@ -213,7 +213,7 @@ impl Tool for EditFileTool {
     }
 
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Execute, Mode::Auto]
+        vec![Mode::Guided, Mode::Execute, Mode::Auto]
     }
 }
 
@@ -390,7 +390,7 @@ mod tests {
     fn edit_available_modes() {
         let (dir, handler) = setup();
         let tool = EditFileTool::new(dir.path().to_path_buf(), handler);
-        assert_eq!(tool.available_modes(), vec![Mode::Execute, Mode::Auto]);
+        assert_eq!(tool.available_modes(), vec![Mode::Guided, Mode::Execute, Mode::Auto]);
     }
 
     #[test]

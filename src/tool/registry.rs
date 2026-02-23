@@ -210,12 +210,12 @@ pub fn create_orchestrator_registry(
                 working_directory,
             )));
         }
-        Mode::Execute | Mode::Auto => {
+        Mode::Guided | Mode::Execute | Mode::Auto => {
             registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
                 client,
                 working_directory.clone(),
             )));
-            // Write tools — Execute and Auto modes
+            // Write tools — Guided, Execute, and Auto modes
             if let Some(handler) = approval_handler {
                 registry.register(Box::new(super::file_write::WriteFileTool::new(
                     working_directory.clone(),
@@ -502,6 +502,29 @@ mod tests {
         // Explore mode: no write tools regardless of handler
         assert_eq!(registry.len(), 6);
         assert!(registry.get("write_file").is_none());
+    }
+
+    #[test]
+    fn create_orchestrator_registry_guided_mode() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let handler = Arc::new(crate::ui::approval::AutoApproveHandler::always_approve())
+            as Arc<dyn crate::ui::approval::ApprovalHandler>;
+        let registry = create_orchestrator_registry(
+            PathBuf::from("/tmp"),
+            &Mode::Guided,
+            client,
+            Some(handler),
+        );
+        // 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
+        assert_eq!(registry.len(), 8);
+        assert!(registry.get("write_file").is_some());
+        assert!(registry.get("edit_file").is_some());
+        assert!(registry.get("spawn_explorer").is_some());
+        // Guided does not bypass shell allowlist
+        assert!(registry.get("shell").is_some());
     }
 
     #[test]

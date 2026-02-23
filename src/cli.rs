@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "closed-code", version, about = "AI-powered coding CLI")]
 pub struct Cli {
-    /// Operating mode: explore, plan, or execute
+    /// Operating mode: explore, plan, guided, execute, or auto
     #[arg(long, default_value = "explore")]
     pub mode: String,
 

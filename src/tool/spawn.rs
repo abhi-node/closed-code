@@ -101,7 +101,7 @@ impl Tool for SpawnExplorerTool {
     }
 
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto]
+        vec![Mode::Explore, Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto]
     }
 }
 

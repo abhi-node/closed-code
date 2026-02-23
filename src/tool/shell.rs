@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(tool.declaration().name, "shell");
         assert_eq!(
             tool.available_modes(),
-            vec![Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto]
+            vec![Mode::Explore, Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto]
         );
     }
 

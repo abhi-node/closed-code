@@ -19,7 +19,7 @@ pub enum ClosedCodeError {
     #[error("Missing API key. Set GEMINI_API_KEY or pass --api-key")]
     MissingApiKey,
 
-    #[error("Invalid mode '{0}'. Expected: explore, plan, execute, or auto")]
+    #[error("Invalid mode '{0}'. Expected: explore, plan, guided, execute, or auto")]
     InvalidMode(String),
 
     // Network / IO
@@ -211,7 +211,7 @@ mod tests {
         let err = ClosedCodeError::InvalidMode("bad".into());
         assert_eq!(
             err.to_string(),
-            "Invalid mode 'bad'. Expected: explore, plan, execute, or auto"
+            "Invalid mode 'bad'. Expected: explore, plan, guided, execute, or auto"
         );
     }
 

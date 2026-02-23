@@ -11,7 +11,7 @@ use crate::agent::orchestrator::Orchestrator;
 use crate::config::{Config, Personality};
 use crate::gemini::stream::StreamEvent;
 use crate::gemini::GeminiClient;
-use crate::ui::approval::AutoApproveHandler;
+use crate::ui::approval::{ApprovalHandler, DiffOnlyApprovalHandler, TerminalApprovalHandler};
 use crate::ui::spinner::Spinner;
 use crate::ui::theme::Theme;
 
@@ -71,7 +71,7 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
         config.api_key.clone(),
         config.model.clone(),
     ));
-    let approval_handler = Arc::new(AutoApproveHandler::always_approve());
+    let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
     let mut orchestrator = Orchestrator::new(
         client,
         config.mode,
@@ -103,7 +103,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         config.api_key.clone(),
         config.model.clone(),
     ));
-    let approval_handler = Arc::new(AutoApproveHandler::always_approve());
+    let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
     let mut orchestrator = Orchestrator::new(
         client,
         config.mode,
@@ -272,6 +272,15 @@ enum SlashResult {
     ExecutePlan,
 }
 
+/// Return the appropriate ApprovalHandler for a given mode.
+/// Guided mode uses interactive terminal approval; all others use diff-only auto-approve.
+fn handler_for_mode(mode: &crate::mode::Mode) -> Arc<dyn ApprovalHandler> {
+    match mode {
+        crate::mode::Mode::Guided => Arc::new(TerminalApprovalHandler::new()),
+        _ => Arc::new(DiffOnlyApprovalHandler::new()),
+    }
+}
+
 async fn handle_slash_command(
     input: &str,
     orchestrator: &mut Orchestrator,
@@ -297,19 +306,87 @@ async fn handle_slash_command(
                 );
                 return SlashResult::Continue;
             }
-            match orchestrator.accept_plan() {
-                Some(_) => {
+
+            if orchestrator.current_plan().is_none() {
+                println!(
+                    "No plan to accept. Ask the assistant to create a plan first."
+                );
+                return SlashResult::Continue;
+            }
+
+            // Prompt user to choose target mode
+            let items = vec![
+                "Guided  \u{2014} Write files with approval for each change",
+                "Execute \u{2014} Auto-approve writes, allowlisted shell",
+                "Auto    \u{2014} Full autonomy, unrestricted shell [DANGER]",
+            ];
+
+            let selection = tokio::task::spawn_blocking(move || {
+                dialoguer::Select::new()
+                    .with_prompt("Choose execution mode")
+                    .items(&items)
+                    .default(0)
+                    .interact_opt()
+            })
+            .await
+            .unwrap_or(Ok(None))
+            .unwrap_or(None);
+
+            let target_mode = match selection {
+                Some(0) => crate::mode::Mode::Guided,
+                Some(1) => crate::mode::Mode::Execute,
+                Some(2) => {
+                    // Auto mode danger warning
                     println!(
-                        "{} Plan accepted. Switched to Execute mode (tools: {}).",
+                        "{}",
+                        styled_text(
+                            "WARNING: Auto mode grants unrestricted shell access and auto-approves all changes.",
+                            Theme::ERROR,
+                        )
+                    );
+                    let confirmed = tokio::task::spawn_blocking(|| {
+                        dialoguer::Confirm::new()
+                            .with_prompt("Are you sure?")
+                            .default(false)
+                            .interact()
+                    })
+                    .await
+                    .unwrap_or(Ok(false))
+                    .unwrap_or(false);
+
+                    if !confirmed {
+                        println!("Cancelled. Staying in Plan mode.");
+                        return SlashResult::Continue;
+                    }
+                    crate::mode::Mode::Auto
+                }
+                _ => {
+                    println!("Cancelled.");
+                    return SlashResult::Continue;
+                }
+            };
+
+            // Swap handler and accept the plan
+            let handler = handler_for_mode(&target_mode);
+            orchestrator.set_mode_with_handler(target_mode, Some(handler));
+            match orchestrator.accept_plan(target_mode) {
+                Some(_) => {
+                    let extra = if target_mode == crate::mode::Mode::Guided {
+                        " Each change requires your approval."
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{} Plan accepted. Switched to {} mode (tools: {}).{}",
                         styled_text("\u{2713}", Theme::SUCCESS),
-                        orchestrator.tool_count()
+                        target_mode,
+                        orchestrator.tool_count(),
+                        extra,
                     );
                     SlashResult::ExecutePlan
                 }
                 None => {
-                    println!(
-                        "No plan to accept. Ask the assistant to create a plan first."
-                    );
+                    println!("No plan to accept.");
                     SlashResult::Continue
                 }
             }
@@ -317,12 +394,13 @@ async fn handle_slash_command(
         "/help" => {
             println!("Commands:");
             println!("  /help              \u{2014} Show this help");
-            println!("  /mode [name]       \u{2014} Show or switch mode (explore, plan, execute, auto)");
+            println!("  /mode [name]       \u{2014} Show or switch mode (explore, plan, guided, execute, auto)");
             println!("  /explore           \u{2014} Switch to Explore mode");
             println!("  /plan              \u{2014} Switch to Plan mode");
+            println!("  /guided            \u{2014} Switch to Guided mode (writes require approval)");
             println!("  /execute           \u{2014} Switch to Execute mode");
             println!("  /auto              \u{2014} Switch to Auto mode (unrestricted shell)");
-            println!("  /accept            \u{2014} Accept the current plan and switch to Execute mode");
+            println!("  /accept            \u{2014} Accept plan and choose execution mode");
             println!("  /diff [opts]       \u{2014} Show git diff (staged, branch, HEAD~N)");
             println!("  /review [HEAD~N]   \u{2014} Review changes with sub-agent (adds to context)");
             println!("  /commit [message]  \u{2014} Generate commit message via sub-agent and commit");
@@ -539,8 +617,18 @@ async fn handle_slash_command(
             );
             SlashResult::Continue
         }
+        "/guided" => {
+            let handler = handler_for_mode(&crate::mode::Mode::Guided);
+            orchestrator.set_mode_with_handler(crate::mode::Mode::Guided, Some(handler));
+            println!(
+                "Switched to guided mode. Tools: {}. File changes require approval.",
+                orchestrator.tool_count()
+            );
+            SlashResult::Continue
+        }
         "/execute" => {
-            orchestrator.set_mode(crate::mode::Mode::Execute);
+            let handler = handler_for_mode(&crate::mode::Mode::Execute);
+            orchestrator.set_mode_with_handler(crate::mode::Mode::Execute, Some(handler));
             println!(
                 "Switched to execute mode. Tools: {}",
                 orchestrator.tool_count()
@@ -548,7 +636,8 @@ async fn handle_slash_command(
             SlashResult::Continue
         }
         "/auto" => {
-            orchestrator.set_mode(crate::mode::Mode::Auto);
+            let handler = handler_for_mode(&crate::mode::Mode::Auto);
+            orchestrator.set_mode_with_handler(crate::mode::Mode::Auto, Some(handler));
             println!(
                 "Switched to auto mode. Tools: {} (shell unrestricted)",
                 orchestrator.tool_count()
@@ -558,13 +647,14 @@ async fn handle_slash_command(
         "/mode" => {
             if arg.is_empty() {
                 println!(
-                    "Current mode: {}. Usage: /mode <explore|plan|execute|auto>",
+                    "Current mode: {}. Usage: /mode <explore|plan|guided|execute|auto>",
                     orchestrator.mode()
                 );
             } else {
                 match arg.parse::<crate::mode::Mode>() {
                     Ok(new_mode) => {
-                        orchestrator.set_mode(new_mode);
+                        let handler = handler_for_mode(&new_mode);
+                        orchestrator.set_mode_with_handler(new_mode, Some(handler));
                         println!(
                             "Switched to {} mode. Tools: {}",
                             new_mode,
@@ -573,7 +663,7 @@ async fn handle_slash_command(
                     }
                     Err(_) => {
                         println!(
-                            "Invalid mode '{}'. Expected: explore, plan, execute, or auto",
+                            "Invalid mode '{}'. Expected: explore, plan, guided, execute, or auto",
                             arg
                         );
                     }
@@ -706,14 +796,25 @@ mod tests {
     }
 
     // ── Phase 4 /accept Tests ──
+    // Note: /accept with a plan now uses dialoguer::Select which requires stdin,
+    // so we test the orchestrator's accept_plan(mode) directly instead.
 
-    #[tokio::test]
-    async fn slash_accept_in_plan_mode_with_plan() {
+    #[test]
+    fn accept_plan_via_orchestrator_execute() {
         let mut orch = test_plan_orchestrator();
         orch.set_current_plan("My implementation plan".into());
-        let result = handle_slash_command("/accept", &mut orch).await;
-        assert!(matches!(result, SlashResult::ExecutePlan));
+        let plan = orch.accept_plan(crate::mode::Mode::Execute);
+        assert!(plan.is_some());
         assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
+    }
+
+    #[test]
+    fn accept_plan_via_orchestrator_guided() {
+        let mut orch = test_plan_orchestrator();
+        orch.set_current_plan("My plan".into());
+        let plan = orch.accept_plan(crate::mode::Mode::Guided);
+        assert!(plan.is_some());
+        assert_eq!(*orch.mode(), crate::mode::Mode::Guided);
     }
 
     #[tokio::test]
@@ -730,14 +831,6 @@ mod tests {
         let result = handle_slash_command("/accept", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(*orch.mode(), crate::mode::Mode::Explore); // unchanged
-    }
-
-    #[tokio::test]
-    async fn slash_accept_shorthand() {
-        let mut orch = test_plan_orchestrator();
-        orch.set_current_plan("plan".into());
-        let result = handle_slash_command("/a", &mut orch).await;
-        assert!(matches!(result, SlashResult::ExecutePlan));
     }
 
     // ── Phase 5: New Slash Command Tests ──
@@ -799,6 +892,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slash_guided_shorthand() {
+        let mut orch = test_orchestrator(); // Start in explore
+        let result = handle_slash_command("/guided", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(*orch.mode(), crate::mode::Mode::Guided);
+        assert_eq!(orch.tool_count(), 8); // write tools registered
+    }
+
+    #[tokio::test]
     async fn slash_execute_shorthand() {
         let mut orch = test_orchestrator(); // Start in explore
         let result = handle_slash_command("/execute", &mut orch).await;
@@ -822,6 +924,10 @@ mod tests {
         // /mode with arg
         handle_slash_command("/mode execute", &mut orch).await;
         assert_eq!(*orch.mode(), crate::mode::Mode::Execute);
+
+        // /mode guided
+        handle_slash_command("/mode guided", &mut orch).await;
+        assert_eq!(*orch.mode(), crate::mode::Mode::Guided);
 
         // /mode auto
         handle_slash_command("/mode auto", &mut orch).await;

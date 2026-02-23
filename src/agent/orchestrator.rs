@@ -433,7 +433,27 @@ impl Orchestrator {
                  \n\
                  The user will either:\n\
                  - Give feedback to refine the plan (continue the conversation)\n\
-                 - Accept the plan with /accept (transitions to Execute mode)"
+                 - Accept the plan with /accept (choose Guided, Execute, or Auto mode)"
+            }
+            Mode::Guided => {
+                "\n\nYou are in GUIDED mode. You can create and edit files, but \
+                 EVERY change requires explicit user approval.\n\
+                 \n\
+                 Available tools:\n\
+                 - write_file: Create/overwrite files (requires user approval)\n\
+                 - edit_file: Targeted search/replace changes (requires user approval)\n\
+                 - spawn_explorer: Research code before making changes\n\
+                 - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
+                 - shell: Run allowlisted commands only (ls, cat, grep, git, cargo, etc.)\n\
+                 \n\
+                 IMPORTANT workflow:\n\
+                 1. Always read the file first (read_file) before editing it\n\
+                 2. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 3. Use write_file for new files or complete rewrites\n\
+                 4. Each change shows a diff the user must approve or reject\n\
+                 5. If the user rejects a change, adjust your approach based on their feedback\n\
+                 \n\
+                 Make changes methodically: one file at a time, with clear purpose."
             }
             Mode::Execute => {
                 "\n\nYou are in EXECUTE mode. You can create and edit files.\n\
@@ -506,6 +526,20 @@ impl Orchestrator {
             self.personality,
             self.git_context.as_ref(),
         );
+    }
+
+    /// Switch mode with an optional new approval handler.
+    /// If a handler is provided, it replaces the current one before rebuilding
+    /// the registry (so the new tools use the new handler).
+    pub fn set_mode_with_handler(
+        &mut self,
+        mode: Mode,
+        handler: Option<Arc<dyn ApprovalHandler>>,
+    ) {
+        if let Some(h) = handler {
+            self.approval_handler = h;
+        }
+        self.set_mode(mode);
     }
 
     /// Prune conversation history when it exceeds context_window_turns.
@@ -587,18 +621,18 @@ impl Orchestrator {
         self.current_plan.as_deref()
     }
 
-    /// Accept the current plan and switch to Execute mode.
+    /// Accept the current plan and switch to the specified mode.
     ///
     /// Injects the accepted plan into conversation history as context,
-    /// then switches mode to Execute (which registers write tools).
+    /// then switches to the target mode (which registers write tools).
     /// Returns the plan text if one was set, or None.
-    pub fn accept_plan(&mut self) -> Option<String> {
+    pub fn accept_plan(&mut self, target_mode: Mode) -> Option<String> {
         if let Some(plan) = self.current_plan.take() {
             self.history.push(Content::user(&format!(
                 "[ACCEPTED PLAN — Execute this plan step by step]\n\n{}",
                 plan
             )));
-            self.set_mode(Mode::Execute);
+            self.set_mode(target_mode);
             Some(plan)
         } else {
             None
@@ -1072,7 +1106,7 @@ mod tests {
         );
 
         orch.set_current_plan("The plan content".into());
-        let plan = orch.accept_plan();
+        let plan = orch.accept_plan(Mode::Execute);
 
         assert!(plan.is_some());
         assert_eq!(plan.unwrap(), "The plan content");
@@ -1103,9 +1137,53 @@ mod tests {
             50,
         );
 
-        let plan = orch.accept_plan();
+        let plan = orch.accept_plan(Mode::Execute);
         assert!(plan.is_none());
         assert_eq!(*orch.mode(), Mode::Plan); // Mode unchanged
+    }
+
+    #[test]
+    fn orchestrator_accept_plan_guided() {
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Plan,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::default(),
+            50,
+        );
+
+        orch.set_current_plan("The plan content".into());
+        let plan = orch.accept_plan(Mode::Guided);
+
+        assert!(plan.is_some());
+        assert_eq!(*orch.mode(), Mode::Guided);
+        assert_eq!(orch.tool_count(), 8); // Same tools as Execute
+    }
+
+    #[test]
+    fn set_mode_with_handler_swaps_handler() {
+        let mut orch = Orchestrator::new(
+            test_client(),
+            Mode::Explore,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::default(),
+            50,
+        );
+
+        assert_eq!(*orch.mode(), Mode::Explore);
+
+        // Switch to Guided with a new handler
+        let new_handler = Arc::new(
+            crate::ui::approval::AutoApproveHandler::always_reject(),
+        ) as Arc<dyn ApprovalHandler>;
+        orch.set_mode_with_handler(Mode::Guided, Some(new_handler));
+
+        assert_eq!(*orch.mode(), Mode::Guided);
+        assert_eq!(orch.tool_count(), 8); // write tools registered
     }
 
     #[test]
