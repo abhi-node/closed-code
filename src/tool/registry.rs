@@ -114,12 +114,16 @@ impl std::fmt::Debug for ToolRegistry {
 /// Create a ToolRegistry with all Phase 2 tools registered.
 pub fn create_default_registry(working_directory: PathBuf) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory);
+    register_filesystem_tools(&mut registry, working_directory, false);
     registry
 }
 
 /// Register the common filesystem + shell tools into a registry.
-fn register_filesystem_tools(registry: &mut ToolRegistry, working_directory: PathBuf) {
+fn register_filesystem_tools(
+    registry: &mut ToolRegistry,
+    working_directory: PathBuf,
+    bypass_shell_allowlist: bool,
+) {
     registry.register(Box::new(super::filesystem::ReadFileTool::new(
         working_directory.clone(),
     )));
@@ -132,16 +136,22 @@ fn register_filesystem_tools(registry: &mut ToolRegistry, working_directory: Pat
     registry.register(Box::new(super::filesystem::GrepTool::new(
         working_directory.clone(),
     )));
-    registry.register(Box::new(super::shell::ShellCommandTool::new(
-        working_directory,
-    )));
+    if bypass_shell_allowlist {
+        registry.register(Box::new(
+            super::shell::ShellCommandTool::with_bypass_allowlist(working_directory),
+        ));
+    } else {
+        registry.register(Box::new(super::shell::ShellCommandTool::new(
+            working_directory,
+        )));
+    }
 }
 
 /// Create a ToolRegistry for Explorer sub-agents.
 /// Includes filesystem tools + create_report. No spawn tools (terminal).
 pub fn create_subagent_registry(working_directory: PathBuf) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory);
+    register_filesystem_tools(&mut registry, working_directory, false);
     registry.register(Box::new(super::report::CreateReportTool::new()));
     registry
 }
@@ -154,7 +164,7 @@ pub fn create_planner_registry(
     client: Arc<GeminiClient>,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory.clone());
+    register_filesystem_tools(&mut registry, working_directory.clone(), false);
     registry.register(Box::new(super::report::CreateReportTool::new()));
     registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
         client,
@@ -174,8 +184,9 @@ pub fn create_orchestrator_registry(
     client: Arc<GeminiClient>,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
 ) -> ToolRegistry {
+    let bypass_shell = matches!(mode, Mode::Auto);
     let mut registry = ToolRegistry::new();
-    register_filesystem_tools(&mut registry, working_directory.clone());
+    register_filesystem_tools(&mut registry, working_directory.clone(), bypass_shell);
 
     // Spawn tools (mode-dependent)
     match mode {
@@ -199,12 +210,12 @@ pub fn create_orchestrator_registry(
                 working_directory,
             )));
         }
-        Mode::Execute => {
+        Mode::Execute | Mode::Auto => {
             registry.register(Box::new(super::spawn::SpawnExplorerTool::new(
                 client,
                 working_directory.clone(),
             )));
-            // Write tools — Execute mode only
+            // Write tools — Execute and Auto modes
             if let Some(handler) = approval_handler {
                 registry.register(Box::new(super::file_write::WriteFileTool::new(
                     working_directory.clone(),
@@ -238,7 +249,7 @@ mod tests {
         fn new(name: &str) -> Self {
             Self {
                 tool_name: name.to_string(),
-                modes: vec![Mode::Explore, Mode::Plan, Mode::Execute],
+                modes: vec![Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto],
             }
         }
 
@@ -514,5 +525,27 @@ mod tests {
         assert!(registry.get("create_report").is_some());
         assert!(registry.get("spawn_explorer").is_some());
         assert!(registry.get("spawn_planner").is_none());
+    }
+
+    #[test]
+    fn create_orchestrator_registry_auto_mode() {
+        let client = Arc::new(crate::gemini::GeminiClient::new(
+            "key".into(),
+            "model".into(),
+        ));
+        let handler = Arc::new(crate::ui::approval::AutoApproveHandler::always_approve())
+            as Arc<dyn crate::ui::approval::ApprovalHandler>;
+        let registry = create_orchestrator_registry(
+            PathBuf::from("/tmp"),
+            &Mode::Auto,
+            client,
+            Some(handler),
+        );
+        // Same as Execute: 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
+        assert_eq!(registry.len(), 8);
+        assert!(registry.get("write_file").is_some());
+        assert!(registry.get("edit_file").is_some());
+        assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("shell").is_some());
     }
 }

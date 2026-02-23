@@ -848,7 +848,7 @@ mod tests {
             assert_eq!(tool.declaration().name, tool.name());
             assert_eq!(
                 tool.available_modes(),
-                vec![Mode::Explore, Mode::Plan, Mode::Execute]
+                vec![Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto]
             );
         }
     }

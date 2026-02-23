@@ -171,7 +171,7 @@ impl Tool for WriteFileTool {
     }
 
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Execute]
+        vec![Mode::Execute, Mode::Auto]
     }
 }
 
@@ -303,7 +303,7 @@ mod tests {
     fn write_available_modes() {
         let (dir, handler) = setup();
         let tool = WriteFileTool::new(dir.path().to_path_buf(), handler);
-        assert_eq!(tool.available_modes(), vec![Mode::Execute]);
+        assert_eq!(tool.available_modes(), vec![Mode::Execute, Mode::Auto]);
     }
 
     #[test]

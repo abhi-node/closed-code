@@ -78,7 +78,7 @@ impl Tool for CreateReportTool {
     }
 
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Explore, Mode::Plan, Mode::Execute]
+        vec![Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto]
     }
 }
 

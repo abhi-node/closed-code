@@ -434,14 +434,34 @@ impl Orchestrator {
                  - write_file: Create new files or overwrite existing ones\n\
                  - edit_file: Make targeted changes using search/replace\n\
                  - spawn_explorer: Research code before making changes\n\
-                 - All filesystem read tools (read_file, list_directory, search_files, grep, shell)\n\
+                 - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
+                 - shell: Run allowlisted commands only (ls, cat, grep, git, cargo, etc.)\n\
                  \n\
                  IMPORTANT workflow:\n\
                  1. Always read the file first (read_file) before editing it\n\
                  2. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
                  3. Use write_file for new files or complete rewrites\n\
-                 4. Every file change shows a diff and requires user approval\n\
-                 5. If a change is rejected, ask the user what they want instead\n\
+                 4. File writes are auto-approved\n\
+                 5. If something goes wrong, use /explore to investigate\n\
+                 \n\
+                 Make changes methodically: one file at a time, with clear purpose."
+            }
+            Mode::Auto => {
+                "\n\nYou are in AUTO mode. You have FULL autonomy.\n\
+                 \n\
+                 Available tools:\n\
+                 - write_file: Create new files or overwrite existing ones\n\
+                 - edit_file: Make targeted changes using search/replace\n\
+                 - shell: Execute ANY shell command (no allowlist restrictions)\n\
+                 - spawn_explorer: Research code before making changes\n\
+                 - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
+                 \n\
+                 IMPORTANT: File writes are auto-approved and shell commands are unrestricted.\n\
+                 1. Always read the file first (read_file) before editing it\n\
+                 2. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 3. Use write_file for new files or complete rewrites\n\
+                 4. Double-check destructive shell commands before executing\n\
+                 5. Never run commands that could damage the system or delete important data\n\
                  \n\
                  Make changes methodically: one file at a time, with clear purpose."
             }
@@ -890,6 +910,13 @@ mod tests {
         assert_eq!(orch.tool_count(), 8);
         assert!(orch.system_prompt().contains("write_file"));
 
+        // Switch to Auto mode
+        orch.set_mode(Mode::Auto);
+        assert_eq!(*orch.mode(), Mode::Auto);
+        assert_eq!(orch.tool_count(), 8);
+        assert!(orch.system_prompt().contains("AUTO"));
+        assert!(orch.system_prompt().contains("ANY shell command"));
+
         // Switch back to Explore
         orch.set_mode(Mode::Explore);
         assert_eq!(*orch.mode(), Mode::Explore);
@@ -1083,5 +1110,44 @@ mod tests {
             100,
         );
         assert_eq!(orch2.context_window_turns(), 100);
+    }
+
+    // ── Auto Mode Tests ──
+
+    #[test]
+    fn orchestrator_new_auto_mode() {
+        let orch = Orchestrator::new(
+            test_client(),
+            Mode::Auto,
+            PathBuf::from("/tmp"),
+            8192,
+            test_handler(),
+            Personality::default(),
+            50,
+        );
+        // Same as Execute: 5 filesystem/shell + spawn_explorer + write_file + edit_file = 8
+        assert_eq!(orch.tool_count(), 8);
+        assert_eq!(*orch.mode(), Mode::Auto);
+        assert!(orch.system_prompt().contains("AUTO"));
+        assert!(orch.system_prompt().contains("ANY shell command"));
+        assert!(orch.system_prompt().contains("write_file"));
+        assert!(orch.system_prompt().contains("unrestricted"));
+    }
+
+    #[test]
+    fn orchestrator_set_mode_auto() {
+        let mut orch = test_orchestrator();
+        assert_eq!(*orch.mode(), Mode::Explore);
+
+        orch.set_mode(Mode::Auto);
+        assert_eq!(*orch.mode(), Mode::Auto);
+        assert_eq!(orch.tool_count(), 8);
+        assert!(orch.system_prompt().contains("AUTO"));
+
+        // Switch back
+        orch.set_mode(Mode::Explore);
+        assert_eq!(*orch.mode(), Mode::Explore);
+        assert_eq!(orch.tool_count(), 6);
+        assert!(!orch.system_prompt().contains("AUTO"));
     }
 }

@@ -8,49 +8,6 @@ use crate::cli::Cli;
 use crate::error::ClosedCodeError;
 use crate::mode::Mode;
 
-// ── Approval Policy ──
-
-/// Approval policy for file writes and shell commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalPolicy {
-    /// Prompt for file writes AND shell commands (default).
-    Suggest,
-    /// Auto-approve file operations, prompt for shell commands.
-    AutoEdit,
-    /// Fully autonomous, no prompts.
-    FullAuto,
-}
-
-impl Default for ApprovalPolicy {
-    fn default() -> Self {
-        Self::Suggest
-    }
-}
-
-impl fmt::Display for ApprovalPolicy {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Suggest => write!(f, "suggest"),
-            Self::AutoEdit => write!(f, "auto_edit"),
-            Self::FullAuto => write!(f, "full_auto"),
-        }
-    }
-}
-
-impl FromStr for ApprovalPolicy {
-    type Err = ClosedCodeError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "suggest" => Ok(Self::Suggest),
-            "auto_edit" | "autoedit" => Ok(Self::AutoEdit),
-            "full_auto" | "fullauto" => Ok(Self::FullAuto),
-            _ => Err(ClosedCodeError::InvalidApprovalPolicy(s.to_string())),
-        }
-    }
-}
-
 // ── Personality ──
 
 /// Personality style that modifies the system prompt prefix.
@@ -101,7 +58,6 @@ pub struct TomlConfig {
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub default_mode: Option<String>,
-    pub approval_policy: Option<String>,
     pub personality: Option<String>,
     pub context_window_turns: Option<usize>,
     pub max_output_tokens: Option<u32>,
@@ -123,7 +79,6 @@ pub struct Config {
     pub model: String,
     pub mode: Mode,
     pub working_directory: PathBuf,
-    pub approval_policy: ApprovalPolicy,
     pub personality: Personality,
     pub shell_additional_allowlist: Vec<String>,
     pub context_window_turns: usize,
@@ -183,14 +138,6 @@ impl Config {
         };
         let mode = mode_str.parse::<Mode>()?;
 
-        let approval_policy = if let Some(ref ap) = cli.approval_policy {
-            ap.parse::<ApprovalPolicy>()?
-        } else if let Some(ref ap) = merged.approval_policy {
-            ap.parse::<ApprovalPolicy>()?
-        } else {
-            ApprovalPolicy::default()
-        };
-
         let personality = if let Some(ref p) = cli.personality {
             p.parse::<Personality>()?
         } else if let Some(ref p) = merged.personality {
@@ -221,7 +168,6 @@ impl Config {
             model,
             mode,
             working_directory,
-            approval_policy,
             personality,
             shell_additional_allowlist,
             context_window_turns,
@@ -253,7 +199,6 @@ impl Config {
             api_key: overlay.api_key.or(base.api_key),
             model: overlay.model.or(base.model),
             default_mode: overlay.default_mode.or(base.default_mode),
-            approval_policy: overlay.approval_policy.or(base.approval_policy),
             personality: overlay.personality.or(base.personality),
             context_window_turns: overlay.context_window_turns.or(base.context_window_turns),
             max_output_tokens: overlay.max_output_tokens.or(base.max_output_tokens),
@@ -290,7 +235,6 @@ mod tests {
         let config = Config::from_cli(&cli).unwrap();
         assert_eq!(config.api_key, "test-key");
         assert_eq!(config.mode, Mode::Explore);
-        assert_eq!(config.approval_policy, ApprovalPolicy::Suggest);
         assert_eq!(config.personality, Personality::Pragmatic);
         assert_eq!(config.context_window_turns, 50);
         assert_eq!(config.max_output_tokens, 8192);
@@ -344,8 +288,6 @@ mod tests {
             "closed-code",
             "--api-key",
             "k",
-            "--approval-policy",
-            "full_auto",
             "--personality",
             "friendly",
             "--context-window-turns",
@@ -354,7 +296,6 @@ mod tests {
             "4096",
         ]);
         let config = Config::from_cli(&cli).unwrap();
-        assert_eq!(config.approval_policy, ApprovalPolicy::FullAuto);
         assert_eq!(config.personality, Personality::Friendly);
         assert_eq!(config.context_window_turns, 100);
         assert_eq!(config.max_output_tokens, 4096);
@@ -368,7 +309,6 @@ mod tests {
 api_key = "toml-key"
 model = "gemini-2.0-flash"
 default_mode = "plan"
-approval_policy = "auto_edit"
 personality = "friendly"
 context_window_turns = 100
 max_output_tokens = 4096
@@ -381,7 +321,6 @@ additional_allowlist = ["docker", "cargo"]
         assert_eq!(config.api_key.as_deref(), Some("toml-key"));
         assert_eq!(config.model.as_deref(), Some("gemini-2.0-flash"));
         assert_eq!(config.default_mode.as_deref(), Some("plan"));
-        assert_eq!(config.approval_policy.as_deref(), Some("auto_edit"));
         assert_eq!(config.personality.as_deref(), Some("friendly"));
         assert_eq!(config.context_window_turns, Some(100));
         assert_eq!(config.max_output_tokens, Some(4096));
@@ -422,48 +361,13 @@ additional_allowlist = ["docker", "cargo"]
     fn config_merge_none_preserves_base() {
         let base = TomlConfig {
             model: Some("base-model".into()),
-            approval_policy: Some("suggest".into()),
+            personality: Some("friendly".into()),
             ..Default::default()
         };
         let overlay = TomlConfig::default();
         let merged = Config::merge(base, overlay);
         assert_eq!(merged.model.as_deref(), Some("base-model"));
-        assert_eq!(merged.approval_policy.as_deref(), Some("suggest"));
-    }
-
-    // ── ApprovalPolicy ──
-
-    #[test]
-    fn approval_policy_from_str() {
-        assert_eq!("suggest".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::Suggest);
-        assert_eq!("auto_edit".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::AutoEdit);
-        assert_eq!("autoedit".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::AutoEdit);
-        assert_eq!("full_auto".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::FullAuto);
-        assert_eq!("fullauto".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::FullAuto);
-        assert_eq!("SUGGEST".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::Suggest);
-        assert_eq!("Full_Auto".parse::<ApprovalPolicy>().unwrap(), ApprovalPolicy::FullAuto);
-    }
-
-    #[test]
-    fn approval_policy_from_str_invalid() {
-        let result = "bad".parse::<ApprovalPolicy>();
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ClosedCodeError::InvalidApprovalPolicy(_)
-        ));
-    }
-
-    #[test]
-    fn approval_policy_default() {
-        assert_eq!(ApprovalPolicy::default(), ApprovalPolicy::Suggest);
-    }
-
-    #[test]
-    fn approval_policy_display() {
-        assert_eq!(ApprovalPolicy::Suggest.to_string(), "suggest");
-        assert_eq!(ApprovalPolicy::AutoEdit.to_string(), "auto_edit");
-        assert_eq!(ApprovalPolicy::FullAuto.to_string(), "full_auto");
+        assert_eq!(merged.personality.as_deref(), Some("friendly"));
     }
 
     // ── Personality ──

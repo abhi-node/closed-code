@@ -101,7 +101,7 @@ impl Tool for SpawnExplorerTool {
     }
 
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Explore, Mode::Plan, Mode::Execute]
+        vec![Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto]
     }
 }
 
@@ -288,6 +288,7 @@ mod tests {
         assert!(tool.available_modes().contains(&Mode::Explore));
         assert!(tool.available_modes().contains(&Mode::Plan));
         assert!(tool.available_modes().contains(&Mode::Execute));
+        assert!(tool.available_modes().contains(&Mode::Auto));
     }
 
     #[test]

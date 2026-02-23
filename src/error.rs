@@ -19,7 +19,7 @@ pub enum ClosedCodeError {
     #[error("Missing API key. Set GEMINI_API_KEY or pass --api-key")]
     MissingApiKey,
 
-    #[error("Invalid mode '{0}'. Expected: explore, plan, or execute")]
+    #[error("Invalid mode '{0}'. Expected: explore, plan, execute, or auto")]
     InvalidMode(String),
 
     // Network / IO
@@ -97,9 +97,6 @@ pub enum ClosedCodeError {
     // Configuration errors (Phase 5)
     #[error("Configuration error: {0}")]
     ConfigError(String),
-
-    #[error("Invalid approval policy '{0}'. Expected: suggest, auto_edit, full_auto")]
-    InvalidApprovalPolicy(String),
 
     #[error("Invalid personality '{0}'. Expected: friendly, pragmatic, none")]
     InvalidPersonality(String),
@@ -214,7 +211,7 @@ mod tests {
         let err = ClosedCodeError::InvalidMode("bad".into());
         assert_eq!(
             err.to_string(),
-            "Invalid mode 'bad'. Expected: explore, plan, or execute"
+            "Invalid mode 'bad'. Expected: explore, plan, execute, or auto"
         );
     }
 
@@ -265,7 +262,6 @@ mod tests {
     fn phase5_errors_are_not_retryable() {
         let errors: Vec<ClosedCodeError> = vec![
             ClosedCodeError::ConfigError("bad toml".into()),
-            ClosedCodeError::InvalidApprovalPolicy("bad".into()),
             ClosedCodeError::InvalidPersonality("bad".into()),
         ];
         for err in &errors {
@@ -278,10 +274,6 @@ mod tests {
         assert_eq!(
             ClosedCodeError::ConfigError("bad toml".into()).to_string(),
             "Configuration error: bad toml"
-        );
-        assert_eq!(
-            ClosedCodeError::InvalidApprovalPolicy("bad".into()).to_string(),
-            "Invalid approval policy 'bad'. Expected: suggest, auto_edit, full_auto"
         );
         assert_eq!(
             ClosedCodeError::InvalidPersonality("bad".into()).to_string(),

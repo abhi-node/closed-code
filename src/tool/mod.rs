@@ -31,9 +31,9 @@ pub trait Tool: Send + Sync + Debug {
     async fn execute(&self, args: Value) -> Result<Value>;
 
     /// Which modes this tool is available in.
-    /// Default: all modes (Explore, Plan, Execute).
+    /// Default: all modes (Explore, Plan, Execute, Auto).
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Explore, Mode::Plan, Mode::Execute]
+        vec![Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto]
     }
 }
 

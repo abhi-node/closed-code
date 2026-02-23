@@ -8,6 +8,7 @@ pub enum Mode {
     Explore,
     Plan,
     Execute,
+    Auto,
 }
 
 impl fmt::Display for Mode {
@@ -16,6 +17,7 @@ impl fmt::Display for Mode {
             Mode::Explore => write!(f, "explore"),
             Mode::Plan => write!(f, "plan"),
             Mode::Execute => write!(f, "execute"),
+            Mode::Auto => write!(f, "auto"),
         }
     }
 }
@@ -28,6 +30,7 @@ impl FromStr for Mode {
             "explore" => Ok(Mode::Explore),
             "plan" => Ok(Mode::Plan),
             "execute" => Ok(Mode::Execute),
+            "auto" => Ok(Mode::Auto),
             other => Err(ClosedCodeError::InvalidMode(other.to_string())),
         }
     }
@@ -42,6 +45,7 @@ mod tests {
         assert_eq!("explore".parse::<Mode>().unwrap(), Mode::Explore);
         assert_eq!("plan".parse::<Mode>().unwrap(), Mode::Plan);
         assert_eq!("execute".parse::<Mode>().unwrap(), Mode::Execute);
+        assert_eq!("auto".parse::<Mode>().unwrap(), Mode::Auto);
     }
 
     #[test]
@@ -49,6 +53,7 @@ mod tests {
         assert_eq!("EXPLORE".parse::<Mode>().unwrap(), Mode::Explore);
         assert_eq!("Plan".parse::<Mode>().unwrap(), Mode::Plan);
         assert_eq!("EXECUTE".parse::<Mode>().unwrap(), Mode::Execute);
+        assert_eq!("AUTO".parse::<Mode>().unwrap(), Mode::Auto);
     }
 
     #[test]
@@ -63,7 +68,7 @@ mod tests {
 
     #[test]
     fn display_roundtrip() {
-        for mode in [Mode::Explore, Mode::Plan, Mode::Execute] {
+        for mode in [Mode::Explore, Mode::Plan, Mode::Execute, Mode::Auto] {
             let s = mode.to_string();
             let parsed: Mode = s.parse().unwrap();
             assert_eq!(mode, parsed);
