@@ -1,15 +1,12 @@
 use std::time::Duration;
 
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent};
+use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, MouseEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
 pub const TICK_RATE: Duration = Duration::from_millis(100);
 
 /// Application-level events consumed by the main event loop.
-///
-/// Phase 9a uses Key, Resize, and Tick.
-/// Later phases add TextDelta, ToolStart, ApprovalRequest, etc.
 #[derive(Debug)]
 pub enum AppEvent {
     /// A key press from the terminal.
@@ -18,14 +15,60 @@ pub enum AppEvent {
     Resize(u16, u16),
     /// Periodic tick for animations (spinner frame advance).
     Tick,
+
+    // ── Phase 9c: LLM Streaming ──
+    /// A chunk of text from the streaming LLM response.
+    TextDelta(String),
+    /// Streaming is complete (final text available).
+    StreamDone,
+
+    // ── Phase 9c: Tool Events ──
+    ToolStart {
+        name: String,
+        args_display: String,
+    },
+    ToolComplete {
+        name: String,
+        duration: Duration,
+    },
+    ToolError {
+        name: String,
+        error: String,
+    },
+
+    // ── Phase 9c: Sub-Agent Events ──
+    AgentStart {
+        agent_type: String,
+        task: String,
+    },
+    AgentComplete {
+        agent_type: String,
+        duration: Duration,
+    },
+    AgentToolUpdate {
+        agent_type: String,
+        tool_name: String,
+        args_display: String,
+    },
+
+    // ── Mouse Events ──
+    MouseScrollUp,
+    MouseScrollDown,
+
+    // ── Phase 9c: System Events ──
+    SystemMessage(String),
+    ModeChanged(crate::mode::Mode),
+    OrchestratorDone,
+    Error(String),
 }
 
 /// Spawn a background task that polls crossterm events and a tick timer,
-/// sending `AppEvent` values into the returned receiver.
+/// sending `AppEvent` values into the provided sender.
 ///
-/// The task exits when the receiver is dropped.
-pub fn spawn_event_loop() -> mpsc::UnboundedReceiver<AppEvent> {
-    let (tx, rx) = mpsc::unbounded_channel();
+/// Returns the receiver. The caller can also clone `tx` to inject
+/// programmatic events (tool notifications, streaming deltas, etc.).
+pub fn spawn_event_loop(tx: mpsc::UnboundedSender<AppEvent>) -> mpsc::UnboundedSender<AppEvent> {
+    let tx_clone = tx.clone();
 
     tokio::spawn(async move {
         let mut reader = EventStream::new();
@@ -37,7 +80,12 @@ pub fn spawn_event_loop() -> mpsc::UnboundedReceiver<AppEvent> {
                     match maybe_event {
                         Some(Ok(CrosstermEvent::Key(key))) => Some(AppEvent::Key(key)),
                         Some(Ok(CrosstermEvent::Resize(w, h))) => Some(AppEvent::Resize(w, h)),
-                        Some(Ok(_)) => None,  // Mouse events ignored in 9a
+                        Some(Ok(CrosstermEvent::Mouse(mouse))) => match mouse.kind {
+                            MouseEventKind::ScrollUp => Some(AppEvent::MouseScrollUp),
+                            MouseEventKind::ScrollDown => Some(AppEvent::MouseScrollDown),
+                            _ => None,
+                        },
+                        Some(Ok(_)) => None,
                         Some(Err(_)) => None,  // Read error, skip
                         None => break,         // Stream ended
                     }
@@ -48,12 +96,12 @@ pub fn spawn_event_loop() -> mpsc::UnboundedReceiver<AppEvent> {
             };
 
             if let Some(ev) = event {
-                if tx.send(ev).is_err() {
+                if tx_clone.send(ev).is_err() {
                     break; // Receiver dropped
                 }
             }
         }
     });
 
-    rx
+    tx
 }

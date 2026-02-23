@@ -35,9 +35,5 @@ pub trait Agent: Send + Sync + Debug {
     /// Run the agent with the given request.
     /// The agent creates its own conversation, runs its tool loop,
     /// and returns a structured response.
-    async fn run(
-        &self,
-        client: &GeminiClient,
-        request: AgentRequest,
-    ) -> Result<AgentResponse>;
+    async fn run(&self, client: &GeminiClient, request: AgentRequest) -> Result<AgentResponse>;
 }

@@ -53,23 +53,19 @@ impl<'a> InputPane<'a> {
     }
 
     pub fn move_cursor_left(&mut self) {
-        self.textarea
-            .move_cursor(tui_textarea::CursorMove::Back);
+        self.textarea.move_cursor(tui_textarea::CursorMove::Back);
     }
 
     pub fn move_cursor_right(&mut self) {
-        self.textarea
-            .move_cursor(tui_textarea::CursorMove::Forward);
+        self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
     }
 
     pub fn move_cursor_home(&mut self) {
-        self.textarea
-            .move_cursor(tui_textarea::CursorMove::Head);
+        self.textarea.move_cursor(tui_textarea::CursorMove::Head);
     }
 
     pub fn move_cursor_end(&mut self) {
-        self.textarea
-            .move_cursor(tui_textarea::CursorMove::End);
+        self.textarea.move_cursor(tui_textarea::CursorMove::End);
     }
 
     pub fn text(&self) -> String {
@@ -176,10 +172,8 @@ impl<'a> InputPane<'a> {
         self.textarea = TextArea::new(lines);
         apply_textarea_config(&mut self.textarea);
         // Move cursor to end of content
-        self.textarea
-            .move_cursor(tui_textarea::CursorMove::Bottom);
-        self.textarea
-            .move_cursor(tui_textarea::CursorMove::End);
+        self.textarea.move_cursor(tui_textarea::CursorMove::Bottom);
+        self.textarea.move_cursor(tui_textarea::CursorMove::End);
     }
 
     // ── External Editor (Ctrl+G) ──
@@ -190,19 +184,15 @@ impl<'a> InputPane<'a> {
             .or_else(|_| std::env::var("VISUAL"))
             .unwrap_or_else(|_| "vi".to_string());
 
-        let temp_path = std::env::temp_dir().join(format!(
-            "closed-code-input-{}.txt",
-            std::process::id()
-        ));
+        let temp_path =
+            std::env::temp_dir().join(format!("closed-code-input-{}.txt", std::process::id()));
         std::fs::write(&temp_path, self.text())?;
 
         // Leave alternate screen for the editor
         crossterm::terminal::disable_raw_mode()?;
         crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
 
-        let status = std::process::Command::new(&editor)
-            .arg(&temp_path)
-            .status();
+        let status = std::process::Command::new(&editor).arg(&temp_path).status();
 
         // Re-enter alternate screen (always, even on editor failure)
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;

@@ -4,28 +4,73 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::agent::commit_agent::CommitAgent;
 use crate::agent::review_agent::ReviewAgent;
 use crate::agent::AgentRequest;
-use chrono::Utc;
 use crate::config::Personality;
 use crate::error::{ClosedCodeError, Result};
-use crate::session::{SessionEvent, SessionId};
-use crate::session::store::SessionStore;
 use crate::gemini::stream::{consume_stream, StreamEvent, StreamResult};
 use crate::gemini::types::{Content, GenerateContentRequest, GenerationConfig, Part};
 use crate::gemini::GeminiClient;
 use crate::git::GitContext;
 use crate::mode::Mode;
 use crate::sandbox::{Sandbox, SandboxMode};
+use crate::session::store::SessionStore;
+use crate::session::{SessionEvent, SessionId};
 use crate::tool::registry::{create_orchestrator_registry, ToolRegistry};
 use crate::ui::approval::ApprovalHandler;
 use crate::ui::spinner::Spinner;
 use crate::ui::usage::SessionUsage;
+use chrono::Utc;
+
+/// Events emitted by the orchestrator during tool execution and streaming.
+/// Defined here (not in the TUI module) to avoid circular dependencies.
+#[derive(Debug, Clone)]
+pub enum OrchestratorEvent {
+    ToolStart {
+        name: String,
+        args_display: String,
+    },
+    ToolComplete {
+        name: String,
+        duration: Duration,
+    },
+    ToolError {
+        name: String,
+        error: String,
+    },
+    AgentStart {
+        agent_type: String,
+        task: String,
+    },
+    AgentComplete {
+        agent_type: String,
+        duration: Duration,
+    },
+    AgentToolUpdate {
+        agent_type: String,
+        tool_name: String,
+        args_display: String,
+    },
+}
 
 const MAX_ORCHESTRATOR_ITERATIONS: usize = 30;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
+
+/// Configuration for constructing an [`Orchestrator`].
+pub struct OrchestratorConfig {
+    pub client: Arc<GeminiClient>,
+    pub mode: Mode,
+    pub working_directory: PathBuf,
+    pub max_output_tokens: u32,
+    pub approval_handler: Arc<dyn ApprovalHandler>,
+    pub personality: Personality,
+    pub context_window_turns: usize,
+    pub sandbox: Arc<dyn Sandbox>,
+    pub protected_paths: Vec<String>,
+}
 
 /// The main orchestrator that owns the Gemini client, tool registry,
 /// conversation history, and mode-specific system prompt.
@@ -55,52 +100,53 @@ pub struct Orchestrator {
     // Phase 8a
     session_id: Option<SessionId>,
     session_store: Option<SessionStore>,
+    // Phase 9c: TUI integration
+    suppress_display: bool,
+    event_tx: Option<mpsc::UnboundedSender<OrchestratorEvent>>,
 }
 
 impl Orchestrator {
-    pub fn new(
-        client: Arc<GeminiClient>,
-        mode: Mode,
-        working_directory: PathBuf,
-        max_output_tokens: u32,
-        approval_handler: Arc<dyn ApprovalHandler>,
-        personality: Personality,
-        context_window_turns: usize,
-        sandbox: Arc<dyn Sandbox>,
-        protected_paths: Vec<String>,
-    ) -> Self {
+    pub fn new(config: OrchestratorConfig) -> Self {
         let registry = create_orchestrator_registry(
-            working_directory.clone(),
-            &mode,
-            client.clone(),
-            Some(approval_handler.clone()),
-            sandbox.clone(),
-            protected_paths.clone(),
+            config.working_directory.clone(),
+            &config.mode,
+            config.client.clone(),
+            Some(config.approval_handler.clone()),
+            config.sandbox.clone(),
+            config.protected_paths.clone(),
+            None, // event_tx set later via set_event_sender()
         );
-        let system_prompt =
-            Self::build_system_prompt(&mode, &working_directory, personality, None, &*sandbox);
-        let model_name = client.model().to_string();
+        let system_prompt = Self::build_system_prompt(
+            &config.mode,
+            &config.working_directory,
+            config.personality,
+            None,
+            &*config.sandbox,
+        );
+        let model_name = config.client.model().to_string();
 
         Self {
-            client,
-            mode,
-            working_directory,
+            client: config.client,
+            mode: config.mode,
+            working_directory: config.working_directory,
             history: Vec::new(),
             registry,
             system_prompt,
-            max_output_tokens,
-            approval_handler,
+            max_output_tokens: config.max_output_tokens,
+            approval_handler: config.approval_handler,
             current_plan: None,
             cancelled: Arc::new(AtomicBool::new(false)),
-            personality,
-            context_window_turns,
+            personality: config.personality,
+            context_window_turns: config.context_window_turns,
             session_usage: SessionUsage::new(),
             model_name,
             git_context: None,
-            sandbox,
-            protected_paths,
+            sandbox: config.sandbox,
+            protected_paths: config.protected_paths,
             session_id: None,
             session_store: None,
+            suppress_display: false,
+            event_tx: None,
         }
     }
 
@@ -125,13 +171,19 @@ impl Orchestrator {
         // Stream with rate limit retry
         let mut rate_limit_retries = 0;
         let stream_result = loop {
-            let spinner = Spinner::new("Thinking...");
+            let spinner = if !self.suppress_display {
+                Some(Spinner::new("Thinking..."))
+            } else {
+                None
+            };
             let es = self.client.stream_generate_content(&request);
             let mut spinner_cleared = false;
 
             match consume_stream(es, |event| {
                 if !spinner_cleared {
-                    spinner.finish();
+                    if let Some(s) = &spinner {
+                        s.finish();
+                    }
                     spinner_cleared = true;
                 }
                 on_event(event);
@@ -140,24 +192,33 @@ impl Orchestrator {
             {
                 Ok(result) => {
                     if !spinner_cleared {
-                        spinner.finish();
+                        if let Some(s) = &spinner {
+                            s.finish();
+                        }
                     }
                     break result;
                 }
                 Err(ClosedCodeError::RateLimited { retry_after_ms })
                     if rate_limit_retries < MAX_RATE_LIMIT_RETRIES =>
                 {
-                    spinner.finish();
-                    let delay = crate::gemini::client::with_jitter(
-                        Duration::from_millis(retry_after_ms),
-                    );
-                    display_rate_limit_countdown(delay).await;
+                    if let Some(s) = &spinner {
+                        s.finish();
+                    }
+                    let delay =
+                        crate::gemini::client::with_jitter(Duration::from_millis(retry_after_ms));
+                    if !self.suppress_display {
+                        display_rate_limit_countdown(delay).await;
+                    } else {
+                        tokio::time::sleep(delay).await;
+                    }
                     rate_limit_retries += 1;
                     continue;
                 }
                 Err(e) => {
                     if !spinner_cleared {
-                        spinner.finish();
+                        if let Some(s) = &spinner {
+                            s.finish();
+                        }
                     }
                     return Err(e);
                 }
@@ -166,8 +227,7 @@ impl Orchestrator {
 
         // Accumulate usage
         match &stream_result {
-            StreamResult::Text { usage, .. }
-            | StreamResult::FunctionCall { usage, .. } => {
+            StreamResult::Text { usage, .. } | StreamResult::FunctionCall { usage, .. } => {
                 if let Some(u) = usage {
                     self.session_usage.accumulate(u);
                 }
@@ -223,10 +283,7 @@ impl Orchestrator {
     ///
     /// Sends requests to Gemini, executes function calls, and repeats
     /// until a text-only response or max iterations.
-    async fn run_tool_loop(
-        &mut self,
-        on_event: &mut impl FnMut(StreamEvent),
-    ) -> Result<String> {
+    async fn run_tool_loop(&mut self, on_event: &mut impl FnMut(StreamEvent)) -> Result<String> {
         let mut final_text = String::new();
 
         for iteration in 0..MAX_ORCHESTRATOR_ITERATIONS {
@@ -247,13 +304,19 @@ impl Orchestrator {
             // Stream with rate limit retry
             let mut rate_limit_retries = 0;
             let stream_result = loop {
-                let spinner = Spinner::new("Thinking...");
+                let spinner = if !self.suppress_display {
+                    Some(Spinner::new("Thinking..."))
+                } else {
+                    None
+                };
                 let es = self.client.stream_generate_content(&request);
                 let mut spinner_cleared = false;
 
                 match consume_stream(es, |event| {
                     if !spinner_cleared {
-                        spinner.finish();
+                        if let Some(s) = &spinner {
+                            s.finish();
+                        }
                         spinner_cleared = true;
                     }
                     on_event(event);
@@ -262,24 +325,34 @@ impl Orchestrator {
                 {
                     Ok(result) => {
                         if !spinner_cleared {
-                            spinner.finish();
+                            if let Some(s) = &spinner {
+                                s.finish();
+                            }
                         }
                         break result;
                     }
                     Err(ClosedCodeError::RateLimited { retry_after_ms })
                         if rate_limit_retries < MAX_RATE_LIMIT_RETRIES =>
                     {
-                        spinner.finish();
-                        let delay = crate::gemini::client::with_jitter(
-                            Duration::from_millis(retry_after_ms),
-                        );
-                        display_rate_limit_countdown(delay).await;
+                        if let Some(s) = &spinner {
+                            s.finish();
+                        }
+                        let delay = crate::gemini::client::with_jitter(Duration::from_millis(
+                            retry_after_ms,
+                        ));
+                        if !self.suppress_display {
+                            display_rate_limit_countdown(delay).await;
+                        } else {
+                            tokio::time::sleep(delay).await;
+                        }
                         rate_limit_retries += 1;
                         continue;
                     }
                     Err(e) => {
                         if !spinner_cleared {
-                            spinner.finish();
+                            if let Some(s) = &spinner {
+                                s.finish();
+                            }
                         }
                         return Err(e);
                     }
@@ -288,8 +361,7 @@ impl Orchestrator {
 
             // Accumulate usage
             match &stream_result {
-                StreamResult::Text { usage, .. }
-                | StreamResult::FunctionCall { usage, .. } => {
+                StreamResult::Text { usage, .. } | StreamResult::FunctionCall { usage, .. } => {
                     if let Some(u) = usage {
                         self.session_usage.accumulate(u);
                     }
@@ -308,7 +380,7 @@ impl Orchestrator {
                     ..
                 } => {
                     final_text.push_str(&text_so_far);
-                    if !text_so_far.is_empty() {
+                    if !text_so_far.is_empty() && !self.suppress_display {
                         println!();
                     }
 
@@ -360,15 +432,20 @@ impl Orchestrator {
     /// ```
     ///
     /// For regular tools, shows the standard spinner + checkmark pattern.
-    async fn execute_and_display_tool(&self, name: &str, args: &serde_json::Value) -> serde_json::Value {
+    async fn execute_and_display_tool(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> serde_json::Value {
         self.emit_event(SessionEvent::ToolCall {
             name: name.to_string(),
             args: args.clone(),
             timestamp: Utc::now(),
         });
 
-        let result = if name.starts_with("spawn_") {
-            let agent_type = &name["spawn_".len()..];
+        let start = std::time::Instant::now();
+
+        let result = if let Some(agent_type) = name.strip_prefix("spawn_") {
             let task = args["task"]
                 .as_str()
                 .or_else(|| args["query"].as_str())
@@ -379,32 +456,73 @@ impl Orchestrator {
                 task.to_string()
             };
 
-            println!("┌ [agent:{}] {}", agent_type, task_display);
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(OrchestratorEvent::AgentStart {
+                    agent_type: agent_type.to_string(),
+                    task: task_display.clone(),
+                });
+            } else if !self.suppress_display {
+                println!("┌ [agent:{}] {}", agent_type, task_display);
+            }
 
             let result = match self.registry.execute(name, args.clone()).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("Tool '{}' failed: {}", name, e);
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(OrchestratorEvent::ToolError {
+                            name: name.to_string(),
+                            error: e.to_string(),
+                        });
+                    }
                     serde_json::json!({"error": e.to_string()})
                 }
             };
 
-            println!("└ [agent:{}] done", agent_type);
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(OrchestratorEvent::AgentComplete {
+                    agent_type: agent_type.to_string(),
+                    duration: start.elapsed(),
+                });
+            } else if !self.suppress_display {
+                println!("└ [agent:{}] done", agent_type);
+            }
             result
         } else {
             let display = format_tool_call(name, args);
-            let tool_spinner = Spinner::new(&format!("[tool] {}", display));
-            tool_spinner.finish();
+
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(OrchestratorEvent::ToolStart {
+                    name: name.to_string(),
+                    args_display: display.clone(),
+                });
+            } else if !self.suppress_display {
+                let tool_spinner = Spinner::new(&format!("[tool] {}", display));
+                tool_spinner.finish();
+            }
 
             let result = match self.registry.execute(name, args.clone()).await {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("Tool '{}' failed: {}", name, e);
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(OrchestratorEvent::ToolError {
+                            name: name.to_string(),
+                            error: e.to_string(),
+                        });
+                    }
                     serde_json::json!({"error": e.to_string()})
                 }
             };
 
-            println!("\u{2713} [tool] {}", display);
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(OrchestratorEvent::ToolComplete {
+                    name: name.to_string(),
+                    duration: start.elapsed(),
+                });
+            } else if !self.suppress_display {
+                println!("\u{2713} [tool] {}", display);
+            }
             result
         };
 
@@ -621,11 +739,9 @@ impl Orchestrator {
                     "workspace directory only",
                     "blocked",
                 ),
-                SandboxMode::WorkspaceWrite => (
-                    "everywhere",
-                    "workspace directory only",
-                    "allowed",
-                ),
+                SandboxMode::WorkspaceWrite => {
+                    ("everywhere", "workspace directory only", "allowed")
+                }
                 SandboxMode::FullAccess => unreachable!(),
             };
             format!(
@@ -663,6 +779,7 @@ impl Orchestrator {
             Some(self.approval_handler.clone()),
             self.sandbox.clone(),
             self.protected_paths.clone(),
+            self.event_tx.clone(),
         );
         self.system_prompt = Self::build_system_prompt(
             &self.mode,
@@ -676,11 +793,7 @@ impl Orchestrator {
     /// Switch mode with an optional new approval handler.
     /// If a handler is provided, it replaces the current one before rebuilding
     /// the registry (so the new tools use the new handler).
-    pub fn set_mode_with_handler(
-        &mut self,
-        mode: Mode,
-        handler: Option<Arc<dyn ApprovalHandler>>,
-    ) {
+    pub fn set_mode_with_handler(&mut self, mode: Mode, handler: Option<Arc<dyn ApprovalHandler>>) {
         if let Some(h) = handler {
             self.approval_handler = h;
         }
@@ -854,10 +967,7 @@ impl Orchestrator {
     /// Switch model. Rebuilds client and tool registry.
     pub fn set_model(&mut self, model: String) {
         self.model_name = model.clone();
-        self.client = Arc::new(GeminiClient::new(
-            self.client.api_key().to_string(),
-            model,
-        ));
+        self.client = Arc::new(GeminiClient::new(self.client.api_key().to_string(), model));
         self.registry = create_orchestrator_registry(
             self.working_directory.clone(),
             &self.mode,
@@ -865,6 +975,7 @@ impl Orchestrator {
             Some(self.approval_handler.clone()),
             self.sandbox.clone(),
             self.protected_paths.clone(),
+            self.event_tx.clone(),
         );
     }
 
@@ -979,10 +1090,8 @@ impl Orchestrator {
                         history_text.push_str(&format!("[{}]: {}\n\n", role, t));
                     }
                     Part::FunctionCall { name, args, .. } => {
-                        history_text.push_str(&format!(
-                            "[{}]: Called tool {}({})\n\n",
-                            role, name, args
-                        ));
+                        history_text
+                            .push_str(&format!("[{}]: Called tool {}({})\n\n", role, name, args));
                     }
                     Part::FunctionResponse { name, response, .. } => {
                         let resp_str = response.to_string();
@@ -991,12 +1100,13 @@ impl Orchestrator {
                         } else {
                             resp_str
                         };
-                        history_text
-                            .push_str(&format!("[{}]: Tool {} returned: {}\n\n", role, name, truncated));
+                        history_text.push_str(&format!(
+                            "[{}]: Tool {} returned: {}\n\n",
+                            role, name, truncated
+                        ));
                     }
                     Part::InlineData { mime_type, .. } => {
-                        history_text
-                            .push_str(&format!("[{}]: [Image: {}]\n\n", role, mime_type));
+                        history_text.push_str(&format!("[{}]: [Image: {}]\n\n", role, mime_type));
                     }
                 }
             }
@@ -1047,8 +1157,10 @@ impl Orchestrator {
 
         // Replace history: summary + recent turns
         self.history = Vec::new();
-        self.history
-            .push(Content::user(&format!("[Previous conversation summary]: {}", summary)));
+        self.history.push(Content::user(&format!(
+            "[Previous conversation summary]: {}",
+            summary
+        )));
         self.history.extend(recent_turns);
 
         let turns_after = self.history.len();
@@ -1121,6 +1233,146 @@ impl Orchestrator {
         }
     }
 
+    // ── Phase 9c: TUI Integration ──
+
+    /// Suppress terminal display (Spinner, println) for TUI mode.
+    pub fn set_suppress_display(&mut self, suppress: bool) {
+        self.suppress_display = suppress;
+    }
+
+    /// Set the event sender for tool/agent notifications.
+    /// Rebuilds the registry so spawn tools get the event channel.
+    pub fn set_event_sender(&mut self, tx: mpsc::UnboundedSender<OrchestratorEvent>) {
+        self.event_tx = Some(tx);
+        // Rebuild registry so spawn tools receive the event channel
+        self.registry = create_orchestrator_registry(
+            self.working_directory.clone(),
+            &self.mode,
+            self.client.clone(),
+            Some(self.approval_handler.clone()),
+            self.sandbox.clone(),
+            self.protected_paths.clone(),
+            self.event_tx.clone(),
+        );
+    }
+
+    /// Number of tools available for a given mode.
+    pub fn tool_count_for_mode(&self, mode: &Mode) -> usize {
+        let registry = create_orchestrator_registry(
+            self.working_directory.clone(),
+            mode,
+            self.client.clone(),
+            Some(self.approval_handler.clone()),
+            self.sandbox.clone(),
+            self.protected_paths.clone(),
+            None,
+        );
+        registry.len()
+    }
+
+    /// Get the configured protected paths.
+    pub fn protected_paths(&self) -> &[String] {
+        &self.protected_paths
+    }
+
+    /// Format the last N history entries for display.
+    pub fn recent_history_display(&self, n: usize) -> String {
+        let start = self.history.len().saturating_sub(n);
+        let mut output = String::new();
+        for (i, content) in self.history[start..].iter().enumerate() {
+            let role = content.role.as_deref().unwrap_or("system");
+            for part in &content.parts {
+                match part {
+                    Part::Text(t) => {
+                        let truncated = if t.len() > 200 {
+                            format!("{}...", &t[..197])
+                        } else {
+                            t.clone()
+                        };
+                        output.push_str(&format!("[{}] {}: {}\n", start + i + 1, role, truncated));
+                    }
+                    Part::FunctionCall { name, .. } => {
+                        output.push_str(&format!(
+                            "[{}] {}: tool call: {}\n",
+                            start + i + 1,
+                            role,
+                            name
+                        ));
+                    }
+                    Part::FunctionResponse { name, .. } => {
+                        output.push_str(&format!(
+                            "[{}] {}: tool result: {}\n",
+                            start + i + 1,
+                            role,
+                            name
+                        ));
+                    }
+                    Part::InlineData { mime_type, .. } => {
+                        output.push_str(&format!(
+                            "[{}] {}: [{}]\n",
+                            start + i + 1,
+                            role,
+                            mime_type
+                        ));
+                    }
+                }
+            }
+        }
+        if output.is_empty() {
+            "No conversation history.".to_string()
+        } else {
+            output
+        }
+    }
+
+    /// Export the current session to a markdown file.
+    pub fn export_session(&self, path: &str) -> Result<()> {
+        let mut output = String::from("# Session Export\n\n");
+        if let Some(id) = &self.session_id {
+            output.push_str(&format!("Session: {}\n\n", id));
+        }
+        output.push_str(&format!(
+            "Mode: {}\nModel: {}\n\n---\n\n",
+            self.mode, self.model_name
+        ));
+
+        for content in &self.history {
+            let role = content.role.as_deref().unwrap_or("system");
+            for part in &content.parts {
+                match part {
+                    Part::Text(t) => {
+                        output.push_str(&format!("## {}\n\n{}\n\n", role, t));
+                    }
+                    Part::FunctionCall { name, args, .. } => {
+                        output.push_str(&format!(
+                            "### Tool Call: {}\n\n```json\n{}\n```\n\n",
+                            name,
+                            serde_json::to_string_pretty(args).unwrap_or_default()
+                        ));
+                    }
+                    Part::FunctionResponse { name, response, .. } => {
+                        let resp_str = response.to_string();
+                        let truncated = if resp_str.len() > 1000 {
+                            format!("{}...", &resp_str[..997])
+                        } else {
+                            resp_str
+                        };
+                        output.push_str(&format!(
+                            "### Tool Result: {}\n\n```\n{}\n```\n\n",
+                            name, truncated
+                        ));
+                    }
+                    Part::InlineData { mime_type, .. } => {
+                        output.push_str(&format!("*[Inline data: {}]*\n\n", mime_type));
+                    }
+                }
+            }
+        }
+
+        std::fs::write(path, output)
+            .map_err(|e| ClosedCodeError::SessionError(format!("Failed to export session: {}", e)))
+    }
+
     // ── Phase 6: Sub-Agent Runners ──
 
     /// Run a commit agent to generate a commit message from a diff.
@@ -1128,7 +1380,13 @@ impl Orchestrator {
     pub async fn run_commit_agent(&self, diff: &str) -> Result<String> {
         use crate::agent::Agent;
 
-        let agent = CommitAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        let mut agent = CommitAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        if let Some(ref tx) = self.event_tx {
+            agent = agent.with_progress(crate::tool::spawn::make_agent_progress_callback(
+                tx.clone(),
+                "commit",
+            ));
+        }
         let request = AgentRequest::new(
             "Generate a commit message for the following code changes.".to_string(),
             self.working_directory.to_string_lossy().to_string(),
@@ -1145,7 +1403,13 @@ impl Orchestrator {
     pub async fn run_review_agent(&mut self, diff: &str) -> Result<String> {
         use crate::agent::Agent;
 
-        let agent = ReviewAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        let mut agent = ReviewAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        if let Some(ref tx) = self.event_tx {
+            agent = agent.with_progress(crate::tool::spawn::make_agent_progress_callback(
+                tx.clone(),
+                "review",
+            ));
+        }
         let request = AgentRequest::new(
             "Review the following code changes thoroughly.".to_string(),
             self.working_directory.to_string_lossy().to_string(),
@@ -1242,20 +1506,22 @@ mod tests {
         Arc::new(MockSandbox::new(PathBuf::from("/tmp")))
     }
 
-
+    fn test_config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            client: test_client(),
+            mode: Mode::Explore,
+            working_directory: PathBuf::from("/tmp"),
+            max_output_tokens: 8192,
+            approval_handler: test_handler(),
+            personality: Personality::default(),
+            context_window_turns: 50,
+            sandbox: mock_sandbox(),
+            protected_paths: vec![],
+        }
+    }
 
     fn test_orchestrator() -> Orchestrator {
-        Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        )
+        Orchestrator::new(test_config())
     }
 
     #[test]
@@ -1270,17 +1536,10 @@ mod tests {
 
     #[test]
     fn orchestrator_new_plan_mode() {
-        let orch = Orchestrator::new(
-            test_client(),
-            Mode::Plan,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let orch = Orchestrator::new(OrchestratorConfig {
+            mode: Mode::Plan,
+            ..test_config()
+        });
         // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
         assert_eq!(orch.tool_count(), 8);
         assert_eq!(*orch.mode(), Mode::Plan);
@@ -1290,17 +1549,10 @@ mod tests {
 
     #[test]
     fn orchestrator_new_execute_mode() {
-        let orch = Orchestrator::new(
-            test_client(),
-            Mode::Execute,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let orch = Orchestrator::new(OrchestratorConfig {
+            mode: Mode::Execute,
+            ..test_config()
+        });
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(orch.tool_count(), 9);
         assert!(orch.system_prompt().contains("EXECUTE"));
@@ -1356,17 +1608,10 @@ mod tests {
 
     #[test]
     fn prune_configurable_turns() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            20, // smaller context window
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            context_window_turns: 20, // smaller context window
+            ..test_config()
+        });
 
         for i in 0..30 {
             if i % 2 == 0 {
@@ -1460,17 +1705,10 @@ mod tests {
 
     #[test]
     fn orchestrator_set_current_plan() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Plan,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            mode: Mode::Plan,
+            ..test_config()
+        });
 
         assert!(orch.current_plan().is_none());
         orch.set_current_plan("Step 1: Add feature X".into());
@@ -1479,17 +1717,10 @@ mod tests {
 
     #[test]
     fn orchestrator_accept_plan_switches_to_execute() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Plan,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            mode: Mode::Plan,
+            ..test_config()
+        });
 
         orch.set_current_plan("The plan content".into());
         let plan = orch.accept_plan(Mode::Execute);
@@ -1513,17 +1744,10 @@ mod tests {
 
     #[test]
     fn orchestrator_accept_plan_no_plan() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Plan,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            mode: Mode::Plan,
+            ..test_config()
+        });
 
         let plan = orch.accept_plan(Mode::Execute);
         assert!(plan.is_none());
@@ -1532,17 +1756,10 @@ mod tests {
 
     #[test]
     fn orchestrator_accept_plan_guided() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Plan,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            mode: Mode::Plan,
+            ..test_config()
+        });
 
         orch.set_current_plan("The plan content".into());
         let plan = orch.accept_plan(Mode::Guided);
@@ -1554,24 +1771,13 @@ mod tests {
 
     #[test]
     fn set_mode_with_handler_swaps_handler() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(test_config());
 
         assert_eq!(*orch.mode(), Mode::Explore);
 
         // Switch to Guided with a new handler
-        let new_handler = Arc::new(
-            crate::ui::approval::AutoApproveHandler::always_reject(),
-        ) as Arc<dyn ApprovalHandler>;
+        let new_handler = Arc::new(crate::ui::approval::AutoApproveHandler::always_reject())
+            as Arc<dyn ApprovalHandler>;
         orch.set_mode_with_handler(Mode::Guided, Some(new_handler));
 
         assert_eq!(*orch.mode(), Mode::Guided);
@@ -1587,51 +1793,30 @@ mod tests {
 
     #[test]
     fn orchestrator_friendly_prompt() {
-        let orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::Friendly,
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let orch = Orchestrator::new(OrchestratorConfig {
+            personality: Personality::Friendly,
+            ..test_config()
+        });
         assert!(orch.system_prompt().contains("warm"));
         assert!(orch.system_prompt().contains("encouraging"));
     }
 
     #[test]
     fn orchestrator_pragmatic_prompt() {
-        let orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::Pragmatic,
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let orch = Orchestrator::new(OrchestratorConfig {
+            personality: Personality::Pragmatic,
+            ..test_config()
+        });
         assert!(orch.system_prompt().contains("direct"));
         assert!(orch.system_prompt().contains("concise"));
     }
 
     #[test]
     fn orchestrator_none_prompt() {
-        let orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::None,
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let orch = Orchestrator::new(OrchestratorConfig {
+            personality: Personality::None,
+            ..test_config()
+        });
         assert!(!orch.system_prompt().contains("warm"));
         assert!(!orch.system_prompt().contains("concise, and code-focused"));
         assert!(orch.system_prompt().contains("closed-code"));
@@ -1650,17 +1835,10 @@ mod tests {
 
     #[test]
     fn set_mode_preserves_personality() {
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::Friendly,
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            personality: Personality::Friendly,
+            ..test_config()
+        });
         assert!(orch.system_prompt().contains("warm"));
 
         orch.set_mode(Mode::Plan);
@@ -1696,17 +1874,10 @@ mod tests {
         let orch = test_orchestrator();
         assert_eq!(orch.context_window_turns(), 50);
 
-        let orch2 = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            100,
-            mock_sandbox(),
-            vec![],
-        );
+        let orch2 = Orchestrator::new(OrchestratorConfig {
+            context_window_turns: 100,
+            ..test_config()
+        });
         assert_eq!(orch2.context_window_turns(), 100);
     }
 
@@ -1714,17 +1885,10 @@ mod tests {
 
     #[test]
     fn orchestrator_new_auto_mode() {
-        let orch = Orchestrator::new(
-            test_client(),
-            Mode::Auto,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let orch = Orchestrator::new(OrchestratorConfig {
+            mode: Mode::Auto,
+            ..test_config()
+        });
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(orch.tool_count(), 9);
         assert_eq!(*orch.mode(), Mode::Auto);
@@ -1817,17 +1981,10 @@ mod tests {
     #[tokio::test]
     async fn detect_git_context_in_non_repo() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            dir.path().to_path_buf(),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            working_directory: dir.path().to_path_buf(),
+            ..test_config()
+        });
         orch.detect_git_context().await;
         assert_eq!(orch.git_summary(), "not a git repository");
         assert!(orch.git_default_branch().is_none());
@@ -1877,17 +2034,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            dir.path().to_path_buf(),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            working_directory: dir.path().to_path_buf(),
+            ..test_config()
+        });
         orch.detect_git_context().await;
 
         assert!(orch.git_summary().contains("main"));
@@ -1935,17 +2085,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut orch = Orchestrator::new(
-            test_client(),
-            Mode::Explore,
-            dir.path().to_path_buf(),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        );
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            working_directory: dir.path().to_path_buf(),
+            ..test_config()
+        });
         orch.detect_git_context().await;
         assert!(orch.system_prompt().contains("Git context:"));
 
@@ -2024,10 +2167,7 @@ mod tests {
         orch.history.push(Content::user("old"));
         assert_eq!(orch.turn_count(), 1);
 
-        orch.set_history(vec![
-            Content::user("new1"),
-            Content::model("new2"),
-        ]);
+        orch.set_history(vec![Content::user("new1"), Content::model("new2")]);
         assert_eq!(orch.turn_count(), 2);
         assert_eq!(orch.history()[0].role.as_deref(), Some("user"));
     }
@@ -2105,7 +2245,10 @@ mod tests {
         let store = orch.session_store().unwrap();
         let events = store.load_events(&first_id).unwrap();
         assert!(events.len() >= 2);
-        assert!(matches!(events.last().unwrap(), SessionEvent::SessionEnd { .. }));
+        assert!(matches!(
+            events.last().unwrap(),
+            SessionEvent::SessionEnd { .. }
+        ));
     }
 
     #[test]

@@ -1,14 +1,14 @@
 pub mod fallback;
-#[cfg(target_os = "macos")]
-pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 
 pub use fallback::FallbackSandbox;
-#[cfg(target_os = "macos")]
-pub use macos::SeatbeltSandbox;
 #[cfg(target_os = "linux")]
 pub use linux::LandlockSandbox;
+#[cfg(target_os = "macos")]
+pub use macos::SeatbeltSandbox;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use crate::error::{ClosedCodeError, Result};
 
 /// Sandbox restriction level for shell command execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxMode {
     /// Reads and writes restricted to workspace + system essentials. Network blocked.
     /// Strongest isolation — the agent cannot read files outside the project.
@@ -28,15 +28,10 @@ pub enum SandboxMode {
     /// Reads everywhere, writes only within workspace + /tmp. Network allowed.
     /// The invisible default — prevents accidental writes outside the project
     /// while allowing normal development workflows (cargo build, git push, etc.).
+    #[default]
     WorkspaceWrite,
     /// No sandbox restrictions (requires explicit opt-in).
     FullAccess,
-}
-
-impl Default for SandboxMode {
-    fn default() -> Self {
-        Self::WorkspaceWrite
-    }
 }
 
 impl fmt::Display for SandboxMode {
@@ -83,12 +78,7 @@ impl fmt::Display for SandboxBackend {
 #[async_trait]
 pub trait Sandbox: Send + Sync + fmt::Debug {
     /// Execute a command with sandbox restrictions applied.
-    async fn execute_command(
-        &self,
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-    ) -> Result<Output>;
+    async fn execute_command(&self, command: &str, args: &[String], cwd: &Path) -> Result<Output>;
 
     /// The sandbox restriction level.
     fn mode(&self) -> SandboxMode;
@@ -172,9 +162,7 @@ pub mod mock {
                 .current_dir(cwd)
                 .output()
                 .await
-                .map_err(|e| {
-                    ClosedCodeError::ShellError(format!("Mock execution failed: {}", e))
-                })
+                .map_err(|e| ClosedCodeError::ShellError(format!("Mock execution failed: {}", e)))
         }
 
         fn mode(&self) -> SandboxMode {

@@ -35,33 +35,148 @@ pub fn all_commands() -> Vec<CommandEntry> {
     use CommandCategory::*;
     vec![
         // Navigation
-        CommandEntry { name: "/help",        args: "",         description: "Show this help",                                  category: Navigation },
-        CommandEntry { name: "/quit",        args: "",         description: "Exit closed-code",                                category: Navigation },
-        CommandEntry { name: "/clear",       args: "",         description: "Clear conversation history",                      category: Navigation },
+        CommandEntry {
+            name: "/help",
+            args: "",
+            description: "Show this help",
+            category: Navigation,
+        },
+        CommandEntry {
+            name: "/quit",
+            args: "",
+            description: "Exit closed-code",
+            category: Navigation,
+        },
+        CommandEntry {
+            name: "/clear",
+            args: "",
+            description: "Clear conversation history",
+            category: Navigation,
+        },
         // Mode
-        CommandEntry { name: "/mode",        args: "[name]",   description: "Show or switch mode",                             category: Mode },
-        CommandEntry { name: "/explore",     args: "",         description: "Switch to Explore mode",                          category: Mode },
-        CommandEntry { name: "/plan",        args: "",         description: "Switch to Plan mode",                             category: Mode },
-        CommandEntry { name: "/guided",      args: "",         description: "Switch to Guided mode (writes require approval)", category: Mode },
-        CommandEntry { name: "/execute",     args: "",         description: "Switch to Execute mode",                          category: Mode },
-        CommandEntry { name: "/auto",        args: "",         description: "Switch to Auto mode (unrestricted shell)",        category: Mode },
-        CommandEntry { name: "/accept",      args: "",         description: "Accept plan and choose execution mode",           category: Mode },
+        CommandEntry {
+            name: "/mode",
+            args: "[name]",
+            description: "Show or switch mode",
+            category: Mode,
+        },
+        CommandEntry {
+            name: "/explore",
+            args: "",
+            description: "Switch to Explore mode",
+            category: Mode,
+        },
+        CommandEntry {
+            name: "/plan",
+            args: "",
+            description: "Switch to Plan mode",
+            category: Mode,
+        },
+        CommandEntry {
+            name: "/guided",
+            args: "",
+            description: "Switch to Guided mode (writes require approval)",
+            category: Mode,
+        },
+        CommandEntry {
+            name: "/execute",
+            args: "",
+            description: "Switch to Execute mode",
+            category: Mode,
+        },
+        CommandEntry {
+            name: "/auto",
+            args: "",
+            description: "Switch to Auto mode (unrestricted shell)",
+            category: Mode,
+        },
+        CommandEntry {
+            name: "/accept",
+            args: "",
+            description: "Accept plan and choose execution mode",
+            category: Mode,
+        },
         // Git
-        CommandEntry { name: "/diff",        args: "[opts]",   description: "Show git diff (staged, branch, HEAD~N)",          category: Git },
-        CommandEntry { name: "/review",      args: "[HEAD~N]", description: "Review changes with sub-agent",                   category: Git },
-        CommandEntry { name: "/commit",      args: "[message]",description: "Generate commit message and commit",              category: Git },
+        CommandEntry {
+            name: "/diff",
+            args: "[opts]",
+            description: "Show git diff (staged, branch, HEAD~N)",
+            category: Git,
+        },
+        CommandEntry {
+            name: "/review",
+            args: "[HEAD~N]",
+            description: "Review changes with sub-agent",
+            category: Git,
+        },
+        CommandEntry {
+            name: "/commit",
+            args: "[message]",
+            description: "Generate commit message and commit",
+            category: Git,
+        },
         // Session
-        CommandEntry { name: "/new",         args: "",         description: "Start a new session (clears history)",            category: Session },
-        CommandEntry { name: "/fork",        args: "",         description: "Fork current session into a new one",             category: Session },
-        CommandEntry { name: "/compact",     args: "[prompt]", description: "Compact conversation history via LLM",            category: Session },
-        CommandEntry { name: "/history",     args: "[N]",      description: "Show last N conversation turns",                  category: Session },
-        CommandEntry { name: "/export",      args: "[file]",   description: "Export session transcript to markdown",           category: Session },
-        CommandEntry { name: "/resume",      args: "",         description: "List recent sessions",                            category: Session },
+        CommandEntry {
+            name: "/new",
+            args: "",
+            description: "Start a new session (clears history)",
+            category: Session,
+        },
+        CommandEntry {
+            name: "/fork",
+            args: "",
+            description: "Fork current session into a new one",
+            category: Session,
+        },
+        CommandEntry {
+            name: "/compact",
+            args: "[prompt]",
+            description: "Compact conversation history via LLM",
+            category: Session,
+        },
+        CommandEntry {
+            name: "/history",
+            args: "[N]",
+            description: "Show last N conversation turns",
+            category: Session,
+        },
+        CommandEntry {
+            name: "/export",
+            args: "[file]",
+            description: "Export session transcript to markdown",
+            category: Session,
+        },
+        CommandEntry {
+            name: "/resume",
+            args: "",
+            description: "List recent sessions",
+            category: Session,
+        },
         // Config
-        CommandEntry { name: "/model",       args: "[name]",   description: "Show or switch model",                            category: Config },
-        CommandEntry { name: "/personality", args: "[style]",  description: "Show or change personality",                      category: Config },
-        CommandEntry { name: "/status",      args: "",         description: "Show session status and token usage",             category: Config },
-        CommandEntry { name: "/sandbox",     args: "",         description: "Show sandbox mode and protected paths",           category: Config },
+        CommandEntry {
+            name: "/model",
+            args: "[name]",
+            description: "Show or switch model",
+            category: Config,
+        },
+        CommandEntry {
+            name: "/personality",
+            args: "[style]",
+            description: "Show or change personality",
+            category: Config,
+        },
+        CommandEntry {
+            name: "/status",
+            args: "",
+            description: "Show session status and token usage",
+            category: Config,
+        },
+        CommandEntry {
+            name: "/sandbox",
+            args: "",
+            description: "Show sandbox mode and protected paths",
+            category: Config,
+        },
     ]
 }
 
@@ -154,10 +269,7 @@ impl CommandPicker {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(TuiTheme::ACCENT))
-            .title(
-                Line::from(" Commands ")
-                    .style(Style::new().fg(TuiTheme::ACCENT).bold()),
-            )
+            .title(Line::from(" Commands ").style(Style::new().fg(TuiTheme::ACCENT).bold()))
             .title_bottom(
                 Line::from(format!(" {} of {} ", matched, total))
                     .right_aligned()
@@ -292,10 +404,7 @@ mod tests {
     #[test]
     fn filter_case_insensitive() {
         let picker = CommandPicker::new();
-        assert_eq!(
-            picker.filtered("quit").len(),
-            picker.filtered("QUIT").len(),
-        );
+        assert_eq!(picker.filtered("quit").len(), picker.filtered("QUIT").len(),);
     }
 
     #[test]

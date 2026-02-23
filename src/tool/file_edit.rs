@@ -67,11 +67,7 @@ impl Tool for EditFileTool {
             name: self.name().into(),
             description: self.description().into(),
             parameters: ParamBuilder::new()
-                .string(
-                    "path",
-                    "File path relative to working directory",
-                    true,
-                )
+                .string("path", "File path relative to working directory", true)
                 .string(
                     "old_text",
                     "The exact text to find and replace. Must match exactly, including \
@@ -119,12 +115,13 @@ impl Tool for EditFileTool {
         let resolved = self.resolve_path(path_str);
 
         // Read the existing file
-        let old_content = fs::read_to_string(&resolved).await.map_err(|e| {
-            ClosedCodeError::ToolError {
-                name: "edit_file".into(),
-                message: format!("Cannot read '{}': {}", path_str, e),
-            }
-        })?;
+        let old_content =
+            fs::read_to_string(&resolved)
+                .await
+                .map_err(|e| ClosedCodeError::ToolError {
+                    name: "edit_file".into(),
+                    message: format!("Cannot read '{}': {}", path_str, e),
+                })?;
 
         // Find old_text in the file
         let occurrences = old_content.matches(old_text).count();
@@ -342,15 +339,11 @@ mod tests {
         let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
 
         // Missing old_text
-        let result = tool
-            .execute(json!({"path": "x.rs", "new_text": "y"}))
-            .await;
+        let result = tool.execute(json!({"path": "x.rs", "new_text": "y"})).await;
         assert!(result.is_err());
 
         // Missing new_text
-        let result = tool
-            .execute(json!({"path": "x.rs", "old_text": "y"}))
-            .await;
+        let result = tool.execute(json!({"path": "x.rs", "old_text": "y"})).await;
         assert!(result.is_err());
 
         // Missing path
@@ -384,7 +377,10 @@ mod tests {
     fn edit_available_modes() {
         let (dir, handler) = setup();
         let tool = EditFileTool::new(dir.path().to_path_buf(), handler, vec![]);
-        assert_eq!(tool.available_modes(), vec![Mode::Guided, Mode::Execute, Mode::Auto]);
+        assert_eq!(
+            tool.available_modes(),
+            vec![Mode::Guided, Mode::Execute, Mode::Auto]
+        );
     }
 
     #[test]

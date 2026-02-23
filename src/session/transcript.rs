@@ -88,7 +88,10 @@ impl TranscriptWriter {
                     ));
                 }
                 SessionEvent::ModeChange {
-                    from, to, timestamp, ..
+                    from,
+                    to,
+                    timestamp,
+                    ..
                 } => {
                     md.push_str(&format!(
                         "*Mode changed from {} to {} ({})*\n\n",

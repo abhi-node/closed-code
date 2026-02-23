@@ -25,7 +25,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let [header_area, chat_area, input_divider, input_area, status_divider, status_area] =
         Layout::vertical([
             Constraint::Length(1),            // Header bar
-            Constraint::Fill(1),             // Chat area
+            Constraint::Fill(1),              // Chat area
             Constraint::Length(1),            // ══ divider
             Constraint::Length(input_height), // Input area (dynamic)
             Constraint::Length(1),            // ══ divider
@@ -34,7 +34,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .areas(area);
 
     header::render(frame, header_area, app);
-    render_chat_placeholder(frame, chat_area);
+    super::chat::render(
+        frame,
+        chat_area,
+        &app.messages,
+        &mut app.chat_viewport,
+        app.tick_count,
+    );
     render_divider(frame, input_divider);
     frame.render_widget(app.input_pane.textarea(), input_area);
     render_divider(frame, status_divider);
@@ -50,14 +56,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.command_picker
             .render(frame, &filter, selected, area, chat_area);
     }
-}
-
-/// Empty chat area with subtle side borders.
-fn render_chat_placeholder(frame: &mut Frame, area: Rect) {
-    let block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::LEFT | ratatui::widgets::Borders::RIGHT)
-        .border_style(Style::default().fg(TuiTheme::BORDER_DIM));
-    frame.render_widget(block, area);
 }
 
 /// Double-line horizontal divider.

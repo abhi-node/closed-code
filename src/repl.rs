@@ -7,19 +7,19 @@ use crossterm::style::Stylize;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
-use chrono::Utc;
-use crate::agent::orchestrator::Orchestrator;
+use crate::agent::orchestrator::{Orchestrator, OrchestratorConfig};
 use crate::config::{Config, Personality};
 use crate::gemini::stream::StreamEvent;
 use crate::gemini::types::Part;
 use crate::gemini::GeminiClient;
 use crate::sandbox::create_sandbox;
-use crate::session::{SessionEvent, SessionId};
 use crate::session::store::SessionStore;
 use crate::session::transcript::TranscriptWriter;
+use crate::session::{SessionEvent, SessionId};
 use crate::ui::approval::{ApprovalHandler, DiffOnlyApprovalHandler, TerminalApprovalHandler};
 use crate::ui::spinner::Spinner;
 use crate::ui::theme::Theme;
+use chrono::Utc;
 
 fn styled_text(text: &str, color: crossterm::style::Color) -> String {
     text.with(color).to_string()
@@ -79,17 +79,17 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
     ));
     let sandbox = create_sandbox(config.sandbox_mode, config.working_directory.clone());
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
-    let mut orchestrator = Orchestrator::new(
+    let mut orchestrator = Orchestrator::new(OrchestratorConfig {
         client,
-        config.mode,
-        config.working_directory.clone(),
-        config.max_output_tokens,
+        mode: config.mode,
+        working_directory: config.working_directory.clone(),
+        max_output_tokens: config.max_output_tokens,
         approval_handler,
-        config.personality,
-        config.context_window_turns,
+        personality: config.personality,
+        context_window_turns: config.context_window_turns,
         sandbox,
-        config.protected_paths.clone(),
-    );
+        protected_paths: config.protected_paths.clone(),
+    });
     orchestrator.detect_git_context().await;
 
     match orchestrator
@@ -114,17 +114,17 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
     ));
     let sandbox = create_sandbox(config.sandbox_mode, config.working_directory.clone());
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
-    let mut orchestrator = Orchestrator::new(
+    let mut orchestrator = Orchestrator::new(OrchestratorConfig {
         client,
-        config.mode,
-        config.working_directory.clone(),
-        config.max_output_tokens,
+        mode: config.mode,
+        working_directory: config.working_directory.clone(),
+        max_output_tokens: config.max_output_tokens,
         approval_handler,
-        config.personality,
-        config.context_window_turns,
+        personality: config.personality,
+        context_window_turns: config.context_window_turns,
         sandbox,
-        config.protected_paths.clone(),
-    );
+        protected_paths: config.protected_paths.clone(),
+    });
     orchestrator.detect_git_context().await;
 
     // Phase 8a: Auto-start session
@@ -142,10 +142,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         config.model,
         orchestrator.tool_count()
     );
-    println!(
-        "Working directory: {}",
-        config.working_directory.display()
-    );
+    println!("Working directory: {}", config.working_directory.display());
     println!("Sandbox: {}", orchestrator.sandbox_summary());
     println!("Git: {}", orchestrator.git_summary());
     if let Some(id) = orchestrator.session_id() {
@@ -174,12 +171,9 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
                 let _ = editor.add_history_entry(line);
 
                 // Shell prefix: !command runs a local shell command
-                if line.starts_with('!') {
-                    let shell_cmd = &line[1..];
+                if let Some(shell_cmd) = line.strip_prefix('!') {
                     if !shell_cmd.is_empty() {
-                        match execute_local_shell(shell_cmd, &config.working_directory)
-                            .await
-                        {
+                        match execute_local_shell(shell_cmd, &config.working_directory).await {
                             Ok(output) => {
                                 let stdout = String::from_utf8_lossy(&output.stdout);
                                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -191,11 +185,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "{}: {}",
-                                    styled_text("Error", Theme::ERROR),
-                                    e
-                                );
+                                eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
                             }
                         }
                     }
@@ -203,8 +193,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
                 }
 
                 if line.starts_with('/') {
-                    match handle_slash_command(line, &mut orchestrator).await
-                    {
+                    match handle_slash_command(line, &mut orchestrator).await {
                         SlashResult::Continue => continue,
                         SlashResult::Quit => break,
                         SlashResult::ExecutePlan => {
@@ -218,19 +207,12 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
                             {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    eprintln!(
-                                        "\n{}: {}",
-                                        styled_text("Error", Theme::ERROR),
-                                        e
-                                    );
+                                    eprintln!("\n{}: {}", styled_text("Error", Theme::ERROR), e);
                                 }
                             }
                             drain_stdin();
                             if orchestrator.is_cancelled() {
-                                println!(
-                                    "\n{}",
-                                    styled_text("Interrupted.", Theme::DIM)
-                                );
+                                println!("\n{}", styled_text("Interrupted.", Theme::DIM));
                                 orchestrator.record_interruption();
                             }
                             println!();
@@ -254,11 +236,7 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "\n{}: {}",
-                            styled_text("Error", Theme::ERROR),
-                            e
-                        );
+                        eprintln!("\n{}: {}", styled_text("Error", Theme::ERROR), e);
                     }
                 }
                 drain_stdin();
@@ -349,7 +327,9 @@ pub async fn run_resume(config: &Config, session_id_str: Option<&str>) -> anyhow
         }
     };
 
-    let events = store.load_events(&session_id).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let events = store
+        .load_events(&session_id)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     let history = SessionStore::reconstruct_history(&events);
     let turn_count = history.len();
 
@@ -366,17 +346,17 @@ pub async fn run_resume(config: &Config, session_id_str: Option<&str>) -> anyhow
     ));
     let sandbox = create_sandbox(config.sandbox_mode, config.working_directory.clone());
     let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
-    let mut orchestrator = Orchestrator::new(
+    let mut orchestrator = Orchestrator::new(OrchestratorConfig {
         client,
-        config.mode,
-        config.working_directory.clone(),
-        config.max_output_tokens,
+        mode: config.mode,
+        working_directory: config.working_directory.clone(),
+        max_output_tokens: config.max_output_tokens,
         approval_handler,
-        config.personality,
-        config.context_window_turns,
+        personality: config.personality,
+        context_window_turns: config.context_window_turns,
         sandbox,
-        config.protected_paths.clone(),
-    );
+        protected_paths: config.protected_paths.clone(),
+    });
     orchestrator.detect_git_context().await;
     orchestrator.set_history(history);
     orchestrator.set_session(session_id, store);
@@ -391,10 +371,7 @@ pub async fn run_resume(config: &Config, session_id_str: Option<&str>) -> anyhow
         config.model,
         orchestrator.tool_count()
     );
-    println!(
-        "Working directory: {}",
-        config.working_directory.display()
-    );
+    println!("Working directory: {}", config.working_directory.display());
     if let Some(id) = orchestrator.session_id() {
         println!("Session: {} (resumed)", &id.as_str()[..8]);
     }
@@ -418,15 +395,18 @@ pub async fn run_resume(config: &Config, session_id_str: Option<&str>) -> anyhow
                 }
                 let _ = editor.add_history_entry(line);
 
-                if line.starts_with('!') {
-                    let shell_cmd = &line[1..];
+                if let Some(shell_cmd) = line.strip_prefix('!') {
                     if !shell_cmd.is_empty() {
                         match execute_local_shell(shell_cmd, &config.working_directory).await {
                             Ok(output) => {
                                 let stdout = String::from_utf8_lossy(&output.stdout);
                                 let stderr = String::from_utf8_lossy(&output.stderr);
-                                if !stdout.is_empty() { print!("{}", stdout); }
-                                if !stderr.is_empty() { eprint!("{}", stderr); }
+                                if !stdout.is_empty() {
+                                    print!("{}", stdout);
+                                }
+                                if !stderr.is_empty() {
+                                    eprint!("{}", stderr);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
@@ -527,10 +507,7 @@ fn handler_for_mode(mode: &crate::mode::Mode) -> Arc<dyn ApprovalHandler> {
     }
 }
 
-async fn handle_slash_command(
-    input: &str,
-    orchestrator: &mut Orchestrator,
-) -> SlashResult {
+async fn handle_slash_command(input: &str, orchestrator: &mut Orchestrator) -> SlashResult {
     let (cmd, arg) = match input.find(' ') {
         Some(pos) => (&input[..pos], input[pos + 1..].trim()),
         None => (input, ""),
@@ -554,9 +531,7 @@ async fn handle_slash_command(
             }
 
             if orchestrator.current_plan().is_none() {
-                println!(
-                    "No plan to accept. Ask the assistant to create a plan first."
-                );
+                println!("No plan to accept. Ask the assistant to create a plan first.");
                 return SlashResult::Continue;
             }
 
@@ -643,20 +618,32 @@ async fn handle_slash_command(
             println!("  /mode [name]       \u{2014} Show or switch mode (explore, plan, guided, execute, auto)");
             println!("  /explore           \u{2014} Switch to Explore mode");
             println!("  /plan              \u{2014} Switch to Plan mode");
-            println!("  /guided            \u{2014} Switch to Guided mode (writes require approval)");
+            println!(
+                "  /guided            \u{2014} Switch to Guided mode (writes require approval)"
+            );
             println!("  /execute           \u{2014} Switch to Execute mode");
             println!("  /auto              \u{2014} Switch to Auto mode (unrestricted shell)");
             println!("  /accept            \u{2014} Accept plan and choose execution mode");
             println!("  /diff [opts]       \u{2014} Show git diff (staged, branch, HEAD~N)");
-            println!("  /review [HEAD~N]   \u{2014} Review changes with sub-agent (adds to context)");
-            println!("  /commit [message]  \u{2014} Generate commit message via sub-agent and commit");
+            println!(
+                "  /review [HEAD~N]   \u{2014} Review changes with sub-agent (adds to context)"
+            );
+            println!(
+                "  /commit [message]  \u{2014} Generate commit message via sub-agent and commit"
+            );
             println!("  /model [name]      \u{2014} Show or switch model");
             println!("  /personality [s]   \u{2014} Show or change personality (friendly, pragmatic, none)");
-            println!("  /sandbox           \u{2014} Show sandbox mode, backend, and protected paths");
-            println!("  /status            \u{2014} Show session status (tokens, model, mode, etc.)");
+            println!(
+                "  /sandbox           \u{2014} Show sandbox mode, backend, and protected paths"
+            );
+            println!(
+                "  /status            \u{2014} Show session status (tokens, model, mode, etc.)"
+            );
             println!("  /new               \u{2014} Start a new session (clears history)");
             println!("  /fork              \u{2014} Fork current session into a new one");
-            println!("  /compact [prompt]  \u{2014} Compact conversation history via LLM summarization");
+            println!(
+                "  /compact [prompt]  \u{2014} Compact conversation history via LLM summarization"
+            );
             println!("  /history [N]       \u{2014} Show last N conversation turns (default: 10)");
             println!("  /export [file]     \u{2014} Export session transcript to markdown");
             println!("  /resume            \u{2014} List recent sessions (use `closed-code resume` to resume)");
@@ -772,11 +759,7 @@ async fn handle_slash_command(
                         }
                         Err(e) => {
                             spinner.finish();
-                            eprintln!(
-                                "{}: {}",
-                                styled_text("Error", Theme::ERROR),
-                                e
-                            );
+                            eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
                         }
                     }
                 }
@@ -797,11 +780,7 @@ async fn handle_slash_command(
                 }
                 Ok(d) => d,
                 Err(e) => {
-                    println!(
-                        "{}: {}",
-                        styled_text("Error", Theme::ERROR),
-                        e
-                    );
+                    println!("{}: {}", styled_text("Error", Theme::ERROR), e);
                     return SlashResult::Continue;
                 }
             };
@@ -818,11 +797,7 @@ async fn handle_slash_command(
                     }
                     Err(e) => {
                         spinner.finish();
-                        eprintln!(
-                            "{}: {}",
-                            styled_text("Error", Theme::ERROR),
-                            e
-                        );
+                        eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
                         return SlashResult::Continue;
                     }
                 }
@@ -853,11 +828,7 @@ async fn handle_slash_command(
                         orchestrator.refresh_git_context().await;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "{}: {}",
-                            styled_text("Commit failed", Theme::ERROR),
-                            e
-                        );
+                        eprintln!("{}: {}", styled_text("Commit failed", Theme::ERROR), e);
                     }
                 }
             } else {
@@ -976,10 +947,7 @@ async fn handle_slash_command(
                         turns_before,
                         orchestrator.turn_count(),
                     );
-                    println!(
-                        "{}",
-                        styled_text("Summary:", Theme::DIM),
-                    );
+                    println!("{}", styled_text("Summary:", Theme::DIM),);
                     // Show first 200 chars of summary
                     let preview = if summary.len() > 200 {
                         format!("{}...", &summary[..197])
@@ -1012,17 +980,11 @@ async fn handle_slash_command(
                     let text: String = content
                         .parts
                         .iter()
-                        .filter_map(|p| match p {
-                            Part::Text(t) => Some(t.as_str()),
-                            Part::FunctionCall { name, .. } => {
-                                Some(name.as_str())
-                            }
-                            Part::FunctionResponse { name, .. } => {
-                                Some(name.as_str())
-                            }
-                            Part::InlineData { mime_type, .. } => {
-                                Some(mime_type.as_str())
-                            }
+                        .map(|p| match p {
+                            Part::Text(t) => t.as_str(),
+                            Part::FunctionCall { name, .. } => name.as_str(),
+                            Part::FunctionResponse { name, .. } => name.as_str(),
+                            Part::InlineData { mime_type, .. } => mime_type.as_str(),
                         })
                         .collect::<Vec<_>>()
                         .join(", ");
@@ -1037,40 +999,26 @@ async fn handle_slash_command(
             SlashResult::Continue
         }
         "/export" => {
-            let file_path = if arg.is_empty() {
-                "transcript.md"
-            } else {
-                arg
-            };
+            let file_path = if arg.is_empty() { "transcript.md" } else { arg };
 
             if let Some(store) = orchestrator.session_store() {
                 if let Some(id) = orchestrator.session_id() {
                     match store.load_events(id) {
-                        Ok(events) => {
-                            match TranscriptWriter::write_to_file(&events, file_path) {
-                                Ok(()) => {
-                                    println!(
-                                        "{} Exported {} events to {}",
-                                        styled_text("\u{2713}", Theme::SUCCESS),
-                                        events.len(),
-                                        file_path
-                                    );
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "{}: {}",
-                                        styled_text("Error", Theme::ERROR),
-                                        e
-                                    );
-                                }
+                        Ok(events) => match TranscriptWriter::write_to_file(&events, file_path) {
+                            Ok(()) => {
+                                println!(
+                                    "{} Exported {} events to {}",
+                                    styled_text("\u{2713}", Theme::SUCCESS),
+                                    events.len(),
+                                    file_path
+                                );
                             }
-                        }
+                            Err(e) => {
+                                eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
+                            }
+                        },
                         Err(e) => {
-                            eprintln!(
-                                "{}: {}",
-                                styled_text("Error", Theme::ERROR),
-                                e
-                            );
+                            eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
                         }
                     }
                 } else {
@@ -1135,8 +1083,7 @@ async fn handle_slash_command(
                             } else {
                                 match store.load_events(&selected.session_id) {
                                     Ok(events) => {
-                                        let history =
-                                            SessionStore::reconstruct_history(&events);
+                                        let history = SessionStore::reconstruct_history(&events);
                                         let turn_count = history.len();
                                         orchestrator.set_history(history);
                                         orchestrator.set_session(
@@ -1150,22 +1097,14 @@ async fn handle_slash_command(
                                         );
                                     }
                                     Err(e) => {
-                                        eprintln!(
-                                            "{}: {}",
-                                            styled_text("Error", Theme::ERROR),
-                                            e
-                                        );
+                                        eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
                                     }
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "{}: {}",
-                            styled_text("Error", Theme::ERROR),
-                            e
-                        );
+                        eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
                     }
                 }
             } else {
@@ -1201,33 +1140,31 @@ mod tests {
     }
 
     fn test_orchestrator() -> Orchestrator {
-        let client = Arc::new(GeminiClient::new("key".into(), "model".into()));
-        Orchestrator::new(
-            client,
-            crate::mode::Mode::Explore,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        )
+        Orchestrator::new(OrchestratorConfig {
+            client: Arc::new(GeminiClient::new("key".into(), "model".into())),
+            mode: crate::mode::Mode::Explore,
+            working_directory: PathBuf::from("/tmp"),
+            max_output_tokens: 8192,
+            approval_handler: test_handler(),
+            personality: Personality::default(),
+            context_window_turns: 50,
+            sandbox: mock_sandbox(),
+            protected_paths: vec![],
+        })
     }
 
     fn test_plan_orchestrator() -> Orchestrator {
-        let client = Arc::new(GeminiClient::new("key".into(), "model".into()));
-        Orchestrator::new(
-            client,
-            crate::mode::Mode::Plan,
-            PathBuf::from("/tmp"),
-            8192,
-            test_handler(),
-            Personality::default(),
-            50,
-            mock_sandbox(),
-            vec![],
-        )
+        Orchestrator::new(OrchestratorConfig {
+            client: Arc::new(GeminiClient::new("key".into(), "model".into())),
+            mode: crate::mode::Mode::Plan,
+            working_directory: PathBuf::from("/tmp"),
+            max_output_tokens: 8192,
+            approval_handler: test_handler(),
+            personality: Personality::default(),
+            context_window_turns: 50,
+            sandbox: mock_sandbox(),
+            protected_paths: vec![],
+        })
     }
 
     #[tokio::test]
@@ -1375,8 +1312,7 @@ mod tests {
     #[tokio::test]
     async fn slash_personality_switch() {
         let mut orch = test_orchestrator();
-        let result =
-            handle_slash_command("/personality friendly", &mut orch).await;
+        let result = handle_slash_command("/personality friendly", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
         assert_eq!(orch.personality(), Personality::Friendly);
     }
@@ -1509,10 +1445,7 @@ mod tests {
     fn test_orchestrator_sandbox_mode() {
         let orch = test_orchestrator();
         // MockSandbox defaults to FullAccess
-        assert_eq!(
-            orch.sandbox_mode(),
-            crate::sandbox::SandboxMode::FullAccess
-        );
+        assert_eq!(orch.sandbox_mode(), crate::sandbox::SandboxMode::FullAccess);
     }
 
     #[test]
@@ -1572,10 +1505,7 @@ mod tests {
     async fn slash_history_with_turns() {
         let mut orch = test_orchestrator();
         // Manually add some history through set_history
-        orch.set_history(vec![
-            Content::user("hello"),
-            Content::model("hi"),
-        ]);
+        orch.set_history(vec![Content::user("hello"), Content::model("hi")]);
         let result = handle_slash_command("/history 5", &mut orch).await;
         assert!(matches!(result, SlashResult::Continue));
     }

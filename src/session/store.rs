@@ -62,8 +62,7 @@ impl SessionStore {
             ));
         }
 
-        let file =
-            std::fs::File::open(&path).map_err(crate::error::ClosedCodeError::Io)?;
+        let file = std::fs::File::open(&path).map_err(crate::error::ClosedCodeError::Io)?;
         let reader = std::io::BufReader::new(file);
         let mut events = Vec::new();
 
@@ -88,8 +87,8 @@ impl SessionStore {
         self.ensure_dir()?;
         let mut sessions = Vec::new();
 
-        let entries = std::fs::read_dir(&self.sessions_dir)
-            .map_err(crate::error::ClosedCodeError::Io)?;
+        let entries =
+            std::fs::read_dir(&self.sessions_dir).map_err(crate::error::ClosedCodeError::Io)?;
 
         for entry in entries {
             let entry = entry.map_err(crate::error::ClosedCodeError::Io)?;
@@ -197,8 +196,8 @@ impl SessionStore {
         let prefix_lower = prefix.to_lowercase().replace('-', "");
         let mut matches = Vec::new();
 
-        for entry in std::fs::read_dir(&self.sessions_dir)
-            .map_err(crate::error::ClosedCodeError::Io)?
+        for entry in
+            std::fs::read_dir(&self.sessions_dir).map_err(crate::error::ClosedCodeError::Io)?
         {
             let entry = entry.map_err(crate::error::ClosedCodeError::Io)?;
             let path = entry.path();
@@ -236,7 +235,6 @@ impl SessionStore {
         let start_idx = events
             .iter()
             .rposition(|e| matches!(e, SessionEvent::Compact { .. }))
-            .map(|idx| idx) // Start from the compact event itself
             .unwrap_or(0);
 
         let mut history = Vec::new();
@@ -272,9 +270,7 @@ impl SessionStore {
                         response: serde_json::json!({"result": result}),
                     }]));
                 }
-                SessionEvent::ImageAttached {
-                    mime_type, ..
-                } => {
+                SessionEvent::ImageAttached { mime_type, .. } => {
                     history.push(Content {
                         role: Some("user".into()),
                         parts: vec![Part::InlineData {
@@ -388,7 +384,10 @@ mod tests {
         // Append a malformed line
         let path = store.session_path(&id);
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         writeln!(f, "{{invalid json}}").unwrap();
 
         let msg = SessionEvent::UserMessage {

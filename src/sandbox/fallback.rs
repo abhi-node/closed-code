@@ -29,12 +29,7 @@ impl FallbackSandbox {
 
 #[async_trait]
 impl Sandbox for FallbackSandbox {
-    async fn execute_command(
-        &self,
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-    ) -> Result<Output> {
+    async fn execute_command(&self, command: &str, args: &[String], cwd: &Path) -> Result<Output> {
         Command::new(command)
             .args(args)
             .current_dir(cwd)

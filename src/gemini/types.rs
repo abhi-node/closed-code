@@ -672,7 +672,10 @@ mod tests {
         }"#;
         let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.text(), Some("Hello!"));
-        assert_eq!(response.candidates[0].finish_reason.as_deref(), Some("STOP"));
+        assert_eq!(
+            response.candidates[0].finish_reason.as_deref(),
+            Some("STOP")
+        );
         let usage = response.usage_metadata.unwrap();
         assert_eq!(usage.prompt_token_count, Some(10));
         assert_eq!(usage.candidates_token_count, Some(5));
@@ -730,7 +733,10 @@ mod tests {
                     schema_type: "object".into(),
                     properties: {
                         let mut map = serde_json::Map::new();
-                        map.insert("path".into(), serde_json::json!({"type": "string", "description": "File path"}));
+                        map.insert(
+                            "path".into(),
+                            serde_json::json!({"type": "string", "description": "File path"}),
+                        );
                         map
                     },
                     required: Some(vec!["path".into()]),
@@ -753,9 +759,18 @@ mod tests {
             schema_type: "object".into(),
             properties: {
                 let mut map = serde_json::Map::new();
-                map.insert("name".into(), serde_json::json!({"type": "string", "description": "Name"}));
-                map.insert("count".into(), serde_json::json!({"type": "integer", "description": "Count"}));
-                map.insert("verbose".into(), serde_json::json!({"type": "boolean", "description": "Verbose"}));
+                map.insert(
+                    "name".into(),
+                    serde_json::json!({"type": "string", "description": "Name"}),
+                );
+                map.insert(
+                    "count".into(),
+                    serde_json::json!({"type": "integer", "description": "Count"}),
+                );
+                map.insert(
+                    "verbose".into(),
+                    serde_json::json!({"type": "boolean", "description": "Verbose"}),
+                );
                 map
             },
             required: Some(vec!["name".into()]),
@@ -815,7 +830,10 @@ mod tests {
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("tools").is_some());
         assert!(json.get("toolConfig").is_some());
-        assert_eq!(json["tools"][0]["functionDeclarations"][0]["name"], "test_tool");
+        assert_eq!(
+            json["tools"][0]["functionDeclarations"][0]["name"],
+            "test_tool"
+        );
         assert_eq!(json["toolConfig"]["functionCallingConfig"]["mode"], "AUTO");
     }
 
@@ -827,7 +845,9 @@ mod tests {
         }]);
         assert_eq!(content.role.as_deref(), Some("user"));
         assert_eq!(content.parts.len(), 1);
-        assert!(matches!(&content.parts[0], Part::FunctionResponse { name, .. } if name == "read_file"));
+        assert!(
+            matches!(&content.parts[0], Part::FunctionResponse { name, .. } if name == "read_file")
+        );
     }
 
     #[test]
@@ -925,19 +945,17 @@ mod tests {
             contents: vec![Content::user("test")],
             system_instruction: None,
             generation_config: None,
-            tools: Some(vec![
-                GeminiTool::Functions(ToolDefinition {
-                    function_declarations: vec![FunctionDeclaration {
-                        name: "grep".into(),
-                        description: "Search".into(),
-                        parameters: Parameters {
-                            schema_type: "object".into(),
-                            properties: serde_json::Map::new(),
-                            required: None,
-                        },
-                    }],
-                }),
-            ]),
+            tools: Some(vec![GeminiTool::Functions(ToolDefinition {
+                function_declarations: vec![FunctionDeclaration {
+                    name: "grep".into(),
+                    description: "Search".into(),
+                    parameters: Parameters {
+                        schema_type: "object".into(),
+                        properties: serde_json::Map::new(),
+                        required: None,
+                    },
+                }],
+            })]),
             tool_config: None,
         };
         let json = serde_json::to_value(&request).unwrap();

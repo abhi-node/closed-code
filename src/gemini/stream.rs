@@ -242,7 +242,10 @@ mod tests {
 
     #[test]
     fn strip_array_artifacts_clean() {
-        assert_eq!(strip_array_artifacts(r#"{"key": "value"}"#), r#"{"key": "value"}"#);
+        assert_eq!(
+            strip_array_artifacts(r#"{"key": "value"}"#),
+            r#"{"key": "value"}"#
+        );
     }
 
     #[test]

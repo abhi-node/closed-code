@@ -66,16 +66,8 @@ impl Tool for WriteFileTool {
             name: self.name().into(),
             description: self.description().into(),
             parameters: ParamBuilder::new()
-                .string(
-                    "path",
-                    "File path relative to working directory",
-                    true,
-                )
-                .string(
-                    "content",
-                    "The complete file content to write",
-                    true,
-                )
+                .string("path", "File path relative to working directory", true)
+                .string("content", "The complete file content to write", true)
                 .build(),
         }
     }
@@ -106,12 +98,13 @@ impl Tool for WriteFileTool {
 
         // Read existing content if file exists
         let (old_content, is_new_file) = if resolved.exists() {
-            let existing = fs::read_to_string(&resolved).await.map_err(|e| {
-                ClosedCodeError::ToolError {
-                    name: "write_file".into(),
-                    message: format!("Cannot read existing file '{}': {}", path_str, e),
-                }
-            })?;
+            let existing =
+                fs::read_to_string(&resolved)
+                    .await
+                    .map_err(|e| ClosedCodeError::ToolError {
+                        name: "write_file".into(),
+                        message: format!("Cannot read existing file '{}': {}", path_str, e),
+                    })?;
             (existing, false)
         } else {
             (String::new(), true)
@@ -141,24 +134,24 @@ impl Tool for WriteFileTool {
             ApprovalDecision::Approved => {
                 // Create parent directories if needed
                 if let Some(parent) = resolved.parent() {
-                    fs::create_dir_all(parent).await.map_err(|e| {
-                        ClosedCodeError::ToolError {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| ClosedCodeError::ToolError {
                             name: "write_file".into(),
                             message: format!(
                                 "Cannot create directory '{}': {}",
                                 parent.display(),
                                 e
                             ),
-                        }
-                    })?;
+                        })?;
                 }
 
-                fs::write(&resolved, content).await.map_err(|e| {
-                    ClosedCodeError::ToolError {
+                fs::write(&resolved, content)
+                    .await
+                    .map_err(|e| ClosedCodeError::ToolError {
                         name: "write_file".into(),
                         message: format!("Cannot write to '{}': {}", path_str, e),
-                    }
-                })?;
+                    })?;
 
                 let action = if is_new_file { "created" } else { "updated" };
                 tracing::info!("File {}: {}", action, path_str);
@@ -313,7 +306,10 @@ mod tests {
     fn write_available_modes() {
         let (dir, handler) = setup();
         let tool = WriteFileTool::new(dir.path().to_path_buf(), handler, vec![]);
-        assert_eq!(tool.available_modes(), vec![Mode::Guided, Mode::Execute, Mode::Auto]);
+        assert_eq!(
+            tool.available_modes(),
+            vec![Mode::Guided, Mode::Execute, Mode::Auto]
+        );
     }
 
     #[test]

@@ -59,6 +59,9 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
     match state {
         AppState::Idle => map_idle(key),
         AppState::CommandPicker { .. } => map_picker(key),
+        AppState::Thinking => map_thinking(key),
+        AppState::Streaming => map_streaming(key),
+        AppState::ToolExecuting { .. } => map_thinking(key),
         AppState::Exiting => Action::Noop,
     }
 }
@@ -66,9 +69,7 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
 fn map_idle(key: KeyEvent) -> Action {
     match (key.code, key.modifiers) {
         // Submit
-        (KeyCode::Enter, m)
-            if !m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-        {
+        (KeyCode::Enter, m) if !m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
             Action::Submit
         }
 
@@ -100,6 +101,20 @@ fn map_idle(key: KeyEvent) -> Action {
         // Printable characters
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => Action::InsertChar(c),
 
+        _ => Action::Noop,
+    }
+}
+
+/// While thinking or executing tools, only global keys (Cancel/Exit) work.
+fn map_thinking(_key: KeyEvent) -> Action {
+    Action::Noop
+}
+
+/// While streaming, allow scroll keys plus globals.
+fn map_streaming(key: KeyEvent) -> Action {
+    match (key.code, key.modifiers) {
+        (KeyCode::PageUp, _) => Action::PageUp,
+        (KeyCode::PageDown, _) => Action::PageDown,
         _ => Action::Noop,
     }
 }
@@ -220,10 +235,7 @@ mod tests {
             filter: String::new(),
             selected: 0,
         };
-        assert_eq!(
-            map_key(key(KeyCode::Esc), &state),
-            Action::PickerDismiss
-        );
+        assert_eq!(map_key(key(KeyCode::Esc), &state), Action::PickerDismiss);
     }
 
     #[test]
@@ -246,5 +258,50 @@ mod tests {
         };
         assert_eq!(map_key(key(KeyCode::Up), &state), Action::PickerUp);
         assert_eq!(map_key(key(KeyCode::Down), &state), Action::PickerDown);
+    }
+
+    #[test]
+    fn thinking_ignores_regular_keys() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('a')), &AppState::Thinking),
+            Action::Noop
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Enter), &AppState::Thinking),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn thinking_allows_cancel() {
+        assert_eq!(map_key(ctrl('c'), &AppState::Thinking), Action::Cancel);
+    }
+
+    #[test]
+    fn streaming_allows_page_scroll() {
+        assert_eq!(
+            map_key(key(KeyCode::PageUp), &AppState::Streaming),
+            Action::PageUp
+        );
+        assert_eq!(
+            map_key(key(KeyCode::PageDown), &AppState::Streaming),
+            Action::PageDown
+        );
+    }
+
+    #[test]
+    fn streaming_ignores_regular_keys() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('a')), &AppState::Streaming),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn tool_executing_ignores_keys() {
+        let state = AppState::ToolExecuting {
+            tool_name: "read_file".into(),
+        };
+        assert_eq!(map_key(key(KeyCode::Char('a')), &state), Action::Noop);
     }
 }

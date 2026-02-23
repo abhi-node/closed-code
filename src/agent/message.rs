@@ -1,5 +1,11 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Callback invoked by sub-agents when they execute a tool.
+/// Parameters: (tool_name, args_display).
+pub type ToolProgressFn = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Request sent to a sub-agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,10 +94,7 @@ mod tests {
 
     #[test]
     fn agent_request_new() {
-        let req = AgentRequest::new(
-            "Analyze the error handling".into(),
-            "/tmp/project".into(),
-        );
+        let req = AgentRequest::new("Analyze the error handling".into(), "/tmp/project".into());
         assert_eq!(req.task, "Analyze the error handling");
         assert_eq!(req.working_directory, "/tmp/project");
         assert!(req.context.is_empty());

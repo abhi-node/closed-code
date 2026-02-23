@@ -61,10 +61,14 @@ impl Default for TerminalApprovalHandler {
 #[async_trait]
 impl ApprovalHandler for TerminalApprovalHandler {
     async fn request_approval(&self, change: &FileChange) -> Result<ApprovalDecision> {
-        use crossterm::style::Stylize;
         use crate::ui::theme::Theme;
+        use crossterm::style::Stylize;
 
-        let operation = if change.is_new_file { "CREATE" } else { "MODIFY" };
+        let operation = if change.is_new_file {
+            "CREATE"
+        } else {
+            "MODIFY"
+        };
 
         // Print header banner with full resolved path
         println!();
@@ -77,11 +81,7 @@ impl ApprovalHandler for TerminalApprovalHandler {
         println!();
 
         // Display the colorized diff
-        crate::ui::diff::display_diff(
-            &change.file_path,
-            &change.old_content,
-            &change.new_content,
-        );
+        crate::ui::diff::display_diff(&change.file_path, &change.old_content, &change.new_content);
 
         // Prompt user on a blocking thread (dialoguer blocks stdin)
         let approved = tokio::task::spawn_blocking(|| {
@@ -164,10 +164,14 @@ impl Default for DiffOnlyApprovalHandler {
 #[async_trait]
 impl ApprovalHandler for DiffOnlyApprovalHandler {
     async fn request_approval(&self, change: &FileChange) -> Result<ApprovalDecision> {
-        use crossterm::style::Stylize;
         use crate::ui::theme::Theme;
+        use crossterm::style::Stylize;
 
-        let operation = if change.is_new_file { "CREATE" } else { "MODIFY" };
+        let operation = if change.is_new_file {
+            "CREATE"
+        } else {
+            "MODIFY"
+        };
 
         // Print header banner (same style as TerminalApprovalHandler)
         println!();
@@ -180,11 +184,7 @@ impl ApprovalHandler for DiffOnlyApprovalHandler {
         println!();
 
         // Display the colorized diff
-        crate::ui::diff::display_diff(
-            &change.file_path,
-            &change.old_content,
-            &change.new_content,
-        );
+        crate::ui::diff::display_diff(&change.file_path, &change.old_content, &change.new_content);
 
         // Auto-approve without prompting
         println!(

@@ -14,8 +14,8 @@ use super::{ParamBuilder, Tool};
 /// Commands allowed to be executed.
 /// Read-only and informational commands only.
 const ALLOWED_COMMANDS: &[&str] = &[
-    "ls", "cat", "head", "tail", "find", "grep", "rg", "wc", "file", "tree", "pwd", "which",
-    "git", "cargo", "rustc", "echo", "sort", "uniq", "diff",
+    "ls", "cat", "head", "tail", "find", "grep", "rg", "wc", "file", "tree", "pwd", "which", "git",
+    "cargo", "rustc", "echo", "sort", "uniq", "diff",
 ];
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -123,13 +123,12 @@ impl Tool for ShellCommandTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        let command_str =
-            args["command"]
-                .as_str()
-                .ok_or_else(|| ClosedCodeError::ToolError {
-                    name: "shell".into(),
-                    message: "Missing required parameter 'command'".into(),
-                })?;
+        let command_str = args["command"]
+            .as_str()
+            .ok_or_else(|| ClosedCodeError::ToolError {
+                name: "shell".into(),
+                message: "Missing required parameter 'command'".into(),
+            })?;
 
         let (cmd, cmd_args) = if self.bypass_allowlist {
             Self::parse_without_validation(command_str)?
@@ -215,8 +214,7 @@ mod tests {
 
     #[test]
     fn shell_parse_and_validate_quoted() {
-        let (cmd, args) =
-            ShellCommandTool::parse_and_validate("git log --format='%H %s'").unwrap();
+        let (cmd, args) = ShellCommandTool::parse_and_validate("git log --format='%H %s'").unwrap();
         assert_eq!(cmd, "git");
         assert_eq!(args, vec!["log", "--format=%H %s"]);
     }
@@ -235,10 +233,7 @@ mod tests {
     fn shell_parse_and_validate_empty() {
         let result = ShellCommandTool::parse_and_validate("");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Empty command"));
+        assert!(result.unwrap_err().to_string().contains("Empty command"));
     }
 
     #[test]
@@ -269,22 +264,26 @@ mod tests {
 
     #[test]
     fn shell_tool_trait_methods() {
-        let sandbox: Arc<dyn Sandbox> =
-            Arc::new(MockSandbox::new(PathBuf::from("/tmp")));
+        let sandbox: Arc<dyn Sandbox> = Arc::new(MockSandbox::new(PathBuf::from("/tmp")));
         let tool = ShellCommandTool::new(PathBuf::from("/tmp"), sandbox);
         assert_eq!(tool.name(), "shell");
         assert!(tool.description().contains("allowlisted"));
         assert_eq!(tool.declaration().name, "shell");
         assert_eq!(
             tool.available_modes(),
-            vec![Mode::Explore, Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto]
+            vec![
+                Mode::Explore,
+                Mode::Plan,
+                Mode::Guided,
+                Mode::Execute,
+                Mode::Auto
+            ]
         );
     }
 
     #[test]
     fn shell_bypass_description() {
-        let sandbox: Arc<dyn Sandbox> =
-            Arc::new(MockSandbox::new(PathBuf::from("/tmp")));
+        let sandbox: Arc<dyn Sandbox> = Arc::new(MockSandbox::new(PathBuf::from("/tmp")));
         let tool = ShellCommandTool::with_bypass_allowlist(PathBuf::from("/tmp"), sandbox);
         assert!(tool.description().contains("without restrictions"));
         assert!(!tool.description().contains("allowlisted"));

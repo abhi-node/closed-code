@@ -177,7 +177,9 @@ mod tests {
         assert!(!sha.is_empty());
 
         // c.txt should still be untracked
-        let status = run_git(dir.path(), &["status", "--porcelain"]).await.unwrap();
+        let status = run_git(dir.path(), &["status", "--porcelain"])
+            .await
+            .unwrap();
         assert!(status.contains("c.txt"));
         assert!(!status.contains("b.txt"));
     }
@@ -217,7 +219,9 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
         commit_all(dir.path(), "my specific message").await.unwrap();
 
-        let log = run_git(dir.path(), &["log", "-1", "--format=%s"]).await.unwrap();
+        let log = run_git(dir.path(), &["log", "-1", "--format=%s"])
+            .await
+            .unwrap();
         assert_eq!(log, "my specific message");
     }
 

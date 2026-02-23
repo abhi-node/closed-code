@@ -1,11 +1,14 @@
 pub mod app;
+pub mod chat;
 pub mod command_picker;
+pub mod commands;
 pub mod events;
 pub mod gauge;
 pub mod header;
 pub mod input;
 pub mod keybindings;
 pub mod layout;
+pub mod message;
 pub mod status_bar;
 pub mod theme;
 

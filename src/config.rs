@@ -12,21 +12,16 @@ use crate::sandbox::SandboxMode;
 // ── Personality ──
 
 /// Personality style that modifies the system prompt prefix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Personality {
     /// Warm, encouraging, casual language.
     Friendly,
     /// Direct, concise, code-focused.
+    #[default]
     Pragmatic,
     /// Minimal personality, just answers.
     None,
-}
-
-impl Default for Personality {
-    fn default() -> Self {
-        Self::Pragmatic
-    }
 }
 
 impl fmt::Display for Personality {
@@ -244,8 +239,9 @@ impl Config {
     fn load_toml_file(path: &Path) -> crate::error::Result<Option<TomlConfig>> {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
-                let config: TomlConfig = toml::from_str(&contents)
-                    .map_err(|e| ClosedCodeError::ConfigError(format!("{}: {}", path.display(), e)))?;
+                let config: TomlConfig = toml::from_str(&contents).map_err(|e| {
+                    ClosedCodeError::ConfigError(format!("{}: {}", path.display(), e))
+                })?;
                 Ok(Some(config))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -394,10 +390,7 @@ additional_allowlist = ["docker", "cargo"]
         assert_eq!(config.max_output_tokens, Some(4096));
         assert_eq!(config.verbose, Some(true));
         let shell = config.shell.unwrap();
-        assert_eq!(
-            shell.additional_allowlist.unwrap(),
-            vec!["docker", "cargo"]
-        );
+        assert_eq!(shell.additional_allowlist.unwrap(), vec!["docker", "cargo"]);
     }
 
     #[test]
@@ -442,10 +435,19 @@ additional_allowlist = ["docker", "cargo"]
 
     #[test]
     fn personality_from_str() {
-        assert_eq!("friendly".parse::<Personality>().unwrap(), Personality::Friendly);
-        assert_eq!("pragmatic".parse::<Personality>().unwrap(), Personality::Pragmatic);
+        assert_eq!(
+            "friendly".parse::<Personality>().unwrap(),
+            Personality::Friendly
+        );
+        assert_eq!(
+            "pragmatic".parse::<Personality>().unwrap(),
+            Personality::Pragmatic
+        );
         assert_eq!("none".parse::<Personality>().unwrap(), Personality::None);
-        assert_eq!("FRIENDLY".parse::<Personality>().unwrap(), Personality::Friendly);
+        assert_eq!(
+            "FRIENDLY".parse::<Personality>().unwrap(),
+            Personality::Friendly
+        );
     }
 
     #[test]

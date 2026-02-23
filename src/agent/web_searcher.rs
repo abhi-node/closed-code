@@ -49,11 +49,7 @@ impl Agent for WebSearchAgent {
         1 // Single request-response
     }
 
-    async fn run(
-        &self,
-        client: &GeminiClient,
-        request: AgentRequest,
-    ) -> Result<AgentResponse> {
+    async fn run(&self, client: &GeminiClient, request: AgentRequest) -> Result<AgentResponse> {
         let mut user_message = format!("Research topic: {}\n", request.task);
         if !request.context.is_empty() {
             user_message.push_str("\nContext:\n");

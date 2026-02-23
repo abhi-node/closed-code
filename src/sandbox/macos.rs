@@ -126,12 +126,7 @@ impl SeatbeltSandbox {
 
 #[async_trait]
 impl Sandbox for SeatbeltSandbox {
-    async fn execute_command(
-        &self,
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-    ) -> Result<Output> {
+    async fn execute_command(&self, command: &str, args: &[String], cwd: &Path) -> Result<Output> {
         // Resolve the full path of the command for sandbox-exec
         let resolved_cmd = Self::resolve_command(command)?;
 
@@ -183,23 +178,20 @@ mod tests {
 
     #[test]
     fn seatbelt_workspace_only_profile_contains_deny_network() {
-        let profile =
-            SeatbeltSandbox::workspace_only_profile(Path::new("/Users/me/project"));
+        let profile = SeatbeltSandbox::workspace_only_profile(Path::new("/Users/me/project"));
         assert!(profile.contains("(deny network*)"));
     }
 
     #[test]
     fn seatbelt_workspace_write_profile_allows_network() {
-        let profile =
-            SeatbeltSandbox::workspace_write_profile(Path::new("/Users/me/project"));
+        let profile = SeatbeltSandbox::workspace_write_profile(Path::new("/Users/me/project"));
         assert!(profile.contains("(allow network*)"));
         assert!(!profile.contains("(deny network*)"));
     }
 
     #[test]
     fn seatbelt_workspace_only_profile_restricts_reads() {
-        let profile =
-            SeatbeltSandbox::workspace_only_profile(Path::new("/Users/me/project"));
+        let profile = SeatbeltSandbox::workspace_only_profile(Path::new("/Users/me/project"));
         // Should NOT have a blanket allow file-read*
         // Should have specific subpath reads
         assert!(profile.contains(r#"(allow file-read* (subpath "/Users/me/project"))"#));
@@ -209,15 +201,13 @@ mod tests {
 
     #[test]
     fn seatbelt_workspace_write_profile_allows_reads() {
-        let profile =
-            SeatbeltSandbox::workspace_write_profile(Path::new("/Users/me/project"));
+        let profile = SeatbeltSandbox::workspace_write_profile(Path::new("/Users/me/project"));
         assert!(profile.contains("(allow file-read*)"));
     }
 
     #[test]
     fn seatbelt_profile_includes_workspace_path() {
-        let profile =
-            SeatbeltSandbox::workspace_only_profile(Path::new("/my/custom/path"));
+        let profile = SeatbeltSandbox::workspace_only_profile(Path::new("/my/custom/path"));
         assert!(profile.contains("/my/custom/path"));
     }
 

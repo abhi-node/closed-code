@@ -59,10 +59,7 @@ pub async fn branch_diff(working_dir: &Path, base_branch: &str) -> Result<String
         Some(base) => run_git_diff(working_dir, &[&base, "HEAD"]).await,
         None => Err(ClosedCodeError::ToolError {
             name: "git".into(),
-            message: format!(
-                "Cannot find merge base between HEAD and '{}'",
-                base_branch
-            ),
+            message: format!("Cannot find merge base between HEAD and '{}'", base_branch),
         }),
     }
 }

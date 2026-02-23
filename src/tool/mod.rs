@@ -33,7 +33,13 @@ pub trait Tool: Send + Sync + Debug {
     /// Which modes this tool is available in.
     /// Default: all modes (Explore, Plan, Guided, Execute, Auto).
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Explore, Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto]
+        vec![
+            Mode::Explore,
+            Mode::Plan,
+            Mode::Guided,
+            Mode::Execute,
+            Mode::Auto,
+        ]
     }
 }
 
@@ -305,7 +311,10 @@ mod tests {
     fn additional_paths_nested() {
         let additional = vec!["config/secrets".to_string()];
         assert!(is_protected_path("config/secrets", &additional));
-        assert!(is_protected_path("config/secrets/deep/file.txt", &additional));
+        assert!(is_protected_path(
+            "config/secrets/deep/file.txt",
+            &additional
+        ));
         assert!(!is_protected_path("config/other.txt", &additional));
     }
 }

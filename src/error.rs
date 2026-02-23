@@ -193,25 +193,13 @@ mod tests {
     #[test]
     fn from_status_500_creates_api_error() {
         let err = ClosedCodeError::from_status(500, "server error".into());
-        assert!(matches!(
-            err,
-            ClosedCodeError::ApiError {
-                status: 500,
-                ..
-            }
-        ));
+        assert!(matches!(err, ClosedCodeError::ApiError { status: 500, .. }));
     }
 
     #[test]
     fn from_status_400_creates_api_error() {
         let err = ClosedCodeError::from_status(400, "bad request".into());
-        assert!(matches!(
-            err,
-            ClosedCodeError::ApiError {
-                status: 400,
-                ..
-            }
-        ));
+        assert!(matches!(err, ClosedCodeError::ApiError { status: 400, .. }));
     }
 
     #[test]
@@ -233,13 +221,25 @@ mod tests {
     fn tool_errors_are_not_retryable() {
         let errors: Vec<ClosedCodeError> = vec![
             ClosedCodeError::ToolNotFound { name: "x".into() },
-            ClosedCodeError::ToolError { name: "x".into(), message: "fail".into() },
+            ClosedCodeError::ToolError {
+                name: "x".into(),
+                message: "fail".into(),
+            },
             ClosedCodeError::ToolLoopMaxIterations { max: 10 },
-            ClosedCodeError::ShellNotAllowed { command: "rm".into(), allowed: "ls".into() },
+            ClosedCodeError::ShellNotAllowed {
+                command: "rm".into(),
+                allowed: "ls".into(),
+            },
             ClosedCodeError::ShellError("fail".into()),
             ClosedCodeError::ShellTimeout { seconds: 30 },
-            ClosedCodeError::FileTooLarge { path: "big".into(), size_bytes: 200000, max_bytes: 100000 },
-            ClosedCodeError::BinaryFile { path: "a.out".into() },
+            ClosedCodeError::FileTooLarge {
+                path: "big".into(),
+                size_bytes: 200000,
+                max_bytes: 100000,
+            },
+            ClosedCodeError::BinaryFile {
+                path: "a.out".into(),
+            },
             ClosedCodeError::GlobError("bad".into()),
             ClosedCodeError::RegexError("bad".into()),
         ];
@@ -251,10 +251,19 @@ mod tests {
     #[test]
     fn agent_errors_are_not_retryable() {
         let errors: Vec<ClosedCodeError> = vec![
-            ClosedCodeError::AgentError { agent_id: "explorer".into(), message: "fail".into() },
-            ClosedCodeError::AgentTimeout { agent_id: "explorer".into(), seconds: 120 },
+            ClosedCodeError::AgentError {
+                agent_id: "explorer".into(),
+                message: "fail".into(),
+            },
+            ClosedCodeError::AgentTimeout {
+                agent_id: "explorer".into(),
+                seconds: 120,
+            },
             ClosedCodeError::OrchestratorMaxIterations { max: 30 },
-            ClosedCodeError::SubAgentMaxIterations { agent_id: "planner".into(), max: 15 },
+            ClosedCodeError::SubAgentMaxIterations {
+                agent_id: "planner".into(),
+                max: 15,
+            },
         ];
         for err in &errors {
             assert!(!err.is_retryable(), "Expected not retryable: {err}");
@@ -264,7 +273,9 @@ mod tests {
     #[test]
     fn phase4_errors_are_not_retryable() {
         let errors: Vec<ClosedCodeError> = vec![
-            ClosedCodeError::ProtectedPath { path: ".git/config".into() },
+            ClosedCodeError::ProtectedPath {
+                path: ".git/config".into(),
+            },
             ClosedCodeError::ApprovalError("prompt failed".into()),
         ];
         for err in &errors {
@@ -298,7 +309,10 @@ mod tests {
     #[test]
     fn phase4_error_display_messages() {
         assert_eq!(
-            ClosedCodeError::ProtectedPath { path: ".git/config".into() }.to_string(),
+            ClosedCodeError::ProtectedPath {
+                path: ".git/config".into()
+            }
+            .to_string(),
             "Cannot modify protected path: .git/config"
         );
         assert_eq!(
@@ -310,11 +324,18 @@ mod tests {
     #[test]
     fn tool_error_display_messages() {
         assert_eq!(
-            ClosedCodeError::ToolNotFound { name: "read_file".into() }.to_string(),
+            ClosedCodeError::ToolNotFound {
+                name: "read_file".into()
+            }
+            .to_string(),
             "Tool 'read_file' not found in registry"
         );
         assert_eq!(
-            ClosedCodeError::ToolError { name: "grep".into(), message: "bad regex".into() }.to_string(),
+            ClosedCodeError::ToolError {
+                name: "grep".into(),
+                message: "bad regex".into()
+            }
+            .to_string(),
             "Tool 'grep' execution failed: bad regex"
         );
         assert_eq!(
@@ -322,7 +343,11 @@ mod tests {
             "Tool-call loop exceeded max iterations (10)"
         );
         assert_eq!(
-            ClosedCodeError::ShellNotAllowed { command: "rm".into(), allowed: "ls, cat".into() }.to_string(),
+            ClosedCodeError::ShellNotAllowed {
+                command: "rm".into(),
+                allowed: "ls, cat".into()
+            }
+            .to_string(),
             "Command 'rm' is not in the allowlist. Allowed: ls, cat"
         );
         assert_eq!(
@@ -334,11 +359,19 @@ mod tests {
             "Shell command timed out after 30s"
         );
         assert_eq!(
-            ClosedCodeError::FileTooLarge { path: "big.bin".into(), size_bytes: 200000, max_bytes: 100000 }.to_string(),
+            ClosedCodeError::FileTooLarge {
+                path: "big.bin".into(),
+                size_bytes: 200000,
+                max_bytes: 100000
+            }
+            .to_string(),
             "File too large (200000 bytes, max 100000): big.bin"
         );
         assert_eq!(
-            ClosedCodeError::BinaryFile { path: "a.out".into() }.to_string(),
+            ClosedCodeError::BinaryFile {
+                path: "a.out".into()
+            }
+            .to_string(),
             "Binary file detected: a.out"
         );
         assert_eq!(

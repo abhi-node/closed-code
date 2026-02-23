@@ -2,7 +2,7 @@ use clap::Parser;
 
 use closed_code::cli::{Cli, Commands};
 use closed_code::config::Config;
-use closed_code::repl::{run_oneshot, run_repl, run_resume};
+use closed_code::repl::{run_oneshot, run_resume};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::message::{AgentResponse, Artifact, ArtifactType};
+use crate::agent::message::{AgentResponse, Artifact, ArtifactType, ToolProgressFn};
 use crate::agent::{Agent, AgentRequest};
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::types::*;
@@ -33,10 +33,18 @@ are communicated back. Do not simply respond with text — always use create_rep
 Be thorough but efficient. Focus on answering the specific task, not exploring everything. \
 Include relevant code snippets in your report as artifacts.";
 
-#[derive(Debug)]
 pub struct ExplorerAgent {
     working_directory: PathBuf,
     sandbox: Arc<dyn Sandbox>,
+    on_tool_progress: Option<ToolProgressFn>,
+}
+
+impl std::fmt::Debug for ExplorerAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExplorerAgent")
+            .field("working_directory", &self.working_directory)
+            .finish()
+    }
 }
 
 impl ExplorerAgent {
@@ -44,7 +52,13 @@ impl ExplorerAgent {
         Self {
             working_directory,
             sandbox,
+            on_tool_progress: None,
         }
+    }
+
+    pub fn with_progress(mut self, f: ToolProgressFn) -> Self {
+        self.on_tool_progress = Some(f);
+        self
     }
 
     /// Run the sub-agent's tool-call loop.
@@ -57,7 +71,8 @@ impl ExplorerAgent {
         tools: Option<Vec<GeminiTool>>,
         tool_config: Option<ToolConfig>,
     ) -> Result<Option<AgentResponse>> {
-        let registry = create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
+        let registry =
+            create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
 
         for iteration in 0..self.max_iterations() {
             tracing::debug!(
@@ -132,7 +147,9 @@ impl ExplorerAgent {
             for (name, args) in &function_calls {
                 // Check if this is a create_report call — intercept and extract
                 if name == "create_report" {
-                    println!("│  \u{2713} create_report(...)");
+                    if let Some(ref cb) = self.on_tool_progress {
+                        cb("create_report", "...");
+                    }
                     let report = Self::extract_report(args)?;
                     return Ok(Some(report));
                 }
@@ -145,7 +162,9 @@ impl ExplorerAgent {
                         serde_json::json!({"error": e.to_string()})
                     }
                 };
-                println!("│  \u{2713} {}", display);
+                if let Some(ref cb) = self.on_tool_progress {
+                    cb(name, &display);
+                }
 
                 response_parts.push(Part::FunctionResponse {
                     name: name.clone(),
@@ -238,12 +257,9 @@ impl Agent for ExplorerAgent {
         EXPLORER_MAX_ITERATIONS
     }
 
-    async fn run(
-        &self,
-        client: &GeminiClient,
-        request: AgentRequest,
-    ) -> Result<AgentResponse> {
-        let registry = create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
+    async fn run(&self, client: &GeminiClient, request: AgentRequest) -> Result<AgentResponse> {
+        let registry =
+            create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
         let tools = registry.to_gemini_tools(&crate::mode::Mode::Explore);
         let tool_config = Some(ToolRegistry::tool_config());
         let system_instruction = Content::system(self.system_prompt());
@@ -266,13 +282,7 @@ impl Agent for ExplorerAgent {
         // Run with timeout
         let result = tokio::time::timeout(
             Duration::from_secs(EXPLORER_TIMEOUT_SECS),
-            self.run_subagent_loop(
-                client,
-                &mut history,
-                system_instruction,
-                tools,
-                tool_config,
-            ),
+            self.run_subagent_loop(client, &mut history, system_instruction, tools, tool_config),
         )
         .await
         .map_err(|_| ClosedCodeError::AgentTimeout {

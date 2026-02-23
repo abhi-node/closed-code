@@ -73,7 +73,13 @@ mod tests {
 
     #[test]
     fn display_roundtrip() {
-        for mode in [Mode::Explore, Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto] {
+        for mode in [
+            Mode::Explore,
+            Mode::Plan,
+            Mode::Guided,
+            Mode::Execute,
+            Mode::Auto,
+        ] {
             let s = mode.to_string();
             let parsed: Mode = s.parse().unwrap();
             assert_eq!(mode, parsed);

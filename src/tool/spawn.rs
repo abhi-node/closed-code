@@ -3,8 +3,11 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::agent::explorer::ExplorerAgent;
-use crate::agent::message::AgentRequest;
+use crate::agent::message::{AgentRequest, ToolProgressFn};
+use crate::agent::orchestrator::OrchestratorEvent;
 use crate::agent::planner::PlannerAgent;
 use crate::agent::web_searcher::WebSearchAgent;
 use crate::agent::Agent;
@@ -16,13 +19,38 @@ use crate::sandbox::Sandbox;
 
 use super::{ParamBuilder, Tool};
 
+/// Create a progress callback from an event sender and agent type.
+/// Public so the orchestrator can create callbacks for directly-invoked agents
+/// (CommitAgent, ReviewAgent).
+pub fn make_agent_progress_callback(
+    tx: UnboundedSender<OrchestratorEvent>,
+    agent_type: &str,
+) -> ToolProgressFn {
+    let agent_type = agent_type.to_string();
+    Arc::new(move |tool_name: &str, args_display: &str| {
+        let _ = tx.send(OrchestratorEvent::AgentToolUpdate {
+            agent_type: agent_type.clone(),
+            tool_name: tool_name.to_string(),
+            args_display: args_display.to_string(),
+        });
+    })
+}
+
 // ── SpawnExplorerTool ──
 
-#[derive(Debug)]
 pub struct SpawnExplorerTool {
     client: Arc<GeminiClient>,
     working_directory: PathBuf,
     sandbox: Arc<dyn Sandbox>,
+    event_tx: Option<UnboundedSender<OrchestratorEvent>>,
+}
+
+impl std::fmt::Debug for SpawnExplorerTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnExplorerTool")
+            .field("working_directory", &self.working_directory)
+            .finish()
+    }
 }
 
 impl SpawnExplorerTool {
@@ -35,7 +63,13 @@ impl SpawnExplorerTool {
             client,
             working_directory,
             sandbox,
+            event_tx: None,
         }
+    }
+
+    pub fn with_event_tx(mut self, tx: Option<UnboundedSender<OrchestratorEvent>>) -> Self {
+        self.event_tx = tx;
+        self
     }
 }
 
@@ -80,17 +114,18 @@ impl Tool for SpawnExplorerTool {
             .to_string();
         let context_str = args["context"].as_str().unwrap_or("");
 
-        let mut request = AgentRequest::new(
-            task,
-            self.working_directory.to_string_lossy().to_string(),
-        );
+        let mut request =
+            AgentRequest::new(task, self.working_directory.to_string_lossy().to_string());
         if !context_str.is_empty() {
             request = request.with_context(vec![context_str.to_string()]);
         }
 
         tracing::info!("Spawning explorer agent: {}", request.task);
 
-        let agent = ExplorerAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        let mut agent = ExplorerAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        if let Some(ref tx) = self.event_tx {
+            agent = agent.with_progress(make_agent_progress_callback(tx.clone(), "explorer"));
+        }
         let response = agent.run(&self.client, request).await?;
 
         Ok(json!({
@@ -108,17 +143,31 @@ impl Tool for SpawnExplorerTool {
     }
 
     fn available_modes(&self) -> Vec<Mode> {
-        vec![Mode::Explore, Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto]
+        vec![
+            Mode::Explore,
+            Mode::Plan,
+            Mode::Guided,
+            Mode::Execute,
+            Mode::Auto,
+        ]
     }
 }
 
 // ── SpawnPlannerTool ──
 
-#[derive(Debug)]
 pub struct SpawnPlannerTool {
     client: Arc<GeminiClient>,
     working_directory: PathBuf,
     sandbox: Arc<dyn Sandbox>,
+    event_tx: Option<UnboundedSender<OrchestratorEvent>>,
+}
+
+impl std::fmt::Debug for SpawnPlannerTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnPlannerTool")
+            .field("working_directory", &self.working_directory)
+            .finish()
+    }
 }
 
 impl SpawnPlannerTool {
@@ -131,7 +180,13 @@ impl SpawnPlannerTool {
             client,
             working_directory,
             sandbox,
+            event_tx: None,
         }
+    }
+
+    pub fn with_event_tx(mut self, tx: Option<UnboundedSender<OrchestratorEvent>>) -> Self {
+        self.event_tx = tx;
+        self
     }
 }
 
@@ -174,17 +229,18 @@ impl Tool for SpawnPlannerTool {
             .to_string();
         let context_str = args["context"].as_str().unwrap_or("");
 
-        let mut request = AgentRequest::new(
-            task,
-            self.working_directory.to_string_lossy().to_string(),
-        );
+        let mut request =
+            AgentRequest::new(task, self.working_directory.to_string_lossy().to_string());
         if !context_str.is_empty() {
             request = request.with_context(vec![context_str.to_string()]);
         }
 
         tracing::info!("Spawning planner agent: {}", request.task);
 
-        let agent = PlannerAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        let mut agent = PlannerAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        if let Some(ref tx) = self.event_tx {
+            agent = agent.with_progress(make_agent_progress_callback(tx.clone(), "planner"));
+        }
         let response = agent.run(&self.client, request).await?;
 
         Ok(json!({
@@ -263,10 +319,8 @@ impl Tool for SpawnWebSearchTool {
             .to_string();
         let context_str = args["context"].as_str().unwrap_or("");
 
-        let mut request = AgentRequest::new(
-            query,
-            self.working_directory.to_string_lossy().to_string(),
-        );
+        let mut request =
+            AgentRequest::new(query, self.working_directory.to_string_lossy().to_string());
         if !context_str.is_empty() {
             request = request.with_context(vec![context_str.to_string()]);
         }

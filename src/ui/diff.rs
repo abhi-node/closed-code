@@ -101,11 +101,7 @@ pub fn display_diff(file_path: &str, old_content: &str, new_content: &str) -> Di
     // Print summary
     println!();
     if is_new_file {
-        println!(
-            "  File: {} {}",
-            file_path,
-            "(new)".with(Theme::DIM)
-        );
+        println!("  File: {} {}", file_path, "(new)".with(Theme::DIM));
     } else {
         println!("  File: {}", file_path);
     }

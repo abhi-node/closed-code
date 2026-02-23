@@ -2,16 +2,22 @@ use ratatui::layout::Constraint;
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use super::app::App;
-use super::theme::{self, TuiTheme};
+use super::app::{App, AppState};
 use super::gauge;
+use super::theme::{self, TuiTheme};
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App<'_>) {
     let status = &app.status;
+    let is_working = matches!(
+        app.state,
+        AppState::Thinking | AppState::Streaming | AppState::ToolExecuting { .. }
+    );
+    let working_width: u16 = if is_working { 14 } else { 0 };
 
-    let [mode_area, s1, model_area, s2, turns_area, s3, gauge_area, s4, git_area] =
+    let [mode_area, working_area, s1, model_area, s2, turns_area, s3, gauge_area, s4, git_area] =
         Layout::horizontal([
             Constraint::Length(10),
+            Constraint::Length(working_width),
             Constraint::Length(1),
             Constraint::Length(18),
             Constraint::Length(1),
@@ -26,6 +32,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App<'_>) {
     // Mode badge
     render_mode_badge(frame, mode_area, &status.mode);
 
+    // Thinking/Working indicator
+    if is_working {
+        render_working_indicator(frame, working_area, &app.state, app.tick_count);
+    }
+
     // Separators
     let sep = Paragraph::new("│").style(Style::default().fg(TuiTheme::BORDER_DIM));
     for area in [s1, s2, s3, s4] {
@@ -35,8 +46,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App<'_>) {
     // Model name (truncated to 16 chars)
     let model_display = truncate(&status.model, 16);
     frame.render_widget(
-        Paragraph::new(format!(" {}", model_display))
-            .style(Style::default().fg(TuiTheme::FG_DIM)),
+        Paragraph::new(format!(" {}", model_display)).style(Style::default().fg(TuiTheme::FG_DIM)),
         model_area,
     );
 
@@ -58,6 +68,22 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App<'_>) {
 
     // Git info
     render_git_info(frame, git_area, status);
+}
+
+fn render_working_indicator(frame: &mut Frame, area: Rect, state: &AppState, tick: usize) {
+    let frames = TuiTheme::SPINNER_FRAMES;
+    let spinner = frames[tick % frames.len()];
+    let label = match state {
+        AppState::Thinking => "Thinking...",
+        AppState::Streaming => "Streaming..",
+        AppState::ToolExecuting { .. } => "Working...",
+        _ => "",
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {} {}", spinner, label))
+            .style(Style::default().fg(TuiTheme::ACCENT)),
+        area,
+    );
 }
 
 fn render_mode_badge(frame: &mut Frame, area: Rect, mode: &crate::mode::Mode) {
@@ -94,11 +120,7 @@ fn render_turn_counter(frame: &mut Frame, area: Rect, turns: usize, max: usize) 
     );
 }
 
-fn render_git_info(
-    frame: &mut Frame,
-    area: Rect,
-    status: &super::app::StatusSnapshot,
-) {
+fn render_git_info(frame: &mut Frame, area: Rect, status: &super::app::StatusSnapshot) {
     let line = match &status.git_branch {
         Some(branch) if status.git_is_clean => Line::from(vec![
             Span::styled(

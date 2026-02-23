@@ -29,9 +29,7 @@ impl ReadFileTool {
         } else {
             self.working_directory.join(path)
         };
-        let canonical = resolved
-            .canonicalize()
-            .map_err(ClosedCodeError::Io)?;
+        let canonical = resolved.canonicalize().map_err(ClosedCodeError::Io)?;
         Ok(canonical)
     }
 
@@ -79,18 +77,22 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, args: Value) -> Result<Value> {
-        let path_str = args["path"].as_str().ok_or_else(|| ClosedCodeError::ToolError {
-            name: "read_file".into(),
-            message: "Missing required parameter 'path'".into(),
-        })?;
+        let path_str = args["path"]
+            .as_str()
+            .ok_or_else(|| ClosedCodeError::ToolError {
+                name: "read_file".into(),
+                message: "Missing required parameter 'path'".into(),
+            })?;
 
         let path = self.resolve_path(path_str)?;
 
         // Check file size
-        let metadata = fs::metadata(&path).await.map_err(|e| ClosedCodeError::ToolError {
-            name: "read_file".into(),
-            message: format!("Cannot read '{}': {}", path_str, e),
-        })?;
+        let metadata = fs::metadata(&path)
+            .await
+            .map_err(|e| ClosedCodeError::ToolError {
+                name: "read_file".into(),
+                message: format!("Cannot read '{}': {}", path_str, e),
+            })?;
 
         let file_size = metadata.len();
         let truncated = file_size > MAX_FILE_SIZE;
@@ -104,10 +106,12 @@ impl Tool for ReadFileTool {
             buf.truncate(n);
             buf
         } else {
-            fs::read(&path).await.map_err(|e| ClosedCodeError::ToolError {
-                name: "read_file".into(),
-                message: format!("Cannot read '{}': {}", path_str, e),
-            })?
+            fs::read(&path)
+                .await
+                .map_err(|e| ClosedCodeError::ToolError {
+                    name: "read_file".into(),
+                    message: format!("Cannot read '{}': {}", path_str, e),
+                })?
         };
 
         // Binary detection
@@ -321,27 +325,26 @@ impl Tool for SearchFilesTool {
         let wd = self.working_directory.clone();
         let pattern = pattern.to_string();
 
-        let matches =
-            tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-                let full_pattern = wd.join(&pattern).to_string_lossy().to_string();
+        let matches = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let full_pattern = wd.join(&pattern).to_string_lossy().to_string();
 
-                let paths: Vec<String> = glob::glob(&full_pattern)
-                    .map_err(|e| ClosedCodeError::GlobError(e.to_string()))?
-                    .filter_map(|entry| entry.ok())
-                    .filter_map(|path| {
-                        path.strip_prefix(&wd)
-                            .ok()
-                            .map(|rel| rel.to_string_lossy().to_string())
-                    })
-                    .collect();
+            let paths: Vec<String> = glob::glob(&full_pattern)
+                .map_err(|e| ClosedCodeError::GlobError(e.to_string()))?
+                .filter_map(|entry| entry.ok())
+                .filter_map(|path| {
+                    path.strip_prefix(&wd)
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().to_string())
+                })
+                .collect();
 
-                Ok(paths)
-            })
-            .await
-            .map_err(|e| ClosedCodeError::ToolError {
-                name: "search_files".into(),
-                message: format!("Search failed: {}", e),
-            })??;
+            Ok(paths)
+        })
+        .await
+        .map_err(|e| ClosedCodeError::ToolError {
+            name: "search_files".into(),
+            message: format!("Search failed: {}", e),
+        })??;
 
         Ok(json!({
             "pattern": args["pattern"],
@@ -420,87 +423,80 @@ impl Tool for GrepTool {
 
         let wd = self.working_directory.clone();
 
-        let matches =
-            tokio::task::spawn_blocking(move || -> Result<Vec<Value>> {
-                use ignore::WalkBuilder;
-                use std::fs::File;
-                use std::io::{BufRead, BufReader};
+        let matches = tokio::task::spawn_blocking(move || -> Result<Vec<Value>> {
+            use ignore::WalkBuilder;
+            use std::fs::File;
+            use std::io::{BufRead, BufReader};
 
-                let mut results = Vec::new();
+            let mut results = Vec::new();
 
-                let walker = WalkBuilder::new(&wd)
-                    .hidden(false)
-                    .git_ignore(true)
-                    .build();
+            let walker = WalkBuilder::new(&wd).hidden(false).git_ignore(true).build();
 
-                for entry in walker {
-                    if results.len() >= MAX_MATCHES {
-                        break;
-                    }
+            for entry in walker {
+                if results.len() >= MAX_MATCHES {
+                    break;
+                }
 
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
 
-                    if entry.file_type().is_none_or(|ft| ft.is_dir()) {
-                        continue;
-                    }
+                if entry.file_type().is_none_or(|ft| ft.is_dir()) {
+                    continue;
+                }
 
-                    let path = entry.path();
+                let path = entry.path();
 
-                    // Apply file pattern filter
-                    if let Some(ref fp) = file_pattern {
-                        let file_name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("");
-                        if let Ok(glob_pattern) = glob::Pattern::new(fp) {
-                            if !glob_pattern.matches(file_name) {
-                                continue;
-                            }
-                        }
-                    }
-
-                    let file = match File::open(path) {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-
-                    let reader = BufReader::new(file);
-                    for (line_num, line) in reader.lines().enumerate() {
-                        if results.len() >= MAX_MATCHES {
-                            break;
-                        }
-
-                        let line = match line {
-                            Ok(l) => l,
-                            Err(_) => continue,
-                        };
-
-                        if re.is_match(&line) {
-                            let relative = path
-                                .strip_prefix(&wd)
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .to_string();
-
-                            results.push(json!({
-                                "file": relative,
-                                "line": line_num + 1,
-                                "content": line.trim(),
-                            }));
+                // Apply file pattern filter
+                if let Some(ref fp) = file_pattern {
+                    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if let Ok(glob_pattern) = glob::Pattern::new(fp) {
+                        if !glob_pattern.matches(file_name) {
+                            continue;
                         }
                     }
                 }
 
-                Ok(results)
-            })
-            .await
-            .map_err(|e| ClosedCodeError::ToolError {
-                name: "grep".into(),
-                message: format!("Search failed: {}", e),
-            })??;
+                let file = match File::open(path) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+
+                let reader = BufReader::new(file);
+                for (line_num, line) in reader.lines().enumerate() {
+                    if results.len() >= MAX_MATCHES {
+                        break;
+                    }
+
+                    let line = match line {
+                        Ok(l) => l,
+                        Err(_) => continue,
+                    };
+
+                    if re.is_match(&line) {
+                        let relative = path
+                            .strip_prefix(&wd)
+                            .unwrap_or(path)
+                            .to_string_lossy()
+                            .to_string();
+
+                        results.push(json!({
+                            "file": relative,
+                            "line": line_num + 1,
+                            "content": line.trim(),
+                        }));
+                    }
+                }
+            }
+
+            Ok(results)
+        })
+        .await
+        .map_err(|e| ClosedCodeError::ToolError {
+            name: "grep".into(),
+            message: format!("Search failed: {}", e),
+        })??;
 
         let truncated = matches.len() >= MAX_MATCHES;
 
@@ -586,7 +582,9 @@ mod tests {
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("Missing required parameter 'path'"));
+        assert!(err
+            .to_string()
+            .contains("Missing required parameter 'path'"));
     }
 
     #[tokio::test]
@@ -597,10 +595,7 @@ mod tests {
         std::fs::write(sub.join("file.txt"), "content").unwrap();
 
         let tool = ReadFileTool::new(dir.path().to_path_buf());
-        let result = tool
-            .execute(json!({"path": "sub/file.txt"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": "sub/file.txt"})).await.unwrap();
         assert!(result["content"].as_str().unwrap().contains("content"));
     }
 
@@ -646,10 +641,7 @@ mod tests {
         std::fs::write(sub.join("nested.txt"), "x").unwrap();
 
         let tool = ListDirectoryTool::new(dir.path().to_path_buf());
-        let result = tool
-            .execute(json!({"recursive": true}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"recursive": true})).await.unwrap();
 
         let entries = result["entries"].as_array().unwrap();
         let names: Vec<&str> = entries
@@ -704,10 +696,7 @@ mod tests {
         std::fs::write(dir.path().join("file.txt"), "content").unwrap();
 
         let tool = SearchFilesTool::new(dir.path().to_path_buf());
-        let result = tool
-            .execute(json!({"pattern": "*.xyz"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"pattern": "*.xyz"})).await.unwrap();
         assert_eq!(result["count"], 0);
     }
 
@@ -739,17 +728,11 @@ mod tests {
         .unwrap();
 
         let tool = GrepTool::new(dir.path().to_path_buf());
-        let result = tool
-            .execute(json!({"pattern": "println"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"pattern": "println"})).await.unwrap();
 
         assert!(result["count"].as_u64().unwrap() >= 1);
         let matches = result["matches"].as_array().unwrap();
-        assert!(matches[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("println"));
+        assert!(matches[0]["content"].as_str().unwrap().contains("println"));
     }
 
     #[tokio::test]
@@ -848,7 +831,13 @@ mod tests {
             assert_eq!(tool.declaration().name, tool.name());
             assert_eq!(
                 tool.available_modes(),
-                vec![Mode::Explore, Mode::Plan, Mode::Guided, Mode::Execute, Mode::Auto]
+                vec![
+                    Mode::Explore,
+                    Mode::Plan,
+                    Mode::Guided,
+                    Mode::Execute,
+                    Mode::Auto
+                ]
             );
         }
     }

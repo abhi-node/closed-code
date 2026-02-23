@@ -103,10 +103,7 @@ impl GitContext {
             return "not a git repository".to_string();
         }
 
-        let branch = self
-            .current_branch
-            .as_deref()
-            .unwrap_or("(detached HEAD)");
+        let branch = self.current_branch.as_deref().unwrap_or("(detached HEAD)");
 
         if self.has_uncommitted_changes {
             let count = self.changed_files.len();
@@ -125,10 +122,7 @@ impl GitContext {
 
         let mut lines = Vec::new();
 
-        let branch = self
-            .current_branch
-            .as_deref()
-            .unwrap_or("(detached HEAD)");
+        let branch = self.current_branch.as_deref().unwrap_or("(detached HEAD)");
 
         if self.has_uncommitted_changes {
             let count = self.changed_files.len();
@@ -197,10 +191,7 @@ async fn detect_changes(working_dir: &Path) -> (bool, Vec<ChangedFile>) {
         return (false, Vec::new());
     }
 
-    let files: Vec<ChangedFile> = output
-        .lines()
-        .filter_map(|line| parse_porcelain_line(line))
-        .collect();
+    let files: Vec<ChangedFile> = output.lines().filter_map(parse_porcelain_line).collect();
 
     let has_changes = !files.is_empty();
     (has_changes, files)

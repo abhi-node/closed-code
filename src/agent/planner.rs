@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::message::{AgentResponse, Artifact, ArtifactType};
+use crate::agent::message::{AgentResponse, Artifact, ArtifactType, ToolProgressFn};
 use crate::agent::{Agent, AgentRequest};
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::types::*;
@@ -38,10 +38,18 @@ IMPORTANT: You MUST call create_report when done. The summary should be a brief 
 of the plan. The detailed_report should contain the full plan. Include code snippets \
 showing proposed implementations or patterns to follow.";
 
-#[derive(Debug)]
 pub struct PlannerAgent {
     working_directory: PathBuf,
     sandbox: Arc<dyn Sandbox>,
+    on_tool_progress: Option<ToolProgressFn>,
+}
+
+impl std::fmt::Debug for PlannerAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlannerAgent")
+            .field("working_directory", &self.working_directory)
+            .finish()
+    }
 }
 
 impl PlannerAgent {
@@ -49,7 +57,13 @@ impl PlannerAgent {
         Self {
             working_directory,
             sandbox,
+            on_tool_progress: None,
         }
+    }
+
+    pub fn with_progress(mut self, f: ToolProgressFn) -> Self {
+        self.on_tool_progress = Some(f);
+        self
     }
 
     /// Run the sub-agent's tool-call loop.
@@ -62,7 +76,8 @@ impl PlannerAgent {
         tools: Option<Vec<GeminiTool>>,
         tool_config: Option<ToolConfig>,
     ) -> Result<Option<AgentResponse>> {
-        let registry = create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
+        let registry =
+            create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
 
         for iteration in 0..self.max_iterations() {
             tracing::debug!(
@@ -135,7 +150,9 @@ impl PlannerAgent {
             let mut response_parts = Vec::new();
             for (name, args) in &function_calls {
                 if name == "create_report" {
-                    println!("│  \u{2713} create_report(...)");
+                    if let Some(ref cb) = self.on_tool_progress {
+                        cb("create_report", "...");
+                    }
                     let report = Self::extract_report(args)?;
                     return Ok(Some(report));
                 }
@@ -148,7 +165,9 @@ impl PlannerAgent {
                         serde_json::json!({"error": e.to_string()})
                     }
                 };
-                println!("│  \u{2713} {}", display);
+                if let Some(ref cb) = self.on_tool_progress {
+                    cb(name, &display);
+                }
 
                 response_parts.push(Part::FunctionResponse {
                     name: name.clone(),
@@ -183,16 +202,12 @@ impl PlannerAgent {
         if let Some(snippets_str) = args["code_snippets"].as_str() {
             if let Ok(snippets) = serde_json::from_str::<Vec<serde_json::Value>>(snippets_str) {
                 for s in &snippets {
-                    if let (Some(name), Some(content)) =
-                        (s["name"].as_str(), s["content"].as_str())
+                    if let (Some(name), Some(content)) = (s["name"].as_str(), s["content"].as_str())
                     {
                         artifacts.push(Artifact {
                             name: name.to_string(),
                             artifact_type: ArtifactType::CodeSnippet {
-                                language: s["language"]
-                                    .as_str()
-                                    .unwrap_or("text")
-                                    .to_string(),
+                                language: s["language"].as_str().unwrap_or("text").to_string(),
                             },
                             content: content.to_string(),
                         });
@@ -201,16 +216,11 @@ impl PlannerAgent {
             }
         } else if let Some(snippets) = args["code_snippets"].as_array() {
             for s in snippets {
-                if let (Some(name), Some(content)) =
-                    (s["name"].as_str(), s["content"].as_str())
-                {
+                if let (Some(name), Some(content)) = (s["name"].as_str(), s["content"].as_str()) {
                     artifacts.push(Artifact {
                         name: name.to_string(),
                         artifact_type: ArtifactType::CodeSnippet {
-                            language: s["language"]
-                                .as_str()
-                                .unwrap_or("text")
-                                .to_string(),
+                            language: s["language"].as_str().unwrap_or("text").to_string(),
                         },
                         content: content.to_string(),
                     });
@@ -242,12 +252,9 @@ impl Agent for PlannerAgent {
         PLANNER_MAX_ITERATIONS
     }
 
-    async fn run(
-        &self,
-        client: &GeminiClient,
-        request: AgentRequest,
-    ) -> Result<AgentResponse> {
-        let registry = create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
+    async fn run(&self, client: &GeminiClient, request: AgentRequest) -> Result<AgentResponse> {
+        let registry =
+            create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
         let tools = registry.to_gemini_tools(&crate::mode::Mode::Explore);
         let tool_config = Some(ToolRegistry::tool_config());
         let system_instruction = Content::system(self.system_prompt());
@@ -268,13 +275,7 @@ impl Agent for PlannerAgent {
 
         let result = tokio::time::timeout(
             Duration::from_secs(PLANNER_TIMEOUT_SECS),
-            self.run_subagent_loop(
-                client,
-                &mut history,
-                system_instruction,
-                tools,
-                tool_config,
-            ),
+            self.run_subagent_loop(client, &mut history, system_instruction, tools, tool_config),
         )
         .await
         .map_err(|_| ClosedCodeError::AgentTimeout {
@@ -331,9 +332,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn planner_has_higher_timeout_than_explorer() {
-        assert!(PLANNER_TIMEOUT_SECS > 120); // Explorer is 120s
-        assert!(PLANNER_MAX_ITERATIONS > 15); // Explorer is 15
-    }
+    // Compile-time checks: planner should have higher limits than explorer
+    const _: () = assert!(PLANNER_TIMEOUT_SECS > 120); // Explorer is 120s
+    const _: () = assert!(PLANNER_MAX_ITERATIONS > 15); // Explorer is 15
 }

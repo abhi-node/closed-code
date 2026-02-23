@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ratatui::DefaultTerminal;
 
-use crate::agent::orchestrator::Orchestrator;
+use crate::agent::orchestrator::{Orchestrator, OrchestratorConfig};
 use crate::config::Config;
 use crate::gemini::GeminiClient;
 use crate::mode::Mode;
@@ -11,7 +11,9 @@ use crate::session::store::SessionStore;
 use crate::session::{SessionEvent, SessionId};
 use crate::ui::approval::DiffOnlyApprovalHandler;
 
+use super::chat::{ChatMessage, ChatViewport};
 use super::command_picker::CommandPicker;
+use super::commands::{self, CommandResult};
 use super::events::{self, AppEvent};
 use super::input::InputPane;
 use super::keybindings::{self, Action};
@@ -26,6 +28,9 @@ use super::layout;
 pub enum AppState {
     Idle,
     CommandPicker { filter: String, selected: usize },
+    Thinking,
+    Streaming,
+    ToolExecuting { tool_name: String },
     Exiting,
 }
 
@@ -86,6 +91,8 @@ pub struct App<'a> {
     pub input_pane: InputPane<'a>,
     pub command_picker: CommandPicker,
     pub pending_input: Option<String>,
+    pub messages: Vec<ChatMessage>,
+    pub chat_viewport: ChatViewport,
 }
 
 impl<'a> App<'a> {
@@ -95,11 +102,23 @@ impl<'a> App<'a> {
                 self.state = AppState::Exiting;
             }
             Action::Cancel => {
-                if matches!(self.state, AppState::CommandPicker { .. }) {
-                    self.state = AppState::Idle;
-                    self.input_pane.clear();
-                } else {
-                    self.input_pane.clear();
+                match &self.state {
+                    AppState::CommandPicker { .. } => {
+                        self.state = AppState::Idle;
+                        self.input_pane.clear();
+                    }
+                    AppState::Thinking | AppState::Streaming | AppState::ToolExecuting { .. } => {
+                        // Cancellation is handled by setting the cancel flag on the orchestrator.
+                        // The spawned streaming task checks this flag and will send OrchestratorDone.
+                        // We add an "Interrupted." message and transition to Idle.
+                        self.messages.push(ChatMessage::System {
+                            text: "Interrupted.".into(),
+                        });
+                        self.state = AppState::Idle;
+                    }
+                    _ => {
+                        self.input_pane.clear();
+                    }
                 }
             }
             Action::Redraw => {} // Next frame will redraw
@@ -161,15 +180,13 @@ impl<'a> App<'a> {
                 }
             }
 
-            // ── Chat scrolling (Phase 9c) ──
-            Action::PageUp
-            | Action::PageDown
-            | Action::ScrollUp
-            | Action::ScrollDown
-            | Action::ScrollToTop
-            | Action::ScrollToBottom => {
-                // No-op in Phase 9b; wired in Phase 9c
-            }
+            // ── Chat scrolling ──
+            Action::PageUp => self.chat_viewport.page_up(),
+            Action::PageDown => self.chat_viewport.page_down(),
+            Action::ScrollUp => self.chat_viewport.scroll_up(3),
+            Action::ScrollDown => self.chat_viewport.scroll_down(3),
+            Action::ScrollToTop => self.chat_viewport.scroll_to_top(),
+            Action::ScrollToBottom => self.chat_viewport.scroll_to_bottom(),
 
             // ── Command picker ──
             Action::PickerUp => {
@@ -231,10 +248,7 @@ impl<'a> App<'a> {
                     } = self.state
                     {
                         let new_text = self.input_pane.text();
-                        *filter = new_text
-                            .strip_prefix('/')
-                            .unwrap_or("")
-                            .to_string();
+                        *filter = new_text.strip_prefix('/').unwrap_or("").to_string();
                         *selected = 0;
                     }
                 }
@@ -261,20 +275,29 @@ fn setup_terminal() -> anyhow::Result<DefaultTerminal> {
     // Install panic hook that restores terminal before printing panic info.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
         ratatui::restore();
         original_hook(panic_info);
     }));
 
     let terminal = ratatui::init();
+    // Enable mouse capture for scroll support
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     Ok(terminal)
 }
 
 fn restore_terminal() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
 }
 
 pub async fn run(config: &Config) -> anyhow::Result<()> {
-    // ── Build Orchestrator (mirrors run_repl setup) ──
+    use crate::agent::orchestrator::OrchestratorEvent;
+    use crate::gemini::stream::StreamEvent;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::Mutex;
+
+    // ── Build Orchestrator ──
     let client = Arc::new(GeminiClient::new(
         config.api_key.clone(),
         config.model.clone(),
@@ -283,17 +306,17 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     let approval_handler: Arc<dyn crate::ui::approval::ApprovalHandler> =
         Arc::new(DiffOnlyApprovalHandler::new());
 
-    let mut orchestrator = Orchestrator::new(
+    let mut orchestrator = Orchestrator::new(OrchestratorConfig {
         client,
-        config.mode,
-        config.working_directory.clone(),
-        config.max_output_tokens,
+        mode: config.mode,
+        working_directory: config.working_directory.clone(),
+        max_output_tokens: config.max_output_tokens,
         approval_handler,
-        config.personality,
-        config.context_window_turns,
+        personality: config.personality,
+        context_window_turns: config.context_window_turns,
         sandbox,
-        config.protected_paths.clone(),
-    );
+        protected_paths: config.protected_paths.clone(),
+    });
     orchestrator.detect_git_context().await;
 
     if config.session_auto_save {
@@ -301,24 +324,206 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         orchestrator.start_session(store);
     }
 
+    // Configure orchestrator for TUI mode
+    orchestrator.set_suppress_display(true);
+
+    // Orchestrator event channel (for tool/agent notifications)
+    let (orch_event_tx, mut orch_event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<OrchestratorEvent>();
+    orchestrator.set_event_sender(orch_event_tx);
+
+    // Extract cancel flag before wrapping in Arc<Mutex>
+    let cancel_flag = orchestrator.cancel_flag();
+
+    // Wrap orchestrator for shared access
+    let orchestrator = Arc::new(Mutex::new(orchestrator));
+
     // ── Terminal setup ──
     let mut terminal = setup_terminal()?;
 
     // ── App state ──
+    let initial_status = {
+        let orch = orchestrator.lock().await;
+        StatusSnapshot::from_orchestrator(&orch)
+    };
+
     let mut app = App {
         state: AppState::Idle,
         tick_count: 0,
-        status: StatusSnapshot::from_orchestrator(&orchestrator),
+        status: initial_status,
         input_pane: InputPane::new(config.working_directory.clone()),
         command_picker: CommandPicker::new(),
         pending_input: None,
+        messages: Vec::new(),
+        chat_viewport: ChatViewport::new(),
     };
 
-    // ── Event loop ──
-    let mut event_rx = events::spawn_event_loop();
+    // ── Event channels ──
+    let (app_event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    events::spawn_event_loop(app_event_tx.clone());
 
+    // Bridge: OrchestratorEvent -> AppEvent
+    let bridge_tx = app_event_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = orch_event_rx.recv().await {
+            let app_event = match event {
+                OrchestratorEvent::ToolStart { name, args_display } => {
+                    AppEvent::ToolStart { name, args_display }
+                }
+                OrchestratorEvent::ToolComplete { name, duration } => {
+                    AppEvent::ToolComplete { name, duration }
+                }
+                OrchestratorEvent::ToolError { name, error } => AppEvent::ToolError { name, error },
+                OrchestratorEvent::AgentStart { agent_type, task } => {
+                    AppEvent::AgentStart { agent_type, task }
+                }
+                OrchestratorEvent::AgentComplete {
+                    agent_type,
+                    duration,
+                } => AppEvent::AgentComplete {
+                    agent_type,
+                    duration,
+                },
+                OrchestratorEvent::AgentToolUpdate {
+                    agent_type,
+                    tool_name,
+                    args_display,
+                } => AppEvent::AgentToolUpdate {
+                    agent_type,
+                    tool_name,
+                    args_display,
+                },
+            };
+            if bridge_tx.send(app_event).is_err() {
+                break;
+            }
+        }
+    });
+
+    // ── Event loop ──
     loop {
         terminal.draw(|frame| layout::render(frame, &mut app))?;
+
+        // Process pending input (slash commands, shell commands, or LLM messages)
+        if let Some(input) = app.pending_input.take() {
+            if input.starts_with('/') {
+                // Slash command — lock orchestrator briefly
+                let mut orch = orchestrator.lock().await;
+                let (msgs, result) = commands::dispatch(&input, &mut orch).await;
+                app.messages.extend(msgs);
+                app.status = StatusSnapshot::from_orchestrator(&orch);
+                drop(orch);
+
+                match result {
+                    CommandResult::Quit => {
+                        app.state = AppState::Exiting;
+                    }
+                    CommandResult::ExecutePlan => {
+                        // Kick off streaming with the plan
+                        let orch_clone = orchestrator.clone();
+                        let tx = app_event_tx.clone();
+                        let flag = cancel_flag.clone();
+                        flag.store(false, Ordering::SeqCst);
+                        app.state = AppState::Thinking;
+                        app.messages.push(ChatMessage::Assistant {
+                            text: String::new(),
+                            tool_calls: Vec::new(),
+                            is_streaming: true,
+                        });
+
+                        tokio::spawn(async move {
+                            let mut orch = orch_clone.lock().await;
+                            let result = orch
+                                .handle_user_input_streaming(
+                                    "Execute the accepted plan step by step.",
+                                    |event| match &event {
+                                        StreamEvent::TextDelta(text) => {
+                                            let _ = tx.send(AppEvent::TextDelta(text.clone()));
+                                        }
+                                        StreamEvent::Done { .. } => {
+                                            let _ = tx.send(AppEvent::StreamDone);
+                                        }
+                                        _ => {}
+                                    },
+                                )
+                                .await;
+                            drop(orch);
+                            match result {
+                                Ok(_) => {
+                                    let _ = tx.send(AppEvent::OrchestratorDone);
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::Error(e.to_string()));
+                                    let _ = tx.send(AppEvent::OrchestratorDone);
+                                }
+                            }
+                        });
+                    }
+                    CommandResult::SwitchMode(mode) => {
+                        app.messages.push(ChatMessage::System {
+                            text: format!("Switched to {} mode.", mode),
+                        });
+                    }
+                    CommandResult::ShowSessionPicker | CommandResult::ShowModePicker => {
+                        // Phase 9d
+                        app.messages.push(ChatMessage::System {
+                            text: "Feature coming in Phase 9d.".into(),
+                        });
+                    }
+                    CommandResult::Continue => {}
+                }
+            } else if let Some(shell_input) = input.strip_prefix('!') {
+                // Shell command
+                let command = shell_input.trim().to_string();
+                if !command.is_empty() {
+                    let msg = commands::execute_shell_command(&command).await;
+                    app.messages.push(msg);
+                }
+            } else {
+                // Normal user message — send to LLM
+                app.messages.push(ChatMessage::User {
+                    text: input.clone(),
+                });
+                app.messages.push(ChatMessage::Assistant {
+                    text: String::new(),
+                    tool_calls: Vec::new(),
+                    is_streaming: true,
+                });
+                app.state = AppState::Thinking;
+
+                let orch_clone = orchestrator.clone();
+                let tx = app_event_tx.clone();
+                let flag = cancel_flag.clone();
+                flag.store(false, Ordering::SeqCst);
+
+                let input_owned = input;
+                tokio::spawn(async move {
+                    let mut orch = orch_clone.lock().await;
+                    orch.reset_cancel();
+                    let result = orch
+                        .handle_user_input_streaming(&input_owned, |event| match &event {
+                            StreamEvent::TextDelta(text) => {
+                                let _ = tx.send(AppEvent::TextDelta(text.clone()));
+                            }
+                            StreamEvent::Done { .. } => {
+                                let _ = tx.send(AppEvent::StreamDone);
+                            }
+                            _ => {}
+                        })
+                        .await;
+                    drop(orch);
+                    match result {
+                        Ok(_) => {
+                            let _ = tx.send(AppEvent::OrchestratorDone);
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Error(e.to_string()));
+                            let _ = tx.send(AppEvent::OrchestratorDone);
+                        }
+                    }
+                });
+            }
+        }
 
         let Some(event) = event_rx.recv().await else {
             break;
@@ -327,13 +532,167 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         match event {
             AppEvent::Key(key) => {
                 let action = keybindings::map_key(key, &app.state);
+
+                // Handle cancel by setting the flag on the orchestrator
+                if action == Action::Cancel
+                    && matches!(
+                        app.state,
+                        AppState::Thinking | AppState::Streaming | AppState::ToolExecuting { .. }
+                    )
+                {
+                    cancel_flag.store(true, Ordering::SeqCst);
+                }
+
                 app.handle_action(action);
             }
             AppEvent::Resize(_w, _h) => {
                 // Ratatui handles resize on next draw automatically.
             }
+            AppEvent::MouseScrollUp => {
+                app.chat_viewport.scroll_up(3);
+            }
+            AppEvent::MouseScrollDown => {
+                app.chat_viewport.scroll_down(3);
+            }
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
+            }
+
+            // ── Streaming events ──
+            AppEvent::TextDelta(text) => {
+                if app.state == AppState::Thinking {
+                    app.state = AppState::Streaming;
+                }
+                // Append text to the last assistant message
+                if let Some(ChatMessage::Assistant {
+                    text: ref mut msg_text,
+                    ..
+                }) = app.messages.last_mut()
+                {
+                    msg_text.push_str(&text);
+                }
+            }
+            AppEvent::StreamDone => {
+                // Mark the last assistant message as not streaming
+                if let Some(ChatMessage::Assistant {
+                    ref mut is_streaming,
+                    ..
+                }) = app.messages.last_mut()
+                {
+                    *is_streaming = false;
+                }
+            }
+
+            // ── Tool events ──
+            AppEvent::ToolStart { name, args_display } => {
+                app.state = AppState::ToolExecuting {
+                    tool_name: name.clone(),
+                };
+                if let Some(ChatMessage::Assistant {
+                    ref mut tool_calls, ..
+                }) = app.messages.last_mut()
+                {
+                    tool_calls.push(super::chat::ToolCallDisplay::Running { name, args_display });
+                }
+            }
+            AppEvent::ToolComplete { name, duration } => {
+                app.state = AppState::Thinking;
+                if let Some(ChatMessage::Assistant {
+                    ref mut tool_calls, ..
+                }) = app.messages.last_mut()
+                {
+                    // Find the running tool call and mark it completed
+                    if let Some(tc) = tool_calls.iter_mut().rev().find(|tc| {
+                        matches!(tc, super::chat::ToolCallDisplay::Running { name: n, .. } if *n == name)
+                    }) {
+                        *tc = super::chat::ToolCallDisplay::Completed { name, duration };
+                    }
+                }
+            }
+            AppEvent::ToolError { name, error } => {
+                if let Some(ChatMessage::Assistant {
+                    ref mut tool_calls, ..
+                }) = app.messages.last_mut()
+                {
+                    if let Some(tc) = tool_calls.iter_mut().rev().find(|tc| {
+                        matches!(tc, super::chat::ToolCallDisplay::Running { name: n, .. } if *n == name)
+                    }) {
+                        *tc = super::chat::ToolCallDisplay::Failed { name, error };
+                    }
+                }
+            }
+
+            // ── Agent events ──
+            AppEvent::AgentStart { agent_type, task } => {
+                if let Some(ChatMessage::Assistant {
+                    ref mut tool_calls, ..
+                }) = app.messages.last_mut()
+                {
+                    tool_calls.push(super::chat::ToolCallDisplay::AgentRunning {
+                        agent_type,
+                        task,
+                        last_tool: None,
+                    });
+                }
+            }
+            AppEvent::AgentComplete {
+                agent_type,
+                duration,
+            } => {
+                if let Some(ChatMessage::Assistant {
+                    ref mut tool_calls, ..
+                }) = app.messages.last_mut()
+                {
+                    if let Some(tc) = tool_calls.iter_mut().rev().find(|tc| {
+                        matches!(tc, super::chat::ToolCallDisplay::AgentRunning { agent_type: at, .. } if *at == agent_type)
+                    }) {
+                        *tc = super::chat::ToolCallDisplay::AgentCompleted {
+                            agent_type,
+                            duration,
+                        };
+                    }
+                }
+            }
+
+            AppEvent::AgentToolUpdate {
+                agent_type,
+                tool_name,
+                args_display,
+            } => {
+                if let Some(ChatMessage::Assistant {
+                    ref mut tool_calls, ..
+                }) = app.messages.last_mut()
+                {
+                    if let Some(super::chat::ToolCallDisplay::AgentRunning {
+                        ref mut last_tool, ..
+                    }) = tool_calls.iter_mut().rev().find(|tc| {
+                        matches!(tc, super::chat::ToolCallDisplay::AgentRunning { agent_type: at, .. } if *at == agent_type)
+                    }) {
+                        *last_tool = Some(format!("{}({})", tool_name, args_display));
+                    }
+                }
+            }
+
+            // ── System events ──
+            AppEvent::SystemMessage(text) => {
+                app.messages.push(ChatMessage::System { text });
+            }
+            AppEvent::ModeChanged(mode) => {
+                app.messages.push(ChatMessage::System {
+                    text: format!("Mode changed to: {}", mode),
+                });
+            }
+            AppEvent::OrchestratorDone => {
+                // Refresh status from orchestrator
+                let orch = orchestrator.lock().await;
+                app.status = StatusSnapshot::from_orchestrator(&orch);
+                drop(orch);
+                app.state = AppState::Idle;
+            }
+            AppEvent::Error(err) => {
+                app.messages.push(ChatMessage::System {
+                    text: format!("Error: {}", err),
+                });
             }
         }
 
@@ -343,9 +702,12 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     }
 
     // ── Cleanup ──
-    orchestrator.emit_event(SessionEvent::SessionEnd {
-        timestamp: chrono::Utc::now(),
-    });
+    {
+        let orch = orchestrator.lock().await;
+        orch.emit_event(SessionEvent::SessionEnd {
+            timestamp: chrono::Utc::now(),
+        });
+    }
     restore_terminal();
     Ok(())
 }
@@ -389,5 +751,19 @@ mod tests {
     #[test]
     fn app_state_idle_is_not_exiting() {
         assert_ne!(AppState::Idle, AppState::Exiting);
+    }
+
+    #[test]
+    fn app_state_thinking_variant() {
+        assert_ne!(AppState::Thinking, AppState::Idle);
+        assert_ne!(AppState::Streaming, AppState::Idle);
+    }
+
+    #[test]
+    fn app_state_tool_executing() {
+        let state = AppState::ToolExecuting {
+            tool_name: "read_file".into(),
+        };
+        assert_ne!(state, AppState::Idle);
     }
 }

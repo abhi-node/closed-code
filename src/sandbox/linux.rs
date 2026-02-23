@@ -4,8 +4,8 @@ use std::process::Output;
 
 use async_trait::async_trait;
 use landlock::{
-    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr,
-    RulesetStatus, ABI,
+    Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    ABI,
 };
 use tokio::process::Command;
 
@@ -76,26 +76,22 @@ impl LandlockSandbox {
                                     })?,
                                     read_access,
                                 ))
-                                .map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                                })?;
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                         }
                     }
 
                     // Writes: workspace + /tmp only
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(
-                            PathFd::new(&workspace).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::Other, e)
-                            })?,
+                            PathFd::new(&workspace)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                             write_access,
                         ))
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(
-                            PathFd::new("/tmp").map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::Other, e)
-                            })?,
+                            PathFd::new("/tmp")
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                             write_access,
                         ))
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -104,9 +100,8 @@ impl LandlockSandbox {
                     // Reads: everywhere
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(
-                            PathFd::new("/").map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::Other, e)
-                            })?,
+                            PathFd::new("/")
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                             read_access,
                         ))
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -114,17 +109,15 @@ impl LandlockSandbox {
                     // Writes: workspace + /tmp only
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(
-                            PathFd::new(&workspace).map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::Other, e)
-                            })?,
+                            PathFd::new(&workspace)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                             write_access,
                         ))
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(
-                            PathFd::new("/tmp").map_err(|e| {
-                                std::io::Error::new(std::io::ErrorKind::Other, e)
-                            })?,
+                            PathFd::new("/tmp")
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
                             write_access,
                         ))
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -147,12 +140,7 @@ impl LandlockSandbox {
 
 #[async_trait]
 impl Sandbox for LandlockSandbox {
-    async fn execute_command(
-        &self,
-        command: &str,
-        args: &[String],
-        cwd: &Path,
-    ) -> Result<Output> {
+    async fn execute_command(&self, command: &str, args: &[String], cwd: &Path) -> Result<Output> {
         let mut ruleset_fn = self.build_ruleset();
 
         // SAFETY: pre_exec runs after fork() but before exec() in the child process.
@@ -203,15 +191,13 @@ mod tests {
 
     #[test]
     fn landlock_mode_accessor() {
-        let sandbox =
-            LandlockSandbox::new(SandboxMode::WorkspaceWrite, PathBuf::from("/project"));
+        let sandbox = LandlockSandbox::new(SandboxMode::WorkspaceWrite, PathBuf::from("/project"));
         assert_eq!(sandbox.mode(), SandboxMode::WorkspaceWrite);
     }
 
     #[test]
     fn landlock_backend_is_landlock() {
-        let sandbox =
-            LandlockSandbox::new(SandboxMode::WorkspaceWrite, PathBuf::from("/project"));
+        let sandbox = LandlockSandbox::new(SandboxMode::WorkspaceWrite, PathBuf::from("/project"));
         assert_eq!(sandbox.backend(), SandboxBackend::Landlock);
     }
 
