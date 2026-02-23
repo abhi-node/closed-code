@@ -9,6 +9,7 @@ pub mod repl;
 pub mod sandbox;
 pub mod session;
 pub mod tool;
+pub mod tui;
 pub mod ui;
 
 pub use config::Config;

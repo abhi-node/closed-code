@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
             run_resume(&config, session_id.as_deref()).await?;
         }
         None => {
-            run_repl(&config).await?;
+            closed_code::tui::run_tui(&config).await?;
         }
     }
 
