@@ -99,9 +99,12 @@ use crate::error::Result;
 /// Sandbox restriction level for shell command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
-    /// No writes anywhere, no network access.
-    ReadOnly,
-    /// Writes only within the workspace directory, no network access.
+    /// Reads and writes restricted to workspace + system essentials. Network blocked.
+    /// Strongest isolation — the agent cannot read files outside the project.
+    WorkspaceOnly,
+    /// Reads everywhere, writes only within workspace + /tmp. Network allowed.
+    /// The invisible default — prevents accidental writes outside the project
+    /// while allowing normal development workflows (cargo build, git push, etc.).
     WorkspaceWrite,
     /// No sandbox restrictions (requires explicit opt-in).
     FullAccess,
@@ -118,7 +121,7 @@ impl Default for SandboxMode {
 
 | String | Variant |
 |--------|---------|
-| `"read-only"` or `"read_only"` | `ReadOnly` |
+| `"workspace-only"` or `"workspace_only"` | `WorkspaceOnly` |
 | `"workspace-write"` or `"workspace_write"` | `WorkspaceWrite` |
 | `"full-access"` or `"full_access"` | `FullAccess` |
 
@@ -221,6 +224,8 @@ pub fn create_sandbox(
 | `Arc<dyn Sandbox>` sharing | Mirrors the existing `Arc<GeminiClient>` and `Arc<dyn ApprovalHandler>` patterns. |
 | FullAccess always uses Fallback | No point wrapping with sandbox-exec just to allow everything. |
 | Factory handles detection | Centralizes platform checks; callers just get an `Arc<dyn Sandbox>`. |
+| `WorkspaceWrite` allows network | The invisible default must not break `cargo build`, `git push`, or any normal development workflow. Write restrictions are the primary value; network blocking is only for `WorkspaceOnly`. |
+| `WorkspaceOnly` is the high-security mode | Restricts both reads and writes to the workspace. This is where sandboxing earns its keep — the LLM cannot access `~/.ssh`, `~/.aws`, other projects, etc. |
 
 ### `src/lib.rs`
 
@@ -286,24 +291,42 @@ impl SeatbeltSandbox {
     /// Generate a Seatbelt profile string for the given mode.
     fn generate_profile(mode: SandboxMode, workspace: &Path) -> String {
         match mode {
-            SandboxMode::ReadOnly => Self::read_only_profile(),
+            SandboxMode::WorkspaceOnly => Self::workspace_only_profile(workspace),
             SandboxMode::WorkspaceWrite => Self::workspace_write_profile(workspace),
             SandboxMode::FullAccess => unreachable!("FullAccess uses FallbackSandbox"),
         }
     }
 
-    fn read_only_profile() -> String {
-        r#"(version 1)
+    fn workspace_only_profile(workspace: &Path) -> String {
+        let workspace_path = workspace.to_string_lossy();
+        format!(
+            r#"(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
 (allow sysctl-read)
 (allow mach-lookup)
 (allow signal (target self))
-(allow file-read*)
-(deny file-write*)
+;; Read access: workspace + system essentials only
+(allow file-read* (subpath "{workspace_path}"))
+(allow file-read* (subpath "/usr"))
+(allow file-read* (subpath "/bin"))
+(allow file-read* (subpath "/sbin"))
+(allow file-read* (subpath "/opt/homebrew"))
+(allow file-read* (subpath "/Library"))
+(allow file-read* (subpath "/System"))
+(allow file-read* (subpath "/etc"))
+(allow file-read* (subpath "/private/etc"))
+(allow file-read* (subpath "/private/tmp"))
+(allow file-read* (subpath "/tmp"))
+(allow file-read* (subpath "/dev"))
+(allow file-read* (subpath "/var"))
+;; Write access: workspace + /tmp only
+(allow file-write* (subpath "{workspace_path}"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/tmp"))
 (deny network*)"#
-            .to_string()
+        )
     }
 
     fn workspace_write_profile(workspace: &Path) -> String {
@@ -320,7 +343,7 @@ impl SeatbeltSandbox {
 (allow file-write* (subpath "{workspace_path}"))
 (allow file-write* (subpath "/private/tmp"))
 (allow file-write* (subpath "/tmp"))
-(deny network*)"#
+(allow network*)"#
         )
     }
 }
@@ -330,10 +353,24 @@ impl SeatbeltSandbox {
 
 | Mode | file-read | file-write | network |
 |------|-----------|------------|---------|
-| `ReadOnly` | `allow file-read*` | `deny file-write*` | `deny network*` |
-| `WorkspaceWrite` | `allow file-read*` | `allow file-write* (subpath "<workspace>")` + `/tmp` | `deny network*` |
+| `WorkspaceOnly` | Workspace + system paths only | Workspace + `/tmp` | `deny network*` |
+| `WorkspaceWrite` | `allow file-read*` (everywhere) | Workspace + `/tmp` | `allow network*` |
 
-Both profiles allow `process-exec`, `process-fork`, `sysctl-read`, and `mach-lookup` — required for running any command. `/tmp` write access is included in `WorkspaceWrite` because many commands use temporary files.
+Both profiles allow `process-exec`, `process-fork`, `sysctl-read`, and `mach-lookup` — required for running any command. `/tmp` write access is included because many commands use temporary files.
+
+**System paths allowed for reads in `WorkspaceOnly`:**
+
+| Path | Reason |
+|------|--------|
+| `/usr`, `/bin`, `/sbin` | Executables and shared libraries |
+| `/opt/homebrew` | Homebrew-installed tools (common on macOS) |
+| `/Library`, `/System` | macOS frameworks and system libraries |
+| `/etc`, `/private/etc` | System configuration (e.g., `/etc/gitconfig`) |
+| `/tmp`, `/private/tmp` | Temporary files |
+| `/dev` | Device files (`/dev/null`, `/dev/urandom`) |
+| `/var` | System state (logs, sockets needed by some tools) |
+
+Notably **absent**: `$HOME` (except the workspace), other user directories, other projects. This is the key security benefit — the LLM cannot read `~/.ssh`, `~/.aws`, `~/other-project`, etc.
 
 **Trait implementation:**
 
@@ -491,20 +528,37 @@ impl LandlockSandbox {
                 .create()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-            // Always allow reads everywhere
-            ruleset = ruleset
-                .add_rule(PathBeneath::new(
-                    PathFd::new("/").map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
-                    read_access,
-                ))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
             match mode {
-                SandboxMode::ReadOnly => {
-                    // No write rules — all writes are denied by default
-                }
-                SandboxMode::WorkspaceWrite => {
-                    // Allow writes within the workspace
+                SandboxMode::WorkspaceOnly => {
+                    // Reads: workspace + system essentials only
+                    let read_paths = [
+                        workspace.as_path(),
+                        Path::new("/usr"),
+                        Path::new("/bin"),
+                        Path::new("/sbin"),
+                        Path::new("/lib"),
+                        Path::new("/lib64"),
+                        Path::new("/etc"),
+                        Path::new("/tmp"),
+                        Path::new("/dev"),
+                        Path::new("/proc"),
+                        Path::new("/sys"),
+                        Path::new("/var"),
+                        Path::new("/run"),
+                    ];
+                    for path in &read_paths {
+                        if path.exists() {
+                            ruleset = ruleset
+                                .add_rule(PathBeneath::new(
+                                    PathFd::new(path)
+                                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                                    read_access,
+                                ))
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        }
+                    }
+
+                    // Writes: workspace + /tmp only
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(
                             PathFd::new(&workspace)
@@ -512,8 +566,32 @@ impl LandlockSandbox {
                             write_access,
                         ))
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(
+                            PathFd::new("/tmp")
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                            write_access,
+                        ))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                }
+                SandboxMode::WorkspaceWrite => {
+                    // Reads: everywhere
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(
+                            PathFd::new("/")
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                            read_access,
+                        ))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-                    // Allow writes to /tmp
+                    // Writes: workspace + /tmp only
+                    ruleset = ruleset
+                        .add_rule(PathBeneath::new(
+                            PathFd::new(&workspace)
+                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+                            write_access,
+                        ))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
                     ruleset = ruleset
                         .add_rule(PathBeneath::new(
                             PathFd::new("/tmp")
@@ -600,19 +678,20 @@ impl Sandbox for LandlockSandbox {
 | Decision | Rationale |
 |----------|-----------|
 | Landlock applied via `pre_exec`, not `restrict_self` on parent | Applying to parent would restrict our own file operations (reading files, writing diffs, etc.). `pre_exec` runs after `fork()` but before `exec()`, so only the child is restricted. |
-| Always allow reads to `/` | Shell commands need to read system libraries, executables, etc. Read-only mode restricts writes, not reads. |
-| `/tmp` writable in WorkspaceWrite | Many commands create temporary files. Blocking `/tmp` would break common tools like `git`, `cargo`, `rustc`. |
+| `WorkspaceOnly` enumerates allowed read paths | Restricting reads is the high-value security feature — prevents the LLM from reading `~/.ssh`, `~/.aws`, other projects. System paths are enumerated because commands need libraries/executables to run. |
+| `/tmp` writable in both restricted modes | Many commands create temporary files. Blocking `/tmp` would break common tools like `git`, `cargo`, `rustc`. |
 | seccomp BPF deferred | Landlock provides sufficient filesystem sandboxing. seccomp adds syscall-level filtering but requires extensive whitelisting that varies by distribution and would significantly increase complexity. It can be added incrementally later. |
 | `unsafe` block for `pre_exec` | Required by the Rust `CommandExt` API. The closure is safe — it only calls Landlock APIs. |
+| `path.exists()` check before adding rules | Linux system paths vary by distro (e.g., `/lib64` exists on Fedora but not Ubuntu). Skip non-existent paths gracefully. |
 
 **Landlock access rules per mode:**
 
 | Mode | Read access | Write access | Network |
 |------|-------------|--------------|---------|
-| `ReadOnly` | `/` (all) | None | Not restricted by Landlock (filesystem only) |
-| `WorkspaceWrite` | `/` (all) | `<workspace>` + `/tmp` | Not restricted by Landlock |
+| `WorkspaceOnly` | Workspace + system essentials (`/usr`, `/bin`, `/etc`, `/dev`, `/proc`, `/tmp`, etc.) | Workspace + `/tmp` | Not restricted by Landlock (filesystem only) |
+| `WorkspaceWrite` | `/` (all) | Workspace + `/tmp` | Not restricted by Landlock |
 
-Note: Landlock is a filesystem-only sandbox. Network restrictions would require seccomp or iptables, which are deferred. The Seatbelt backend on macOS handles network denial natively.
+Note: Landlock is a filesystem-only sandbox. It cannot restrict network access. On macOS, Seatbelt handles network denial natively for `WorkspaceOnly` mode. On Linux, `WorkspaceOnly` blocks filesystem access outside the workspace but does not block network. Full network restriction on Linux would require seccomp or iptables, which are deferred.
 
 ---
 
@@ -1017,13 +1096,13 @@ protected_paths = [".secrets/", "credentials.json", "*.p12"]
 pub struct Cli {
     // ... existing fields ...
 
-    /// Sandbox mode: read-only, workspace-write, full-access
+    /// Sandbox mode: workspace-only, workspace-write, full-access
     #[arg(long, value_name = "MODE")]
     pub sandbox: Option<String>,
 }
 ```
 
-Usage: `cargo run -- --sandbox read-only`
+Usage: `cargo run -- --sandbox workspace-only`
 
 ### `src/error.rs` — Modified
 
@@ -1038,7 +1117,7 @@ pub enum ClosedCodeError {
     #[error("Sandbox denied: command '{command}' — {reason}")]
     SandboxDenied { command: String, reason: String },
 
-    #[error("Invalid sandbox mode '{0}'. Expected: read-only, workspace-write, full-access")]
+    #[error("Invalid sandbox mode '{0}'. Expected: workspace-only, workspace-write, full-access")]
     InvalidSandboxMode(String),
 }
 ```
@@ -1137,9 +1216,19 @@ When sandbox is active (not FullAccess), append to the system prompt:
 
 ```
 Sandbox: workspace-write (macOS Seatbelt)
-  - File writes restricted to the workspace directory.
-  - Network access is blocked for shell commands.
+  - File reads: everywhere. File writes: workspace directory only.
+  - Network: allowed.
   - Protected paths: .git/, .closed-code/, .env, *.pem, *.key
+```
+
+Or for `WorkspaceOnly`:
+
+```
+Sandbox: workspace-only (macOS Seatbelt)
+  - File reads: workspace + system paths only. File writes: workspace only.
+  - Network: blocked.
+  - Protected paths: .git/, .closed-code/, .env, *.pem, *.key
+  - You cannot read files outside this project directory.
 ```
 
 **New accessor methods:**
@@ -1215,7 +1304,7 @@ The `sandbox` is then passed to `Orchestrator::new()` and through to the REPL/on
 | File | New Tests | Category |
 |------|-----------|----------|
 | `src/sandbox/mod.rs` | 8 | SandboxMode Display/FromStr, SandboxBackend Display, factory with FullAccess returns Fallback, default mode |
-| `src/sandbox/macos.rs` | 6 | Profile generation (ReadOnly, WorkspaceWrite), workspace path escaping, is_available check, resolve_command |
+| `src/sandbox/macos.rs` | 6 | Profile generation (WorkspaceOnly, WorkspaceWrite), workspace path escaping, is_available check, resolve_command |
 | `src/sandbox/linux.rs` | 4 | is_supported check, build_ruleset construction, mode behavior |
 | `src/sandbox/fallback.rs` | 4 | Execute passthrough, mode/backend accessors, warning logged for non-FullAccess |
 | `src/tool/shell.rs` | 6 | Sandbox routing (mock), SandboxDenied error propagation, existing tests updated with MockSandbox |
@@ -1289,7 +1378,7 @@ All existing tests that construct `ShellCommandTool` or use the tool registry mu
 ## Milestone
 
 ```bash
-# macOS sandbox (default: workspace-write)
+# Default behavior (workspace-write) — most users never think about sandboxing
 cargo run -- --api-key $KEY
 # closed-code
 # Mode: explore | Model: gemini-3.1-pro-preview | Tools: 9
@@ -1297,34 +1386,57 @@ cargo run -- --api-key $KEY
 # Sandbox: workspace-write (macOS Seatbelt)
 # Git: main (clean)
 
-# Read-only sandbox
-cargo run -- --api-key $KEY --sandbox read-only
-# Sandbox: read-only (macOS Seatbelt)
-
-# Shell command succeeds (read-only operation)
-# > Run git log
-# ⠋ Using shell: git log --oneline -10...
+# Default mode allows reads everywhere, writes only in project, network allowed
+# > Run git log --oneline -5
+# ⠋ Using shell: git log --oneline -5...
 # abc1234 Initial commit
-# ✓ (sandbox allowed: read-only operation)
+# ✓ exit_code: 0
 
-# Shell command denied by sandbox (write in read-only mode)
-# > Run touch /tmp/test.txt
-# ✗ Sandbox denied: command 'touch' — Seatbelt denied operation (mode: read-only)
+# > Run git push origin main
+# ⠋ Using shell: git push origin main...
+# ✓ (network allowed in workspace-write mode)
 
-# Shell command denied by sandbox (write outside workspace)
+# > Run cargo build
+# ⠋ Using shell: cargo build...
+# ✓ (fetches crates over network, writes to ./target — both allowed)
+
+# Write outside workspace is blocked
 # > (in workspace-write mode) Run touch /etc/test.txt
 # ✗ Sandbox denied: command 'touch' — Seatbelt denied operation (mode: workspace-write)
 
-# Shell command succeeds (write within workspace)
+# Write within workspace succeeds
 # > (in workspace-write mode) Run touch ./test.txt
 # ✓ exit_code: 0
+
+# Workspace-only mode — strongest isolation
+cargo run -- --api-key $KEY --sandbox workspace-only
+# Sandbox: workspace-only (macOS Seatbelt)
+
+# Cannot read files outside the project
+# > Run cat ~/.ssh/id_rsa
+# ✗ Sandbox denied: command 'cat' — Seatbelt denied operation (mode: workspace-only)
+
+# Cannot read other projects
+# > Run ls ~/other-project/
+# ✗ Sandbox denied: command 'ls' — Seatbelt denied operation (mode: workspace-only)
+
+# Network is blocked
+# > Run git push origin main
+# ✗ Sandbox denied: command 'git' — Seatbelt denied operation (mode: workspace-only)
+
+# But workspace reads/writes and system commands work fine
+# > Run git log --oneline -5
+# ✓ exit_code: 0 (reads git objects within workspace)
+
+# > Run ls src/
+# ✓ main.rs  lib.rs  ...
 
 # Full access (no sandbox)
 cargo run -- --api-key $KEY --sandbox full-access
 # Sandbox: full-access (fallback)
 # (no restrictions, identical to pre-Phase 7 behavior)
 
-# Protected paths (extended)
+# Protected paths (extended) — enforced regardless of sandbox mode
 # > (in execute mode) Edit .env
 # Error: Cannot modify protected path: .env
 
@@ -1354,7 +1466,7 @@ cargo run -- --api-key $KEY --sandbox full-access
 # Config file
 # ~/.closed-code/config.toml:
 # [security]
-# sandbox_mode = "workspace-write"
+# sandbox_mode = "workspace-only"
 # protected_paths = [".secrets/", "credentials.json"]
 
 # Linux sandbox
@@ -1364,9 +1476,9 @@ cargo run -- --api-key $KEY
 
 # Unsupported platform / old kernel
 # (falls back gracefully)
-cargo run -- --api-key $KEY --sandbox read-only
+cargo run -- --api-key $KEY --sandbox workspace-only
 # Warning: Sandboxing not available on this platform. Running without OS-level restrictions.
-# Sandbox: read-only (fallback)
+# Sandbox: workspace-only (fallback)
 
 # Tests
 cargo test
