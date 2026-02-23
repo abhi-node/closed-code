@@ -1219,6 +1219,15 @@ src/tui/file_picker.rs   # Fuzzy file search overlay
 - Escape to dismiss
 - Caches file index, refreshes on `/refresh` or after file modifications
 
+**1b. `@image` tagging**
+
+- Type `@image` or `@img` followed by a path to attach an image to the current prompt
+- Reuses the image pipeline from Phase 8b (`read_image_file()` → `ImageDescriptionAgent` → context injection)
+- Supports fuzzy file search for image files: `@img arch` → suggests `docs/architecture.png`
+- Integrates with the `@` fuzzy file picker (filter to image extensions: `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`)
+- Selected image is read, sent to `ImageDescriptionAgent::describe()` with the user's prompt, and the text description is injected into the conversation context
+- Multiple `@image` tags can appear in a single prompt — each is resolved independently before sending
+
 **2. Multi-agent parallel execution**
 
 ```

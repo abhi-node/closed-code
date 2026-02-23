@@ -45,6 +45,7 @@ dotenvy = "0.15"
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 
 # File search (glob patterns)

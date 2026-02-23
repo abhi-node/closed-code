@@ -8,8 +8,11 @@ use serde_json::Value;
 use crate::agent::commit_agent::CommitAgent;
 use crate::agent::review_agent::ReviewAgent;
 use crate::agent::AgentRequest;
+use chrono::Utc;
 use crate::config::Personality;
 use crate::error::{ClosedCodeError, Result};
+use crate::session::{SessionEvent, SessionId};
+use crate::session::store::SessionStore;
 use crate::gemini::stream::{consume_stream, StreamEvent, StreamResult};
 use crate::gemini::types::{Content, GenerateContentRequest, GenerationConfig, Part};
 use crate::gemini::GeminiClient;
@@ -49,6 +52,9 @@ pub struct Orchestrator {
     // Phase 7
     sandbox: Arc<dyn Sandbox>,
     protected_paths: Vec<String>,
+    // Phase 8a
+    session_id: Option<SessionId>,
+    session_store: Option<SessionStore>,
 }
 
 impl Orchestrator {
@@ -93,6 +99,8 @@ impl Orchestrator {
             git_context: None,
             sandbox,
             protected_paths,
+            session_id: None,
+            session_store: None,
         }
     }
 
@@ -106,6 +114,10 @@ impl Orchestrator {
         mut on_event: impl FnMut(StreamEvent),
     ) -> Result<String> {
         self.history.push(Content::user(input));
+        self.emit_event(SessionEvent::UserMessage {
+            content: input.to_string(),
+            timestamp: Utc::now(),
+        });
         self.prune_history();
 
         let request = self.build_request();
@@ -165,6 +177,10 @@ impl Orchestrator {
         match stream_result {
             StreamResult::Text { text, .. } => {
                 self.history.push(Content::model(&text));
+                self.emit_event(SessionEvent::AssistantMessage {
+                    content: text.clone(),
+                    timestamp: Utc::now(),
+                });
                 Ok(text)
             }
             StreamResult::FunctionCall {
@@ -345,7 +361,13 @@ impl Orchestrator {
     ///
     /// For regular tools, shows the standard spinner + checkmark pattern.
     async fn execute_and_display_tool(&self, name: &str, args: &serde_json::Value) -> serde_json::Value {
-        if name.starts_with("spawn_") {
+        self.emit_event(SessionEvent::ToolCall {
+            name: name.to_string(),
+            args: args.clone(),
+            timestamp: Utc::now(),
+        });
+
+        let result = if name.starts_with("spawn_") {
             let agent_type = &name["spawn_".len()..];
             let task = args["task"]
                 .as_str()
@@ -384,7 +406,15 @@ impl Orchestrator {
 
             println!("\u{2713} [tool] {}", display);
             result
-        }
+        };
+
+        self.emit_event(SessionEvent::ToolResponse {
+            name: name.to_string(),
+            result: result.to_string(),
+            timestamp: Utc::now(),
+        });
+
+        result
     }
 
     /// Build a GenerateContentRequest from current state.
@@ -619,7 +649,13 @@ impl Orchestrator {
     /// Switch to a different mode at runtime.
     /// Rebuilds the tool registry and system prompt. Preserves conversation history.
     pub fn set_mode(&mut self, mode: Mode) {
+        let old_mode = self.mode;
         self.mode = mode;
+        self.emit_event(SessionEvent::ModeChange {
+            from: old_mode.to_string(),
+            to: mode.to_string(),
+            timestamp: Utc::now(),
+        });
         self.registry = create_orchestrator_registry(
             self.working_directory.clone(),
             &self.mode,
@@ -695,8 +731,29 @@ impl Orchestrator {
     }
 
     /// Clear the conversation history.
+    /// If a session is active, emits SessionEnd and starts a new session.
     pub fn clear_history(&mut self) {
+        self.emit_event(SessionEvent::SessionEnd {
+            timestamp: Utc::now(),
+        });
         self.history.clear();
+        // Start new session if store configured
+        if self.session_store.is_some() {
+            let new_id = SessionId::new();
+            let event = SessionEvent::SessionStart {
+                session_id: new_id.clone(),
+                model: self.model_name.clone(),
+                mode: self.mode.to_string(),
+                working_directory: self.working_directory.display().to_string(),
+                timestamp: Utc::now(),
+            };
+            if let Some(store) = &self.session_store {
+                if let Err(e) = store.save_event(&new_id, &event) {
+                    tracing::warn!("Failed to save new SessionStart: {}", e);
+                }
+            }
+            self.session_id = Some(new_id);
+        }
     }
 
     /// Current mode.
@@ -821,6 +878,191 @@ impl Orchestrator {
         self.context_window_turns
     }
 
+    // ── Phase 8a: Session Management ──
+
+    /// Set session ID and store for this orchestrator.
+    pub fn set_session(&mut self, id: SessionId, store: SessionStore) {
+        self.session_id = Some(id);
+        self.session_store = Some(store);
+    }
+
+    /// Get current session ID.
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.session_id.as_ref()
+    }
+
+    /// Get reference to session store.
+    pub fn session_store(&self) -> Option<&SessionStore> {
+        self.session_store.as_ref()
+    }
+
+    /// Fire-and-forget session event emission.
+    pub fn emit_event(&self, event: SessionEvent) {
+        if let (Some(session_id), Some(store)) = (&self.session_id, &self.session_store) {
+            if let Err(e) = store.save_event(session_id, &event) {
+                tracing::warn!("Failed to save session event: {}", e);
+            }
+        }
+    }
+
+    /// Replace history (for resume/compact).
+    pub fn set_history(&mut self, history: Vec<Content>) {
+        self.history = history;
+    }
+
+    /// Get history reference.
+    pub fn history(&self) -> &[Content] {
+        &self.history
+    }
+
+    /// Start a new session with auto-generated ID.
+    pub fn start_session(&mut self, store: SessionStore) {
+        let session_id = SessionId::new();
+        let event = SessionEvent::SessionStart {
+            session_id: session_id.clone(),
+            model: self.model_name.clone(),
+            mode: self.mode.to_string(),
+            working_directory: self.working_directory.display().to_string(),
+            timestamp: Utc::now(),
+        };
+        if let Err(e) = store.save_event(&session_id, &event) {
+            tracing::warn!("Failed to save SessionStart: {}", e);
+        }
+        self.session_id = Some(session_id);
+        self.session_store = Some(store);
+    }
+
+    /// Fork current session into new ID.
+    pub fn fork_session(&mut self) -> Result<Option<SessionId>> {
+        let (session_id, store) = match (&self.session_id, &self.session_store) {
+            (Some(id), Some(store)) => (id.clone(), store.clone()),
+            _ => return Ok(None),
+        };
+        let new_id = SessionId::new();
+        store.fork_session(&session_id, &new_id)?;
+        // Mark fork point
+        store.save_event(
+            &new_id,
+            &SessionEvent::SessionStart {
+                session_id: new_id.clone(),
+                model: self.model_name.clone(),
+                mode: self.mode.to_string(),
+                working_directory: self.working_directory.display().to_string(),
+                timestamp: Utc::now(),
+            },
+        )?;
+        self.session_id = Some(new_id.clone());
+        Ok(Some(new_id))
+    }
+
+    /// Compact conversation via LLM summarization.
+    /// `user_prompt` is an optional instruction for how to summarize.
+    /// Always keeps the last 5 recent turns.
+    pub async fn compact_history(&mut self, user_prompt: Option<&str>) -> Result<String> {
+        const KEEP_RECENT: usize = 5;
+
+        if self.history.len() <= KEEP_RECENT + 1 {
+            return Err(ClosedCodeError::SessionError(
+                "History too short to compact (need more than 6 turns)".into(),
+            ));
+        }
+
+        let turns_before = self.history.len();
+
+        // Build text representation of history for summarization
+        let mut history_text = String::new();
+        for content in &self.history {
+            let role = content.role.as_deref().unwrap_or("system");
+            for part in &content.parts {
+                match part {
+                    Part::Text(t) => {
+                        history_text.push_str(&format!("[{}]: {}\n\n", role, t));
+                    }
+                    Part::FunctionCall { name, args, .. } => {
+                        history_text.push_str(&format!(
+                            "[{}]: Called tool {}({})\n\n",
+                            role, name, args
+                        ));
+                    }
+                    Part::FunctionResponse { name, response, .. } => {
+                        let resp_str = response.to_string();
+                        let truncated = if resp_str.len() > 200 {
+                            format!("{}...", &resp_str[..197])
+                        } else {
+                            resp_str
+                        };
+                        history_text
+                            .push_str(&format!("[{}]: Tool {} returned: {}\n\n", role, name, truncated));
+                    }
+                    Part::InlineData { mime_type, .. } => {
+                        history_text
+                            .push_str(&format!("[{}]: [Image: {}]\n\n", role, mime_type));
+                    }
+                }
+            }
+        }
+
+        let summarization_instruction = match user_prompt {
+            Some(prompt) => format!(
+                "Focus on: {}. Summarize this conversation in 500 words or fewer. \
+                 Preserve key decisions, code changes, file paths mentioned, and any important context.",
+                prompt
+            ),
+            None => "Summarize this conversation in 500 words or fewer. \
+                     Preserve key decisions, code changes, file paths mentioned, and any important context."
+                .to_string(),
+        };
+
+        let request = GenerateContentRequest {
+            contents: vec![Content::user(&format!(
+                "{}\n\n---\n\n{}",
+                summarization_instruction, history_text
+            ))],
+            system_instruction: Some(Content::system(
+                "You are a conversation summarizer. Produce a concise summary that preserves \
+                 the most important information: decisions made, files modified, code patterns \
+                 discussed, and any unresolved issues. Output ONLY the summary text.",
+            )),
+            generation_config: Some(GenerationConfig {
+                temperature: Some(0.3),
+                top_p: None,
+                top_k: None,
+                max_output_tokens: Some(2048),
+            }),
+            tools: None,
+            tool_config: None,
+        };
+
+        let response = self.client.generate_content(&request).await?;
+        let summary = response
+            .text()
+            .ok_or_else(|| {
+                ClosedCodeError::SessionError("Compact: empty summary from model".into())
+            })?
+            .to_string();
+
+        // Keep last N turns
+        let recent_start = self.history.len().saturating_sub(KEEP_RECENT);
+        let recent_turns: Vec<Content> = self.history[recent_start..].to_vec();
+
+        // Replace history: summary + recent turns
+        self.history = Vec::new();
+        self.history
+            .push(Content::user(&format!("[Previous conversation summary]: {}", summary)));
+        self.history.extend(recent_turns);
+
+        let turns_after = self.history.len();
+
+        self.emit_event(SessionEvent::Compact {
+            summary: summary.clone(),
+            turns_before,
+            turns_after,
+            timestamp: Utc::now(),
+        });
+
+        Ok(summary)
+    }
+
     // ── Phase 6: Git Context ──
 
     /// Detect git context for the working directory.
@@ -932,6 +1174,7 @@ impl std::fmt::Debug for Orchestrator {
             .field("cancelled", &self.is_cancelled())
             .field("personality", &self.personality)
             .field("model", &self.model_name)
+            .field("session_id", &self.session_id)
             .finish()
     }
 }
@@ -1728,5 +1971,151 @@ mod tests {
         use crate::agent::Agent;
         let agent = ReviewAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "reviewer");
+    }
+
+    // ── Phase 8a: Session Tests ──
+
+    #[test]
+    fn session_set_and_get() {
+        let mut orch = test_orchestrator();
+        assert!(orch.session_id().is_none());
+        assert!(orch.session_store().is_none());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let id = SessionId::new();
+        orch.set_session(id.clone(), store);
+
+        assert_eq!(orch.session_id(), Some(&id));
+        assert!(orch.session_store().is_some());
+    }
+
+    #[test]
+    fn emit_event_no_store_no_panic() {
+        let orch = test_orchestrator();
+        // Should not panic when no session store is set
+        orch.emit_event(SessionEvent::UserMessage {
+            content: "test".into(),
+            timestamp: Utc::now(),
+        });
+    }
+
+    #[test]
+    fn emit_event_with_store_writes_file() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let id = SessionId::new();
+        orch.set_session(id.clone(), store.clone());
+
+        orch.emit_event(SessionEvent::UserMessage {
+            content: "hello".into(),
+            timestamp: Utc::now(),
+        });
+
+        let events = store.load_events(&id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SessionEvent::UserMessage { .. }));
+    }
+
+    #[test]
+    fn set_history_replaces() {
+        let mut orch = test_orchestrator();
+        orch.history.push(Content::user("old"));
+        assert_eq!(orch.turn_count(), 1);
+
+        orch.set_history(vec![
+            Content::user("new1"),
+            Content::model("new2"),
+        ]);
+        assert_eq!(orch.turn_count(), 2);
+        assert_eq!(orch.history()[0].role.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn history_accessor() {
+        let mut orch = test_orchestrator();
+        assert!(orch.history().is_empty());
+        orch.history.push(Content::user("test"));
+        assert_eq!(orch.history().len(), 1);
+    }
+
+    #[test]
+    fn start_session_creates_id_and_writes() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+
+        orch.start_session(store);
+
+        assert!(orch.session_id().is_some());
+        assert!(orch.session_store().is_some());
+
+        // Verify SessionStart was written
+        let id = orch.session_id().unwrap();
+        let events = orch.session_store().unwrap().load_events(id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], SessionEvent::SessionStart { .. }));
+    }
+
+    #[test]
+    fn fork_session_creates_new_file() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        orch.start_session(store);
+
+        let original_id = orch.session_id().unwrap().clone();
+        let new_id = orch.fork_session().unwrap().unwrap();
+
+        assert_ne!(original_id, new_id);
+        assert_eq!(orch.session_id(), Some(&new_id));
+
+        // Both files should exist
+        let store = orch.session_store().unwrap();
+        assert!(store.session_path(&original_id).exists());
+        assert!(store.session_path(&new_id).exists());
+    }
+
+    #[test]
+    fn fork_session_without_store_returns_none() {
+        let mut orch = test_orchestrator();
+        let result = orch.fork_session().unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn clear_history_emits_session_end_when_store_present() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        orch.start_session(store);
+
+        let first_id = orch.session_id().unwrap().clone();
+        orch.history.push(Content::user("hello"));
+
+        orch.clear_history();
+
+        // History cleared
+        assert!(orch.history().is_empty());
+        // New session ID assigned
+        assert_ne!(orch.session_id().unwrap(), &first_id);
+
+        // Original session should have SessionStart + SessionEnd
+        let store = orch.session_store().unwrap();
+        let events = store.load_events(&first_id).unwrap();
+        assert!(events.len() >= 2);
+        assert!(matches!(events.last().unwrap(), SessionEvent::SessionEnd { .. }));
+    }
+
+    #[test]
+    fn debug_includes_session_id() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        orch.start_session(store);
+
+        let debug = format!("{:?}", orch);
+        assert!(debug.contains("session_id"));
     }
 }

@@ -67,6 +67,8 @@ pub struct TomlConfig {
     pub shell: Option<ShellConfig>,
     #[serde(default)]
     pub security: Option<SecurityConfig>,
+    #[serde(default)]
+    pub session: Option<SessionConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -78,6 +80,13 @@ pub struct ShellConfig {
 pub struct SecurityConfig {
     pub sandbox_mode: Option<String>,
     pub protected_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SessionConfig {
+    pub auto_save: Option<bool>,
+    pub transcript_logging: Option<bool>,
+    pub sessions_dir: Option<String>,
 }
 
 // ── Final Config ──
@@ -95,6 +104,10 @@ pub struct Config {
     pub max_output_tokens: u32,
     pub sandbox_mode: SandboxMode,
     pub protected_paths: Vec<String>,
+    // Phase 8a
+    pub session_auto_save: bool,
+    pub session_transcript_logging: bool,
+    pub sessions_dir: PathBuf,
 }
 
 impl Config {
@@ -192,6 +205,23 @@ impl Config {
             .and_then(|s| s.protected_paths)
             .unwrap_or_default();
 
+        let session_auto_save = merged
+            .session
+            .as_ref()
+            .and_then(|s| s.auto_save)
+            .unwrap_or(true);
+        let session_transcript_logging = merged
+            .session
+            .as_ref()
+            .and_then(|s| s.transcript_logging)
+            .unwrap_or(false);
+        let sessions_dir = merged
+            .session
+            .as_ref()
+            .and_then(|s| s.sessions_dir.as_ref())
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::session::store::SessionStore::default_dir);
+
         Ok(Self {
             api_key,
             model,
@@ -204,6 +234,9 @@ impl Config {
             max_output_tokens,
             sandbox_mode,
             protected_paths,
+            session_auto_save,
+            session_transcript_logging,
+            sessions_dir,
         })
     }
 
@@ -236,6 +269,7 @@ impl Config {
             verbose: overlay.verbose.or(base.verbose),
             shell: overlay.shell.or(base.shell),
             security: overlay.security.or(base.security),
+            session: overlay.session.or(base.session),
         }
     }
 
@@ -495,5 +529,63 @@ protected_paths = ["secrets/", "credentials.json"]
         let merged = Config::merge(base, overlay);
         let sec = merged.security.unwrap();
         assert_eq!(sec.sandbox_mode.as_deref(), Some("full-access"));
+    }
+
+    // ── Session Config Tests ──
+
+    #[test]
+    fn config_toml_session_section() {
+        let toml_str = r#"
+api_key = "key"
+
+[session]
+auto_save = false
+transcript_logging = true
+sessions_dir = "/tmp/my-sessions"
+"#;
+        let config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let sess = config.session.unwrap();
+        assert_eq!(sess.auto_save, Some(false));
+        assert_eq!(sess.transcript_logging, Some(true));
+        assert_eq!(sess.sessions_dir.as_deref(), Some("/tmp/my-sessions"));
+    }
+
+    #[test]
+    fn config_toml_session_empty() {
+        let config: TomlConfig = toml::from_str("").unwrap();
+        assert!(config.session.is_none());
+    }
+
+    #[test]
+    fn config_session_defaults() {
+        let cli = Cli::parse_from(["closed-code", "--api-key", "test-key"]);
+        let config = Config::from_cli(&cli).unwrap();
+        assert!(config.session_auto_save); // default true
+        assert!(!config.session_transcript_logging); // default false
+        assert!(config.sessions_dir.to_string_lossy().contains("sessions"));
+    }
+
+    #[test]
+    fn config_merge_session() {
+        let base = TomlConfig {
+            session: Some(SessionConfig {
+                auto_save: Some(true),
+                transcript_logging: Some(false),
+                sessions_dir: Some("/base/sessions".into()),
+            }),
+            ..Default::default()
+        };
+        let overlay = TomlConfig {
+            session: Some(SessionConfig {
+                auto_save: Some(false),
+                transcript_logging: Some(true),
+                sessions_dir: None,
+            }),
+            ..Default::default()
+        };
+        let merged = Config::merge(base, overlay);
+        let sess = merged.session.unwrap();
+        assert_eq!(sess.auto_save, Some(false)); // overlay wins
+        assert_eq!(sess.transcript_logging, Some(true));
     }
 }

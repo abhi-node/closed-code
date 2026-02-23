@@ -107,6 +107,13 @@ pub enum ClosedCodeError {
 
     #[error("Invalid sandbox mode '{0}'. Expected: workspace-only, workspace-write, full-access")]
     InvalidSandboxMode(String),
+
+    // Session errors (Phase 8a)
+    #[error("Session not found: {0}")]
+    SessionNotFound(String),
+
+    #[error("Session error: {0}")]
+    SessionError(String),
 }
 
 impl ClosedCodeError {
@@ -362,6 +369,29 @@ mod tests {
             ClosedCodeError::InvalidSandboxMode("bad".into()).to_string(),
             "Invalid sandbox mode 'bad'. Expected: workspace-only, workspace-write, full-access"
         );
+    }
+
+    #[test]
+    fn session_error_display_messages() {
+        assert_eq!(
+            ClosedCodeError::SessionNotFound("abc-123".into()).to_string(),
+            "Session not found: abc-123"
+        );
+        assert_eq!(
+            ClosedCodeError::SessionError("failed to write".into()).to_string(),
+            "Session error: failed to write"
+        );
+    }
+
+    #[test]
+    fn session_errors_are_not_retryable() {
+        let errors: Vec<ClosedCodeError> = vec![
+            ClosedCodeError::SessionNotFound("abc".into()),
+            ClosedCodeError::SessionError("fail".into()),
+        ];
+        for err in &errors {
+            assert!(!err.is_retryable(), "Expected not retryable: {err}");
+        }
     }
 
     #[test]

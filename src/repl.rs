@@ -7,11 +7,16 @@ use crossterm::style::Stylize;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+use chrono::Utc;
 use crate::agent::orchestrator::Orchestrator;
 use crate::config::{Config, Personality};
 use crate::gemini::stream::StreamEvent;
+use crate::gemini::types::Part;
 use crate::gemini::GeminiClient;
 use crate::sandbox::create_sandbox;
+use crate::session::{SessionEvent, SessionId};
+use crate::session::store::SessionStore;
+use crate::session::transcript::TranscriptWriter;
 use crate::ui::approval::{ApprovalHandler, DiffOnlyApprovalHandler, TerminalApprovalHandler};
 use crate::ui::spinner::Spinner;
 use crate::ui::theme::Theme;
@@ -121,6 +126,13 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
         config.protected_paths.clone(),
     );
     orchestrator.detect_git_context().await;
+
+    // Phase 8a: Auto-start session
+    if config.session_auto_save {
+        let store = SessionStore::new(config.sessions_dir.clone());
+        orchestrator.start_session(store);
+    }
+
     let mut editor = DefaultEditor::new()?;
 
     println!("{}", styled_text("closed-code", Theme::ACCENT));
@@ -136,6 +148,9 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
     );
     println!("Sandbox: {}", orchestrator.sandbox_summary());
     println!("Git: {}", orchestrator.git_summary());
+    if let Some(id) = orchestrator.session_id() {
+        println!("Session: {}", &id.as_str()[..8]);
+    }
     println!("Type /help for commands, Ctrl+C to interrupt, /quit to exit.\n");
 
     // Spawn a background task that sets the cancellation flag on Ctrl+C.
@@ -270,6 +285,212 @@ pub async fn run_repl(config: &Config) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Phase 8a: Emit SessionEnd on exit
+    orchestrator.emit_event(SessionEvent::SessionEnd {
+        timestamp: Utc::now(),
+    });
+
+    Ok(())
+}
+
+/// Resume a previous session by ID, or list sessions if no ID given.
+pub async fn run_resume(config: &Config, session_id_str: Option<&str>) -> anyhow::Result<()> {
+    let store = SessionStore::new(config.sessions_dir.clone());
+
+    let session_id = if let Some(id_str) = session_id_str {
+        SessionId::parse(id_str).map_err(|e| anyhow::anyhow!("Invalid session ID: {}", e))?
+    } else {
+        // List recent sessions
+        let sessions = store.list_sessions().map_err(|e| anyhow::anyhow!("{}", e))?;
+        if sessions.is_empty() {
+            println!("No sessions found.");
+            return Ok(());
+        }
+
+        println!("Recent sessions:");
+        let show = sessions.len().min(10);
+        for (i, meta) in sessions.iter().take(show).enumerate() {
+            println!(
+                "  {}. {} ({}) — {} — {}",
+                i + 1,
+                &meta.session_id.as_str()[..8],
+                meta.relative_time(),
+                meta.mode,
+                meta.truncated_preview(),
+            );
+        }
+
+        // Read selection from stdin
+        println!("\nEnter session number (1-{}):", show);
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let idx: usize = input.trim().parse().map_err(|_| anyhow::anyhow!("Invalid selection"))?;
+        if idx < 1 || idx > show {
+            return Err(anyhow::anyhow!("Selection out of range"));
+        }
+        sessions[idx - 1].session_id.clone()
+    };
+
+    let events = store.load_events(&session_id).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let history = SessionStore::reconstruct_history(&events);
+    let turn_count = history.len();
+
+    println!(
+        "Resumed session {} ({} turns restored)",
+        &session_id.as_str()[..8],
+        turn_count
+    );
+
+    // Create orchestrator with restored history
+    let client = Arc::new(GeminiClient::new(
+        config.api_key.clone(),
+        config.model.clone(),
+    ));
+    let sandbox = create_sandbox(config.sandbox_mode, config.working_directory.clone());
+    let approval_handler: Arc<dyn ApprovalHandler> = Arc::new(DiffOnlyApprovalHandler::new());
+    let mut orchestrator = Orchestrator::new(
+        client,
+        config.mode,
+        config.working_directory.clone(),
+        config.max_output_tokens,
+        approval_handler,
+        config.personality,
+        config.context_window_turns,
+        sandbox,
+        config.protected_paths.clone(),
+    );
+    orchestrator.detect_git_context().await;
+    orchestrator.set_history(history);
+    orchestrator.set_session(session_id, store);
+
+    // Run the same REPL loop
+    let mut editor = DefaultEditor::new()?;
+
+    println!("{}", styled_text("closed-code", Theme::ACCENT));
+    println!(
+        "Mode: {} | Model: {} | Tools: {}",
+        config.mode,
+        config.model,
+        orchestrator.tool_count()
+    );
+    println!(
+        "Working directory: {}",
+        config.working_directory.display()
+    );
+    if let Some(id) = orchestrator.session_id() {
+        println!("Session: {} (resumed)", &id.as_str()[..8]);
+    }
+    println!("Type /help for commands, Ctrl+C to interrupt, /quit to exit.\n");
+
+    let cancel_flag = orchestrator.cancel_flag();
+    tokio::spawn(async move {
+        loop {
+            tokio::signal::ctrl_c().await.ok();
+            cancel_flag.store(true, Ordering::SeqCst);
+        }
+    });
+
+    loop {
+        let prompt = format!("{} > ", orchestrator.mode());
+        match editor.readline(&prompt) {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let _ = editor.add_history_entry(line);
+
+                if line.starts_with('!') {
+                    let shell_cmd = &line[1..];
+                    if !shell_cmd.is_empty() {
+                        match execute_local_shell(shell_cmd, &config.working_directory).await {
+                            Ok(output) => {
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                if !stdout.is_empty() { print!("{}", stdout); }
+                                if !stderr.is_empty() { eprint!("{}", stderr); }
+                            }
+                            Err(e) => {
+                                eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if line.starts_with('/') {
+                    match handle_slash_command(line, &mut orchestrator).await {
+                        SlashResult::Continue => continue,
+                        SlashResult::Quit => break,
+                        SlashResult::ExecutePlan => {
+                            orchestrator.reset_cancel();
+                            match orchestrator
+                                .handle_user_input_streaming(
+                                    "Execute the accepted plan step by step.",
+                                    default_stream_handler,
+                                )
+                                .await
+                            {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!("\n{}: {}", styled_text("Error", Theme::ERROR), e);
+                                }
+                            }
+                            drain_stdin();
+                            if orchestrator.is_cancelled() {
+                                println!("\n{}", styled_text("Interrupted.", Theme::DIM));
+                                orchestrator.record_interruption();
+                            }
+                            println!();
+                            continue;
+                        }
+                    }
+                }
+
+                orchestrator.reset_cancel();
+                match orchestrator
+                    .handle_user_input_streaming(line, default_stream_handler)
+                    .await
+                {
+                    Ok(ref text) => {
+                        if !orchestrator.is_cancelled()
+                            && *orchestrator.mode() == crate::mode::Mode::Plan
+                            && !text.is_empty()
+                        {
+                            orchestrator.set_current_plan(text.clone());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("\n{}: {}", styled_text("Error", Theme::ERROR), e);
+                    }
+                }
+                drain_stdin();
+                if orchestrator.is_cancelled() {
+                    println!("\n{}", styled_text("Interrupted.", Theme::DIM));
+                    orchestrator.record_interruption();
+                }
+                println!();
+            }
+            Err(ReadlineError::Interrupted) => {
+                orchestrator.reset_cancel();
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!("Goodbye!");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Input error: {}", e);
+                break;
+            }
+        }
+    }
+
+    orchestrator.emit_event(SessionEvent::SessionEnd {
+        timestamp: Utc::now(),
+    });
 
     Ok(())
 }
@@ -416,6 +637,12 @@ async fn handle_slash_command(
             println!("  /personality [s]   \u{2014} Show or change personality (friendly, pragmatic, none)");
             println!("  /sandbox           \u{2014} Show sandbox mode, backend, and protected paths");
             println!("  /status            \u{2014} Show session status (tokens, model, mode, etc.)");
+            println!("  /new               \u{2014} Start a new session (clears history)");
+            println!("  /fork              \u{2014} Fork current session into a new one");
+            println!("  /compact [prompt]  \u{2014} Compact conversation history via LLM summarization");
+            println!("  /history [N]       \u{2014} Show last N conversation turns (default: 10)");
+            println!("  /export [file]     \u{2014} Export session transcript to markdown");
+            println!("  /resume            \u{2014} List recent sessions (use `closed-code resume` to resume)");
             println!("  /clear             \u{2014} Clear conversation history");
             println!("  /quit              \u{2014} Exit");
             println!();
@@ -462,6 +689,9 @@ async fn handle_slash_command(
                 orchestrator.context_window_turns(),
                 orchestrator.tool_count(),
             );
+            if let Some(id) = orchestrator.session_id() {
+                println!("Session: {} (auto-save enabled)", &id.as_str()[..8]);
+            }
             SlashResult::Continue
         }
         "/sandbox" => {
@@ -688,6 +918,184 @@ async fn handle_slash_command(
             }
             SlashResult::Continue
         }
+        // ── Phase 8a: Session Commands ──
+        "/new" => {
+            orchestrator.clear_history();
+            if let Some(id) = orchestrator.session_id() {
+                println!("New session started: {}", &id.as_str()[..8]);
+            } else {
+                println!("History cleared. (No session store configured.)");
+            }
+            SlashResult::Continue
+        }
+        "/fork" => {
+            match orchestrator.fork_session() {
+                Ok(Some(new_id)) => {
+                    println!(
+                        "{} Forked to new session: {}",
+                        styled_text("\u{2713}", Theme::SUCCESS),
+                        &new_id.as_str()[..8]
+                    );
+                }
+                Ok(None) => {
+                    println!("No active session to fork.");
+                }
+                Err(e) => {
+                    eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
+                }
+            }
+            SlashResult::Continue
+        }
+        "/compact" => {
+            let user_prompt = if arg.is_empty() { None } else { Some(arg) };
+            let turns_before = orchestrator.turn_count();
+            match orchestrator.compact_history(user_prompt).await {
+                Ok(summary) => {
+                    println!(
+                        "{} Compacted: {} turns \u{2192} {} turns",
+                        styled_text("\u{2713}", Theme::SUCCESS),
+                        turns_before,
+                        orchestrator.turn_count(),
+                    );
+                    println!(
+                        "{}",
+                        styled_text("Summary:", Theme::DIM),
+                    );
+                    // Show first 200 chars of summary
+                    let preview = if summary.len() > 200 {
+                        format!("{}...", &summary[..197])
+                    } else {
+                        summary
+                    };
+                    println!("{}", preview);
+                }
+                Err(e) => {
+                    eprintln!("{}: {}", styled_text("Error", Theme::ERROR), e);
+                }
+            }
+            SlashResult::Continue
+        }
+        "/history" => {
+            let n: usize = if arg.is_empty() {
+                10
+            } else {
+                arg.parse().unwrap_or(10)
+            };
+
+            let history = orchestrator.history();
+            if history.is_empty() {
+                println!("No conversation history.");
+            } else {
+                let start = history.len().saturating_sub(n);
+                for (i, content) in history[start..].iter().enumerate() {
+                    let role = content.role.as_deref().unwrap_or("system");
+                    let text: String = content
+                        .parts
+                        .iter()
+                        .filter_map(|p| match p {
+                            Part::Text(t) => Some(t.as_str()),
+                            Part::FunctionCall { name, .. } => {
+                                Some(name.as_str())
+                            }
+                            Part::FunctionResponse { name, .. } => {
+                                Some(name.as_str())
+                            }
+                            Part::InlineData { mime_type, .. } => {
+                                Some(mime_type.as_str())
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let truncated = if text.len() > 120 {
+                        format!("{}...", &text[..117])
+                    } else {
+                        text
+                    };
+                    println!("  [{}] {}: {}", start + i + 1, role, truncated);
+                }
+            }
+            SlashResult::Continue
+        }
+        "/export" => {
+            let file_path = if arg.is_empty() {
+                "transcript.md"
+            } else {
+                arg
+            };
+
+            if let Some(store) = orchestrator.session_store() {
+                if let Some(id) = orchestrator.session_id() {
+                    match store.load_events(id) {
+                        Ok(events) => {
+                            match TranscriptWriter::write_to_file(&events, file_path) {
+                                Ok(()) => {
+                                    println!(
+                                        "{} Exported {} events to {}",
+                                        styled_text("\u{2713}", Theme::SUCCESS),
+                                        events.len(),
+                                        file_path
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}: {}",
+                                        styled_text("Error", Theme::ERROR),
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "{}: {}",
+                                styled_text("Error", Theme::ERROR),
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    println!("No active session to export.");
+                }
+            } else {
+                println!("No session store configured. Enable [session] auto_save = true.");
+            }
+            SlashResult::Continue
+        }
+        "/resume" => {
+            if let Some(store) = orchestrator.session_store() {
+                match store.list_sessions() {
+                    Ok(sessions) if sessions.is_empty() => {
+                        println!("No sessions found.");
+                    }
+                    Ok(sessions) => {
+                        println!("Recent sessions:");
+                        for (i, meta) in sessions.iter().take(10).enumerate() {
+                            println!(
+                                "  {}. {} ({}) \u{2014} {} \u{2014} {}",
+                                i + 1,
+                                &meta.session_id.as_str()[..8],
+                                meta.relative_time(),
+                                meta.mode,
+                                meta.truncated_preview(),
+                            );
+                        }
+                        println!(
+                            "\nTo resume, run: closed-code resume <session-id>"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{}: {}",
+                            styled_text("Error", Theme::ERROR),
+                            e
+                        );
+                    }
+                }
+            } else {
+                println!("No session store configured.");
+            }
+            SlashResult::Continue
+        }
         _ => {
             println!(
                 "Unknown command: {}. Type /help for available commands.",
@@ -701,6 +1109,7 @@ async fn handle_slash_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gemini::types::Content;
     use crate::sandbox::mock::MockSandbox;
     use crate::sandbox::Sandbox;
     use crate::ui::approval::{ApprovalHandler, AutoApproveHandler};
@@ -1034,5 +1443,126 @@ mod tests {
         let orch = test_orchestrator();
         let summary = orch.sandbox_summary();
         assert!(!summary.is_empty());
+    }
+
+    // ── Phase 8a: Session Slash Command Tests ──
+
+    #[tokio::test]
+    async fn slash_new_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/new", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(orch.turn_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn slash_fork_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/fork", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_fork_with_session() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        orch.start_session(store);
+
+        let original_id = orch.session_id().unwrap().clone();
+        let result = handle_slash_command("/fork", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+        // Session ID should have changed
+        assert_ne!(orch.session_id().unwrap(), &original_id);
+    }
+
+    #[tokio::test]
+    async fn slash_compact_too_short() {
+        let mut orch = test_orchestrator();
+        // No history — should error
+        let result = handle_slash_command("/compact", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_history_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/history", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_history_with_turns() {
+        let mut orch = test_orchestrator();
+        // Manually add some history through set_history
+        orch.set_history(vec![
+            Content::user("hello"),
+            Content::model("hi"),
+        ]);
+        let result = handle_slash_command("/history 5", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_export_no_session() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/export", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_export_with_session() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        orch.start_session(store);
+
+        let export_path = dir.path().join("test_transcript.md");
+        let cmd = format!("/export {}", export_path.display());
+        let result = handle_slash_command(&cmd, &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+        assert!(export_path.exists());
+    }
+
+    #[tokio::test]
+    async fn slash_resume_returns_continue() {
+        let mut orch = test_orchestrator();
+        let result = handle_slash_command("/resume", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_new_with_session_starts_new() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        orch.start_session(store);
+
+        let original_id = orch.session_id().unwrap().clone();
+        orch.set_history(vec![Content::user("hello")]);
+
+        let result = handle_slash_command("/new", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+        assert_eq!(orch.turn_count(), 0);
+        assert_ne!(orch.session_id().unwrap(), &original_id);
+    }
+
+    #[tokio::test]
+    async fn slash_help_includes_session_commands() {
+        let mut orch = test_orchestrator();
+        // Just verify it returns Continue (help output goes to stdout)
+        let result = handle_slash_command("/help", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
+    }
+
+    #[tokio::test]
+    async fn slash_status_with_session() {
+        let mut orch = test_orchestrator();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path().to_path_buf());
+        orch.start_session(store);
+
+        let result = handle_slash_command("/status", &mut orch).await;
+        assert!(matches!(result, SlashResult::Continue));
     }
 }

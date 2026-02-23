@@ -51,6 +51,12 @@ pub enum Commands {
         /// The question to ask
         question: String,
     },
+    /// Resume a previous session
+    Resume {
+        /// Session ID to resume (optional — lists sessions if omitted)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -91,7 +97,7 @@ mod tests {
         let cli = Cli::parse_from(["closed-code", "ask", "What is Rust?"]);
         match cli.command {
             Some(Commands::Ask { question }) => assert_eq!(question, "What is Rust?"),
-            None => panic!("Expected Ask command"),
+            _ => panic!("Expected Ask command"),
         }
     }
 
@@ -138,5 +144,36 @@ mod tests {
     fn parse_sandbox_flag() {
         let cli = Cli::parse_from(["closed-code", "--sandbox", "workspace-only"]);
         assert_eq!(cli.sandbox.as_deref(), Some("workspace-only"));
+    }
+
+    #[test]
+    fn parse_resume_with_session_id() {
+        let cli = Cli::parse_from(["closed-code", "resume", "abc-123"]);
+        match cli.command {
+            Some(Commands::Resume { session_id }) => {
+                assert_eq!(session_id.as_deref(), Some("abc-123"));
+            }
+            _ => panic!("Expected Resume command"),
+        }
+    }
+
+    #[test]
+    fn parse_resume_without_session_id() {
+        let cli = Cli::parse_from(["closed-code", "resume"]);
+        match cli.command {
+            Some(Commands::Resume { session_id }) => {
+                assert!(session_id.is_none());
+            }
+            _ => panic!("Expected Resume command"),
+        }
+    }
+
+    #[test]
+    fn existing_commands_unchanged() {
+        let cli = Cli::parse_from(["closed-code", "ask", "hello"]);
+        assert!(matches!(cli.command, Some(Commands::Ask { .. })));
+
+        let cli2 = Cli::parse_from(["closed-code"]);
+        assert!(cli2.command.is_none());
     }
 }
