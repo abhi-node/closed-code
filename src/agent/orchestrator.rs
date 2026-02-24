@@ -621,11 +621,7 @@ impl Orchestrator {
                  You CANNOT modify files. Your job is to:\n\
                  1. Understand the user's requirements\n\
                  2. Research the codebase using filesystem tools and sub-agents\n\
-                 3. Produce a clear, structured implementation plan with:\n\
-                    - Step-by-step implementation order\n\
-                    - Files to create or modify (with specific changes)\n\
-                    - Code patterns to follow from the existing codebase\n\
-                    - Potential risks or trade-offs\n\
+                 3. Produce a clear, structured implementation plan\n\
                  \n\
                  Available tools:\n\
                  - spawn_explorer: Deep codebase research (use for multi-file analysis)\n\
@@ -640,7 +636,16 @@ impl Orchestrator {
                  focused on the user conversation rather than raw file contents. Reserve \
                  direct tool use (read_file, grep) for quick, targeted lookups.\n\
                  \n\
-                 The user will either:\n\
+                 IMPORTANT: You MUST always end your response with a concrete implementation \
+                 plan. Even if you have questions or need clarification, still present your \
+                 best plan based on current understanding. The plan should be clearly \
+                 formatted with:\n\
+                 - Step-by-step implementation order (numbered)\n\
+                 - Files to create or modify (with specific changes described)\n\
+                 - Code patterns to follow from the existing codebase\n\
+                 - Potential risks or trade-offs\n\
+                 \n\
+                 The user can then:\n\
                  - Give feedback to refine the plan (continue the conversation)\n\
                  - Accept the plan with /accept (choose Guided, Execute, or Auto mode)"
             }

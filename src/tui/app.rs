@@ -1099,7 +1099,15 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
             }
             AppEvent::OrchestratorDone => {
                 // Refresh status from orchestrator
-                let orch = orchestrator.lock().await;
+                let mut orch = orchestrator.lock().await;
+                // Capture plan text in Plan mode (matches repl.rs behavior)
+                if *orch.mode() == crate::mode::Mode::Plan {
+                    if let Some(ChatMessage::Assistant { ref text, .. }) = app.messages.last() {
+                        if !text.is_empty() {
+                            orch.set_current_plan(text.clone());
+                        }
+                    }
+                }
                 app.status = StatusSnapshot::from_orchestrator(&orch);
                 drop(orch);
                 app.state = AppState::Idle;
