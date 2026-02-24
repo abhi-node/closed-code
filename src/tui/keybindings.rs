@@ -43,6 +43,30 @@ pub enum Action {
     PickerBackspace,
     PickerFilter(char),
 
+    // ── Approval Overlay (Phase 9d) ──
+    ApprovalApprove,
+    ApprovalReject,
+    ApprovalOpenDiff,
+
+    // ── Diff View (Phase 9d) ──
+    DiffScrollUp,
+    DiffScrollDown,
+    DiffHalfPageUp,
+    DiffHalfPageDown,
+    DiffTop,
+    DiffBottom,
+    DiffClose,
+
+    // ── List Picker — shared for session/mode (Phase 9d) ──
+    ListUp,
+    ListDown,
+    ListSelect,
+    ListDismiss,
+
+    // ── Mode Confirmation (Phase 9d) ──
+    ModeConfirmYes,
+    ModeConfirmNo,
+
     Noop,
 }
 
@@ -62,6 +86,16 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
         AppState::Thinking => map_thinking(key),
         AppState::Streaming => map_streaming(key),
         AppState::ToolExecuting { .. } => map_thinking(key),
+        AppState::AwaitingApproval => map_approval(key),
+        AppState::DiffView => map_diff_view(key),
+        AppState::SessionPicker => map_list_picker(key),
+        AppState::ModePicker { confirming_auto } => {
+            if *confirming_auto {
+                map_mode_confirm(key)
+            } else {
+                map_list_picker(key)
+            }
+        }
         AppState::Exiting => Action::Noop,
     }
 }
@@ -127,6 +161,48 @@ fn map_picker(key: KeyEvent) -> Action {
         (KeyCode::Esc, _) => Action::PickerDismiss,
         (KeyCode::Backspace, _) => Action::PickerBackspace,
         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => Action::PickerFilter(c),
+        _ => Action::Noop,
+    }
+}
+
+fn map_approval(key: KeyEvent) -> Action {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), _) => Action::ApprovalApprove,
+        (KeyCode::Char('n'), _) | (KeyCode::Esc, _) => Action::ApprovalReject,
+        (KeyCode::Char('d'), _) => Action::ApprovalOpenDiff,
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => Action::DiffScrollUp,
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => Action::DiffScrollDown,
+        _ => Action::Noop,
+    }
+}
+
+fn map_diff_view(key: KeyEvent) -> Action {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => Action::DiffScrollDown,
+        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => Action::DiffScrollUp,
+        (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => Action::DiffHalfPageDown,
+        (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => Action::DiffHalfPageUp,
+        (KeyCode::Char('g'), _) => Action::DiffTop,
+        (KeyCode::Char('G'), _) => Action::DiffBottom,
+        (KeyCode::Char('q'), _) | (KeyCode::Esc, _) => Action::DiffClose,
+        _ => Action::Noop,
+    }
+}
+
+fn map_list_picker(key: KeyEvent) -> Action {
+    match (key.code, key.modifiers) {
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => Action::ListUp,
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => Action::ListDown,
+        (KeyCode::Enter, _) => Action::ListSelect,
+        (KeyCode::Esc, _) => Action::ListDismiss,
+        _ => Action::Noop,
+    }
+}
+
+fn map_mode_confirm(key: KeyEvent) -> Action {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('y'), _) => Action::ModeConfirmYes,
+        (KeyCode::Char('n'), _) | (KeyCode::Esc, _) => Action::ModeConfirmNo,
         _ => Action::Noop,
     }
 }
@@ -303,5 +379,68 @@ mod tests {
             tool_name: "read_file".into(),
         };
         assert_eq!(map_key(key(KeyCode::Char('a')), &state), Action::Noop);
+    }
+
+    // ── Phase 9d: Approval Overlay ──
+    #[test]
+    fn approval_y_approves() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('y')), &AppState::AwaitingApproval),
+            Action::ApprovalApprove
+        );
+    }
+
+    #[test]
+    fn approval_n_rejects() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('n')), &AppState::AwaitingApproval),
+            Action::ApprovalReject
+        );
+    }
+
+    #[test]
+    fn approval_d_opens_diff() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('d')), &AppState::AwaitingApproval),
+            Action::ApprovalOpenDiff
+        );
+    }
+
+    // ── Phase 9d: Diff View ──
+    #[test]
+    fn diff_j_scrolls_down() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('j')), &AppState::DiffView),
+            Action::DiffScrollDown
+        );
+    }
+
+    #[test]
+    fn diff_q_closes() {
+        assert_eq!(
+            map_key(key(KeyCode::Char('q')), &AppState::DiffView),
+            Action::DiffClose
+        );
+    }
+
+    // ── Phase 9d: List Picker (Session/Mode) ──
+    #[test]
+    fn session_enter_selects() {
+        assert_eq!(
+            map_key(key(KeyCode::Enter), &AppState::SessionPicker),
+            Action::ListSelect
+        );
+    }
+
+    // ── Phase 9d: Mode Confirm ──
+    #[test]
+    fn mode_confirm_y() {
+        let state = AppState::ModePicker {
+            confirming_auto: true,
+        };
+        assert_eq!(
+            map_key(key(KeyCode::Char('y')), &state),
+            Action::ModeConfirmYes
+        );
     }
 }

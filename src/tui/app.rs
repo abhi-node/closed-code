@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use ratatui::DefaultTerminal;
+use tokio::sync::oneshot;
 
 use crate::agent::orchestrator::{Orchestrator, OrchestratorConfig};
 use crate::config::Config;
@@ -9,15 +10,20 @@ use crate::mode::Mode;
 use crate::sandbox::create_sandbox;
 use crate::session::store::SessionStore;
 use crate::session::{SessionEvent, SessionId};
-use crate::ui::approval::DiffOnlyApprovalHandler;
+use crate::ui::approval::ApprovalDecision;
 
+use super::approval_overlay::ApprovalOverlay;
 use super::chat::{ChatMessage, ChatViewport};
 use super::command_picker::CommandPicker;
 use super::commands::{self, CommandResult};
+use super::diff_view::DiffView;
 use super::events::{self, AppEvent};
 use super::input::InputPane;
 use super::keybindings::{self, Action};
 use super::layout;
+use super::mode_picker::ModePicker;
+use super::session_picker::SessionPicker;
+use super::tui_approval_handler::TuiApprovalHandler;
 
 /// Application state machine.
 ///
@@ -31,6 +37,10 @@ pub enum AppState {
     Thinking,
     Streaming,
     ToolExecuting { tool_name: String },
+    AwaitingApproval,
+    DiffView,
+    SessionPicker,
+    ModePicker { confirming_auto: bool },
     Exiting,
 }
 
@@ -97,6 +107,12 @@ pub struct App<'a> {
     pub pending_input: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub chat_viewport: ChatViewport,
+    // Phase 9d overlays
+    pub approval_overlay: Option<ApprovalOverlay>,
+    pub approval_response_tx: Option<oneshot::Sender<ApprovalDecision>>,
+    pub diff_view_state: Option<DiffView>,
+    pub session_picker: Option<SessionPicker>,
+    pub mode_picker: Option<ModePicker>,
 }
 
 impl<'a> App<'a> {
@@ -270,6 +286,159 @@ impl<'a> App<'a> {
                 }
             }
 
+            // ── Phase 9d: Approval overlay ──
+            Action::ApprovalApprove => {
+                if let Some(tx) = self.approval_response_tx.take() {
+                    let _ = tx.send(ApprovalDecision::Approved);
+                }
+                let file = self
+                    .approval_overlay
+                    .as_ref()
+                    .map(|o| o.file_path.clone())
+                    .unwrap_or_default();
+                self.approval_overlay = None;
+                self.messages.push(ChatMessage::System {
+                    text: format!("Approved: {}", file),
+                });
+                self.state = AppState::Thinking;
+            }
+            Action::ApprovalReject => {
+                if let Some(tx) = self.approval_response_tx.take() {
+                    let _ = tx.send(ApprovalDecision::Rejected);
+                }
+                let file = self
+                    .approval_overlay
+                    .as_ref()
+                    .map(|o| o.file_path.clone())
+                    .unwrap_or_default();
+                self.approval_overlay = None;
+                self.messages.push(ChatMessage::System {
+                    text: format!("Rejected: {}", file),
+                });
+                self.state = AppState::Thinking;
+            }
+            Action::ApprovalOpenDiff => {
+                if let Some(ref overlay) = self.approval_overlay {
+                    self.diff_view_state = Some(DiffView::new(
+                        overlay.file_path.clone(),
+                        overlay.diff_lines.clone(),
+                        overlay.additions,
+                        overlay.deletions,
+                    ));
+                    self.state = AppState::DiffView;
+                }
+            }
+
+            // ── Phase 9d: Diff view ──
+            Action::DiffScrollUp => {
+                if self.state == AppState::DiffView {
+                    if let Some(ref mut view) = self.diff_view_state {
+                        view.scroll_up(1);
+                    }
+                } else if self.state == AppState::AwaitingApproval {
+                    if let Some(ref mut overlay) = self.approval_overlay {
+                        overlay.scroll_up(1);
+                    }
+                }
+            }
+            Action::DiffScrollDown => {
+                if self.state == AppState::DiffView {
+                    if let Some(ref mut view) = self.diff_view_state {
+                        view.scroll_down(1);
+                    }
+                } else if self.state == AppState::AwaitingApproval {
+                    if let Some(ref mut overlay) = self.approval_overlay {
+                        overlay.scroll_down(1, 20); // approximate visible
+                    }
+                }
+            }
+            Action::DiffHalfPageUp => {
+                if let Some(ref mut view) = self.diff_view_state {
+                    view.page_up();
+                }
+            }
+            Action::DiffHalfPageDown => {
+                if let Some(ref mut view) = self.diff_view_state {
+                    view.page_down();
+                }
+            }
+            Action::DiffTop => {
+                if let Some(ref mut view) = self.diff_view_state {
+                    view.scroll_to_top();
+                }
+            }
+            Action::DiffBottom => {
+                if let Some(ref mut view) = self.diff_view_state {
+                    view.scroll_to_bottom();
+                }
+            }
+            Action::DiffClose => {
+                self.diff_view_state = None;
+                self.state = AppState::AwaitingApproval;
+            }
+
+            // ── Phase 9d: List picker (shared session/mode) ──
+            Action::ListUp => match self.state {
+                AppState::SessionPicker => {
+                    if let Some(ref mut picker) = self.session_picker {
+                        picker.move_up();
+                    }
+                }
+                AppState::ModePicker { .. } => {
+                    if let Some(ref mut picker) = self.mode_picker {
+                        picker.move_up();
+                    }
+                }
+                _ => {}
+            },
+            Action::ListDown => match self.state {
+                AppState::SessionPicker => {
+                    if let Some(ref mut picker) = self.session_picker {
+                        picker.move_down();
+                    }
+                }
+                AppState::ModePicker { .. } => {
+                    if let Some(ref mut picker) = self.mode_picker {
+                        picker.move_down();
+                    }
+                }
+                _ => {}
+            },
+            Action::ListSelect => {
+                // Handled by run() because it needs orchestrator access
+            }
+            Action::ListDismiss => {
+                match self.state {
+                    AppState::SessionPicker => {
+                        self.session_picker = None;
+                        self.messages.push(ChatMessage::System {
+                            text: "Cancelled.".into(),
+                        });
+                    }
+                    AppState::ModePicker { .. } => {
+                        self.mode_picker = None;
+                        self.messages.push(ChatMessage::System {
+                            text: "Cancelled.".into(),
+                        });
+                    }
+                    _ => {}
+                }
+                self.state = AppState::Idle;
+            }
+
+            // ── Phase 9d: Mode confirmation ──
+            Action::ModeConfirmYes => {
+                // Handled by run() because it needs orchestrator access
+            }
+            Action::ModeConfirmNo => {
+                if let Some(ref mut picker) = self.mode_picker {
+                    picker.cancel_auto();
+                }
+                self.state = AppState::ModePicker {
+                    confirming_auto: false,
+                };
+            }
+
             Action::Noop => {}
         }
     }
@@ -301,6 +470,9 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     use std::sync::atomic::Ordering;
     use tokio::sync::Mutex;
 
+    // ── Event channels (created early so TuiApprovalHandler can use app_event_tx) ──
+    let (app_event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+
     // ── Build Orchestrator ──
     let client = Arc::new(GeminiClient::new(
         config.api_key.clone(),
@@ -308,7 +480,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     ));
     let sandbox = create_sandbox(config.sandbox_mode, config.working_directory.clone());
     let approval_handler: Arc<dyn crate::ui::approval::ApprovalHandler> =
-        Arc::new(DiffOnlyApprovalHandler::new());
+        Arc::new(TuiApprovalHandler::new(app_event_tx.clone()));
 
     let mut orchestrator = Orchestrator::new(OrchestratorConfig {
         client,
@@ -361,10 +533,14 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         pending_input: None,
         messages: Vec::new(),
         chat_viewport: ChatViewport::new(),
+        approval_overlay: None,
+        approval_response_tx: None,
+        diff_view_state: None,
+        session_picker: None,
+        mode_picker: None,
     };
 
-    // ── Event channels ──
-    let (app_event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    // ── Event loop (terminal reader + tick timer) ──
     events::spawn_event_loop(app_event_tx.clone());
 
     // Bridge: OrchestratorEvent -> AppEvent
@@ -414,7 +590,8 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
             if input.starts_with('/') {
                 // Slash command — lock orchestrator briefly
                 let mut orch = orchestrator.lock().await;
-                let (msgs, result) = commands::dispatch(&input, &mut orch).await;
+                let (msgs, result) =
+                    commands::dispatch(&input, &mut orch, Some(&app_event_tx)).await;
                 app.messages.extend(msgs);
                 app.status = StatusSnapshot::from_orchestrator(&orch);
                 drop(orch);
@@ -469,11 +646,40 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                             text: format!("Switched to {} mode.", mode),
                         });
                     }
-                    CommandResult::ShowSessionPicker | CommandResult::ShowModePicker => {
-                        // Phase 9d
-                        app.messages.push(ChatMessage::System {
-                            text: "Feature coming in Phase 9d.".into(),
+                    CommandResult::ShowSessionPicker => {
+                        app.state = AppState::SessionPicker;
+                        // Load sessions asynchronously
+                        let orch_clone = orchestrator.clone();
+                        let tx = app_event_tx.clone();
+                        tokio::spawn(async move {
+                            let orch = orch_clone.lock().await;
+                            if let Some(store) = orch.session_store() {
+                                match store.list_sessions() {
+                                    Ok(sessions) => {
+                                        let _ = tx.send(AppEvent::SessionsLoaded(sessions));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(AppEvent::Error(format!(
+                                            "Failed to list sessions: {}",
+                                            e
+                                        )));
+                                        let _ = tx.send(AppEvent::SystemMessage(
+                                            "No sessions found.".into(),
+                                        ));
+                                    }
+                                }
+                            } else {
+                                let _ = tx.send(AppEvent::SystemMessage(
+                                    "No session store configured.".into(),
+                                ));
+                            }
                         });
+                    }
+                    CommandResult::ShowModePicker => {
+                        app.mode_picker = Some(ModePicker::new());
+                        app.state = AppState::ModePicker {
+                            confirming_auto: false,
+                        };
                     }
                     CommandResult::RunCommitAgent { diff, working_dir } => {
                         app.messages.push(ChatMessage::Assistant {
@@ -650,6 +856,108 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                     cancel_flag.store(true, Ordering::SeqCst);
                 }
 
+                // Actions that need orchestrator access
+                match action {
+                    Action::ListSelect if app.state == AppState::SessionPicker => {
+                        if let Some(ref picker) = app.session_picker {
+                            if let Some(meta) = picker.selected_session() {
+                                let session_id = meta.session_id.clone();
+                                app.session_picker = None;
+                                app.state = AppState::Idle;
+                                app.messages.push(ChatMessage::System {
+                                    text: format!(
+                                        "Resuming session {}...",
+                                        &session_id.as_str()[..8]
+                                    ),
+                                });
+
+                                let orch_clone = orchestrator.clone();
+                                let tx = app_event_tx.clone();
+                                tokio::spawn(async move {
+                                    let mut orch = orch_clone.lock().await;
+                                    // Load and restore session
+                                    let result = (|| -> crate::error::Result<usize> {
+                                        let store_ref = orch.session_store().ok_or_else(|| {
+                                            crate::error::ClosedCodeError::SessionError(
+                                                "No session store".into(),
+                                            )
+                                        })?;
+                                        let events = store_ref.load_events(&session_id)?;
+                                        let history = SessionStore::reconstruct_history(&events);
+                                        let count = history.len();
+                                        orch.set_history(history);
+                                        Ok(count)
+                                    })();
+                                    match result {
+                                        Ok(turns) => {
+                                            let _ = tx.send(AppEvent::SystemMessage(format!(
+                                                "Session {} resumed ({} turns restored).",
+                                                &session_id.as_str()[..8],
+                                                turns
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(AppEvent::Error(format!(
+                                                "Resume failed: {}",
+                                                e
+                                            )));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    Action::ListSelect
+                        if matches!(
+                            app.state,
+                            AppState::ModePicker {
+                                confirming_auto: false
+                            }
+                        ) =>
+                    {
+                        if let Some(ref mut picker) = app.mode_picker {
+                            if let Some(mode) = picker.try_select() {
+                                // Accept plan with selected mode
+                                let mut orch = orchestrator.lock().await;
+                                if let Some(_plan) = orch.accept_plan(mode) {
+                                    app.messages.push(ChatMessage::System {
+                                        text: format!("Plan accepted. Executing in {} mode.", mode),
+                                    });
+                                    app.status = StatusSnapshot::from_orchestrator(&orch);
+                                }
+                                drop(orch);
+                                app.mode_picker = None;
+                                app.state = AppState::Idle;
+                                app.pending_input =
+                                    Some("Execute the accepted plan step by step.".into());
+                            } else {
+                                // Auto selected — needs confirmation
+                                app.state = AppState::ModePicker {
+                                    confirming_auto: true,
+                                };
+                            }
+                        }
+                        continue;
+                    }
+                    Action::ModeConfirmYes => {
+                        let mode = Mode::Auto;
+                        let mut orch = orchestrator.lock().await;
+                        if let Some(_plan) = orch.accept_plan(mode) {
+                            app.messages.push(ChatMessage::System {
+                                text: "Plan accepted. Executing in Auto mode.".into(),
+                            });
+                            app.status = StatusSnapshot::from_orchestrator(&orch);
+                        }
+                        drop(orch);
+                        app.mode_picker = None;
+                        app.state = AppState::Idle;
+                        app.pending_input = Some("Execute the accepted plan step by step.".into());
+                        continue;
+                    }
+                    _ => {}
+                }
+
                 app.handle_action(action);
             }
             AppEvent::Resize(_w, _h) => {
@@ -800,6 +1108,27 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 app.messages.push(ChatMessage::System {
                     text: format!("Error: {}", err),
                 });
+            }
+
+            // ── Phase 9d: Overlay events ──
+            AppEvent::ApprovalRequest {
+                change,
+                response_tx,
+            } => {
+                app.approval_overlay = Some(ApprovalOverlay::from_change(&change));
+                app.approval_response_tx = Some(response_tx);
+                app.state = AppState::AwaitingApproval;
+            }
+            AppEvent::SessionsLoaded(sessions) => {
+                if sessions.is_empty() {
+                    app.messages.push(ChatMessage::System {
+                        text: "No sessions found.".into(),
+                    });
+                    app.state = AppState::Idle;
+                } else {
+                    app.session_picker = Some(SessionPicker::new(sessions));
+                    // state is already SessionPicker from ShowSessionPicker handling
+                }
             }
         }
 

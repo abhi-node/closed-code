@@ -4,7 +4,7 @@ use ratatui::widgets::Paragraph;
 
 use super::app::{App, AppState};
 use super::theme::TuiTheme;
-use super::{header, status_bar};
+use super::{approval_overlay, diff_view, header, mode_picker, session_picker, status_bar};
 
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
@@ -17,6 +17,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .style(Style::default().fg(TuiTheme::WARNING))
             .alignment(Alignment::Center);
         frame.render_widget(msg, area);
+        return;
+    }
+
+    // Full-screen DiffView takes over entire terminal
+    if app.state == AppState::DiffView {
+        if let Some(ref mut view) = app.diff_view_state {
+            diff_view::render(frame, view, area);
+        }
         return;
     }
 
@@ -47,7 +55,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_divider(frame, status_divider);
     status_bar::render(frame, status_area, app);
 
-    // Overlay: command picker
+    // ── Overlays — rendered last, on top ──
+
+    // Command picker
     if let AppState::CommandPicker {
         ref filter,
         selected,
@@ -56,6 +66,33 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let filter = filter.clone();
         app.command_picker
             .render(frame, &filter, selected, area, chat_area);
+    }
+
+    // Approval overlay
+    if app.state == AppState::AwaitingApproval {
+        if let Some(ref overlay) = app.approval_overlay {
+            approval_overlay::render(frame, overlay, area);
+        }
+    }
+
+    // Session picker
+    if app.state == AppState::SessionPicker {
+        if let Some(ref picker) = app.session_picker {
+            session_picker::render(frame, picker, area);
+        }
+    }
+
+    // Mode picker
+    if matches!(app.state, AppState::ModePicker { .. }) {
+        if let Some(ref picker) = app.mode_picker {
+            let confirming = matches!(
+                app.state,
+                AppState::ModePicker {
+                    confirming_auto: true
+                }
+            );
+            mode_picker::render(frame, picker, area, confirming);
+        }
     }
 }
 

@@ -1,11 +1,14 @@
 use std::path::PathBuf;
 
+use tokio::sync::mpsc;
+
 use crate::agent::orchestrator::Orchestrator;
 use crate::config::Personality;
 use crate::mode::Mode;
 
 use super::chat::ChatMessage;
 use super::command_picker::all_commands;
+use super::events::AppEvent;
 
 /// Result of dispatching a slash command.
 #[derive(Debug)]
@@ -32,6 +35,7 @@ pub enum CommandResult {
 pub async fn dispatch(
     input: &str,
     orchestrator: &mut Orchestrator,
+    event_tx: Option<&mpsc::UnboundedSender<AppEvent>>,
 ) -> (Vec<ChatMessage>, CommandResult) {
     let (cmd, arg) = parse_command(input);
     let mut messages = Vec::new();
@@ -65,7 +69,7 @@ pub async fn dispatch(
             } else {
                 match arg.parse::<Mode>() {
                     Ok(new_mode) => {
-                        switch_mode(orchestrator, new_mode);
+                        switch_mode(orchestrator, new_mode, event_tx);
                         messages.push(ChatMessage::System {
                             text: format!(
                                 "Switched to {} mode. Tools: {}",
@@ -88,7 +92,7 @@ pub async fn dispatch(
         }
 
         "/explore" => {
-            switch_mode(orchestrator, Mode::Explore);
+            switch_mode(orchestrator, Mode::Explore, event_tx);
             messages.push(ChatMessage::System {
                 text: format!(
                     "Switched to Explore mode. Tools: {}",
@@ -99,7 +103,7 @@ pub async fn dispatch(
         }
 
         "/plan" => {
-            switch_mode(orchestrator, Mode::Plan);
+            switch_mode(orchestrator, Mode::Plan, event_tx);
             messages.push(ChatMessage::System {
                 text: format!(
                     "Switched to Plan mode. Tools: {}",
@@ -110,7 +114,7 @@ pub async fn dispatch(
         }
 
         "/guided" => {
-            switch_mode(orchestrator, Mode::Guided);
+            switch_mode(orchestrator, Mode::Guided, event_tx);
             messages.push(ChatMessage::System {
                 text: format!(
                     "Switched to Guided mode. Tools: {}. File changes require approval.",
@@ -121,7 +125,7 @@ pub async fn dispatch(
         }
 
         "/execute" => {
-            switch_mode(orchestrator, Mode::Execute);
+            switch_mode(orchestrator, Mode::Execute, event_tx);
             messages.push(ChatMessage::System {
                 text: format!(
                     "Switched to Execute mode. Tools: {}",
@@ -132,7 +136,7 @@ pub async fn dispatch(
         }
 
         "/auto" => {
-            switch_mode(orchestrator, Mode::Auto);
+            switch_mode(orchestrator, Mode::Auto, event_tx);
             messages.push(ChatMessage::System {
                 text: format!(
                     "Switched to Auto mode. Tools: {} (shell unrestricted)",
@@ -498,12 +502,24 @@ pub fn parse_command(input: &str) -> (&str, &str) {
 }
 
 /// Switch mode with the appropriate approval handler.
-fn switch_mode(orchestrator: &mut Orchestrator, mode: Mode) {
+fn switch_mode(
+    orchestrator: &mut Orchestrator,
+    mode: Mode,
+    event_tx: Option<&mpsc::UnboundedSender<AppEvent>>,
+) {
     use crate::ui::approval::{AutoApproveHandler, DiffOnlyApprovalHandler};
     use std::sync::Arc;
 
+    use super::tui_approval_handler::TuiApprovalHandler;
+
     let handler: Option<Arc<dyn crate::ui::approval::ApprovalHandler>> = match mode {
-        Mode::Guided => Some(Arc::new(DiffOnlyApprovalHandler::new())),
+        Mode::Guided => {
+            if let Some(tx) = event_tx {
+                Some(Arc::new(TuiApprovalHandler::new(tx.clone())))
+            } else {
+                Some(Arc::new(DiffOnlyApprovalHandler::new()))
+            }
+        }
         Mode::Execute | Mode::Auto => Some(Arc::new(AutoApproveHandler::always_approve())),
         _ => None,
     };

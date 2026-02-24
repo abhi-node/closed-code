@@ -62,16 +62,9 @@ fn render_assistant<'a>(
         lines.extend(render_tool_call(tc, tick));
     }
 
-    // Text content (wrapped)
+    // Text content (markdown rendered)
     if !text.is_empty() {
-        for line in text.lines() {
-            for wline in wrap_text(line, width) {
-                lines.push(Line::from(Span::styled(
-                    wline,
-                    Style::new().fg(TuiTheme::FG),
-                )));
-            }
-        }
+        lines.extend(super::markdown::render_markdown(text, width));
     }
 
     lines

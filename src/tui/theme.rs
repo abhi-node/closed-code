@@ -40,6 +40,16 @@ impl TuiTheme {
     pub const DIFF_DEL: Color = tailwind::RED.c400;
     pub const DIFF_DEL_BG: Color = tailwind::RED.c950;
     pub const DIFF_HUNK: Color = tailwind::BLUE.c400;
+    pub const DIFF_CONTEXT: Color = tailwind::SLATE.c500;
+
+    // ── Markdown Rendering (Phase 9d) ──
+    pub const MD_HEADING: Color = tailwind::BLUE.c300;
+    pub const MD_CODE_FG: Color = tailwind::AMBER.c300;
+    pub const MD_CODE_BLOCK_FG: Color = tailwind::SLATE.c300;
+    pub const MD_CODE_BLOCK_BG: Color = tailwind::SLATE.c900;
+    pub const MD_LINK: Color = tailwind::BLUE.c400;
+    pub const MD_BLOCKQUOTE: Color = tailwind::SLATE.c400;
+    pub const MD_LIST_MARKER: Color = tailwind::SLATE.c500;
 
     // ── Mode Colors ──
     pub const MODE_EXPLORE: Color = tailwind::BLUE.c400;

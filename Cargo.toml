@@ -68,6 +68,9 @@ json5 = "1"
 # Diff generation (Myers algorithm)
 similar = "2"
 
+# Markdown parsing (for TUI message rendering)
+pulldown-cmark = { version = "0.13", default-features = false }
+
 # Interactive terminal prompts (approval y/N)
 dialoguer = "0.11"
 

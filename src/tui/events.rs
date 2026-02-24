@@ -1,13 +1,15 @@
+use std::fmt;
 use std::time::Duration;
 
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, MouseEventKind};
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+
+use crate::ui::approval::{ApprovalDecision, FileChange};
 
 pub const TICK_RATE: Duration = Duration::from_millis(100);
 
 /// Application-level events consumed by the main event loop.
-#[derive(Debug)]
 pub enum AppEvent {
     /// A key press from the terminal.
     Key(KeyEvent),
@@ -60,6 +62,77 @@ pub enum AppEvent {
     ModeChanged(crate::mode::Mode),
     OrchestratorDone,
     Error(String),
+
+    // ── Phase 9d: Overlay Events ──
+    /// Approval request from the orchestrator (Guided mode file changes).
+    ApprovalRequest {
+        change: FileChange,
+        response_tx: oneshot::Sender<ApprovalDecision>,
+    },
+    /// Sessions loaded asynchronously for the session picker.
+    SessionsLoaded(Vec<crate::session::SessionMeta>),
+}
+
+// Manual Debug impl because oneshot::Sender doesn't implement Debug.
+impl fmt::Debug for AppEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Key(key) => f.debug_tuple("Key").field(key).finish(),
+            Self::Resize(w, h) => f.debug_tuple("Resize").field(w).field(h).finish(),
+            Self::Tick => write!(f, "Tick"),
+            Self::TextDelta(t) => f.debug_tuple("TextDelta").field(t).finish(),
+            Self::StreamDone => write!(f, "StreamDone"),
+            Self::ToolStart { name, .. } => {
+                f.debug_struct("ToolStart").field("name", name).finish()
+            }
+            Self::ToolComplete { name, duration } => f
+                .debug_struct("ToolComplete")
+                .field("name", name)
+                .field("duration", duration)
+                .finish(),
+            Self::ToolError { name, error } => f
+                .debug_struct("ToolError")
+                .field("name", name)
+                .field("error", error)
+                .finish(),
+            Self::AgentStart { agent_type, task } => f
+                .debug_struct("AgentStart")
+                .field("agent_type", agent_type)
+                .field("task", task)
+                .finish(),
+            Self::AgentComplete {
+                agent_type,
+                duration,
+            } => f
+                .debug_struct("AgentComplete")
+                .field("agent_type", agent_type)
+                .field("duration", duration)
+                .finish(),
+            Self::AgentToolUpdate {
+                agent_type,
+                tool_name,
+                ..
+            } => f
+                .debug_struct("AgentToolUpdate")
+                .field("agent_type", agent_type)
+                .field("tool_name", tool_name)
+                .finish(),
+            Self::MouseScrollUp => write!(f, "MouseScrollUp"),
+            Self::MouseScrollDown => write!(f, "MouseScrollDown"),
+            Self::SystemMessage(msg) => f.debug_tuple("SystemMessage").field(msg).finish(),
+            Self::ModeChanged(mode) => f.debug_tuple("ModeChanged").field(mode).finish(),
+            Self::OrchestratorDone => write!(f, "OrchestratorDone"),
+            Self::Error(err) => f.debug_tuple("Error").field(err).finish(),
+            Self::ApprovalRequest { change, .. } => f
+                .debug_struct("ApprovalRequest")
+                .field("file_path", &change.file_path)
+                .finish(),
+            Self::SessionsLoaded(sessions) => f
+                .debug_tuple("SessionsLoaded")
+                .field(&sessions.len())
+                .finish(),
+        }
+    }
 }
 
 /// Spawn a background task that polls crossterm events and a tick timer,
