@@ -28,10 +28,6 @@ pub struct Cli {
     #[arg(long)]
     pub personality: Option<String>,
 
-    /// Max context window turns before pruning
-    #[arg(long)]
-    pub context_window_turns: Option<usize>,
-
     /// Max output tokens per response
     #[arg(long)]
     pub max_output_tokens: Option<u32>,
@@ -120,12 +116,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_context_window_turns_flag() {
-        let cli = Cli::parse_from(["closed-code", "--context-window-turns", "100"]);
-        assert_eq!(cli.context_window_turns, Some(100));
-    }
-
-    #[test]
     fn parse_max_output_tokens_flag() {
         let cli = Cli::parse_from(["closed-code", "--max-output-tokens", "4096"]);
         assert_eq!(cli.max_output_tokens, Some(4096));
@@ -135,7 +125,6 @@ mod tests {
     fn new_flags_default_to_none() {
         let cli = Cli::parse_from(["closed-code"]);
         assert!(cli.personality.is_none());
-        assert!(cli.context_window_turns.is_none());
         assert!(cli.max_output_tokens.is_none());
         assert!(cli.sandbox.is_none());
     }

@@ -55,7 +55,6 @@ pub struct TomlConfig {
     pub model: Option<String>,
     pub default_mode: Option<String>,
     pub personality: Option<String>,
-    pub context_window_turns: Option<usize>,
     pub context_limit_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub verbose: Option<bool>,
@@ -95,7 +94,6 @@ pub struct Config {
     pub working_directory: PathBuf,
     pub personality: Personality,
     pub shell_additional_allowlist: Vec<String>,
-    pub context_window_turns: usize,
     pub context_limit_tokens: u32,
     pub verbose: bool,
     pub max_output_tokens: u32,
@@ -167,11 +165,6 @@ impl Config {
             Personality::default()
         };
 
-        let context_window_turns = cli
-            .context_window_turns
-            .or(merged.context_window_turns)
-            .unwrap_or(50);
-
         let context_limit_tokens = merged.context_limit_tokens.unwrap_or(1_000_000);
 
         let max_output_tokens = cli
@@ -228,7 +221,6 @@ impl Config {
             working_directory,
             personality,
             shell_additional_allowlist,
-            context_window_turns,
             context_limit_tokens,
             verbose,
             max_output_tokens,
@@ -265,7 +257,6 @@ impl Config {
             model: overlay.model.or(base.model),
             default_mode: overlay.default_mode.or(base.default_mode),
             personality: overlay.personality.or(base.personality),
-            context_window_turns: overlay.context_window_turns.or(base.context_window_turns),
             context_limit_tokens: overlay.context_limit_tokens.or(base.context_limit_tokens),
             max_output_tokens: overlay.max_output_tokens.or(base.max_output_tokens),
             verbose: overlay.verbose.or(base.verbose),
@@ -304,7 +295,6 @@ mod tests {
         assert_eq!(config.api_key, "test-key");
         assert_eq!(config.mode, Mode::Explore);
         assert_eq!(config.personality, Personality::Pragmatic);
-        assert_eq!(config.context_window_turns, 50);
         assert_eq!(config.max_output_tokens, 8192);
         assert!(!config.verbose);
         assert!(config.shell_additional_allowlist.is_empty());
@@ -360,14 +350,11 @@ mod tests {
             "k",
             "--personality",
             "friendly",
-            "--context-window-turns",
-            "100",
             "--max-output-tokens",
             "4096",
         ]);
         let config = Config::from_cli(&cli).unwrap();
         assert_eq!(config.personality, Personality::Friendly);
-        assert_eq!(config.context_window_turns, 100);
         assert_eq!(config.max_output_tokens, 4096);
     }
 
@@ -380,7 +367,6 @@ api_key = "toml-key"
 model = "gemini-2.0-flash"
 default_mode = "plan"
 personality = "friendly"
-context_window_turns = 100
 max_output_tokens = 4096
 verbose = true
 
@@ -392,7 +378,6 @@ additional_allowlist = ["docker", "cargo"]
         assert_eq!(config.model.as_deref(), Some("gemini-2.0-flash"));
         assert_eq!(config.default_mode.as_deref(), Some("plan"));
         assert_eq!(config.personality.as_deref(), Some("friendly"));
-        assert_eq!(config.context_window_turns, Some(100));
         assert_eq!(config.max_output_tokens, Some(4096));
         assert_eq!(config.verbose, Some(true));
         let shell = config.shell.unwrap();

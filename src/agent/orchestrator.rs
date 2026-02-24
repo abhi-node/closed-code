@@ -71,7 +71,6 @@ pub struct OrchestratorConfig {
     pub max_output_tokens: u32,
     pub approval_handler: Arc<dyn ApprovalHandler>,
     pub personality: Personality,
-    pub context_window_turns: usize,
     pub context_limit_tokens: u32,
     pub sandbox: Arc<dyn Sandbox>,
     pub protected_paths: Vec<String>,
@@ -94,7 +93,6 @@ pub struct Orchestrator {
     cancelled: Arc<AtomicBool>,
     // Phase 5
     personality: Personality,
-    context_window_turns: usize,
     context_limit_tokens: u32,
     last_prompt_tokens: u32,
     session_usage: SessionUsage,
@@ -160,7 +158,6 @@ impl Orchestrator {
             current_plan,
             cancelled: Arc::new(AtomicBool::new(false)),
             personality: config.personality,
-            context_window_turns: config.context_window_turns,
             context_limit_tokens: config.context_limit_tokens,
             last_prompt_tokens: 0,
             session_usage: SessionUsage::new(),
@@ -1079,13 +1076,9 @@ impl Orchestrator {
 
     /// Check if context is at 95% capacity, triggering auto-compaction.
     fn should_auto_compact(&self) -> bool {
-        if self.last_prompt_tokens > 0 && self.context_limit_tokens > 0 {
-            let threshold = (self.context_limit_tokens as f64 * 0.95) as u32;
-            self.last_prompt_tokens >= threshold
-        } else {
-            // Fallback: turn-based (2x configured window)
-            self.history.len() > self.context_window_turns * 2
-        }
+        self.last_prompt_tokens > 0
+            && self.context_limit_tokens > 0
+            && self.last_prompt_tokens >= (self.context_limit_tokens as f64 * 0.95) as u32
     }
 
     /// Clear the conversation history.
@@ -1248,11 +1241,6 @@ impl Orchestrator {
     /// Get cumulative token usage.
     pub fn session_usage(&self) -> &SessionUsage {
         &self.session_usage
-    }
-
-    /// Get configured context window size.
-    pub fn context_window_turns(&self) -> usize {
-        self.context_window_turns
     }
 
     /// Get last prompt token count from the most recent API call.
@@ -1824,7 +1812,6 @@ mod tests {
             max_output_tokens: 8192,
             approval_handler: test_handler(),
             personality: Personality::default(),
-            context_window_turns: 50,
             context_limit_tokens: 1_000_000,
             sandbox: mock_sandbox(),
             protected_paths: vec![],
@@ -1903,24 +1890,6 @@ mod tests {
 
         // At 95% — should compact
         orch.last_prompt_tokens = 950_000;
-        assert!(orch.should_auto_compact());
-    }
-
-    #[test]
-    fn should_auto_compact_fallback_turns() {
-        let mut orch = Orchestrator::new(OrchestratorConfig {
-            context_window_turns: 20,
-            ..test_config()
-        });
-        // last_prompt_tokens = 0 means no token data — use turn-based fallback
-        // Threshold is 2x turns = 40
-        for i in 0..41 {
-            if i % 2 == 0 {
-                orch.history.push(Content::user(&format!("msg {}", i)));
-            } else {
-                orch.history.push(Content::model(&format!("reply {}", i)));
-            }
-        }
         assert!(orch.should_auto_compact());
     }
 
@@ -2181,18 +2150,6 @@ mod tests {
         let usage = orch.session_usage();
         assert_eq!(usage.total_tokens, 0);
         assert_eq!(usage.api_calls, 0);
-    }
-
-    #[test]
-    fn context_window_getter() {
-        let orch = test_orchestrator();
-        assert_eq!(orch.context_window_turns(), 50);
-
-        let orch2 = Orchestrator::new(OrchestratorConfig {
-            context_window_turns: 100,
-            ..test_config()
-        });
-        assert_eq!(orch2.context_window_turns(), 100);
     }
 
     // ── Auto Mode Tests ──

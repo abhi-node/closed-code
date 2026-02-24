@@ -52,7 +52,6 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
         max_output_tokens: config.max_output_tokens,
         approval_handler,
         personality: config.personality,
-        context_window_turns: config.context_window_turns,
         context_limit_tokens: config.context_limit_tokens,
         sandbox,
         protected_paths: config.protected_paths.clone(),

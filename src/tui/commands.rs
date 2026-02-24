@@ -398,11 +398,7 @@ pub async fn dispatch(
                     orchestrator.context_limit_tokens()
                 )
             } else {
-                format!(
-                    "Context: {} / {} turns (no token data yet)",
-                    orchestrator.turn_count(),
-                    orchestrator.context_window_turns()
-                )
+                "Context: no token data yet".to_string()
             };
             let mut status_text = format!(
                 "Mode: {} | Model: {} | Personality: {}\n\

@@ -53,15 +53,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App<'_>) {
     // Token / turn counter
     render_context_counter(frame, turns_area, status);
 
-    // Context gauge (token-based when available, falls back to turns)
-    let (used, total) = if status.last_prompt_tokens > 0 {
-        (
-            status.last_prompt_tokens as usize,
-            status.context_limit_tokens as usize,
-        )
-    } else {
-        (status.turn_count, status.context_window_turns)
-    };
+    // Context gauge (token-based)
+    let (used, total) = (
+        status.last_prompt_tokens as usize,
+        status.context_limit_tokens as usize,
+    );
     gauge::render(frame, gauge_area, used, total);
 
     // Git info
@@ -116,7 +112,6 @@ fn render_mode_badge(frame: &mut Frame, area: Rect, mode: &crate::mode::Mode) {
 
 fn render_context_counter(frame: &mut Frame, area: Rect, status: &super::app::StatusSnapshot) {
     if status.last_prompt_tokens > 0 {
-        // Token-based display
         let ratio = if status.context_limit_tokens > 0 {
             status.last_prompt_tokens as f64 / status.context_limit_tokens as f64
         } else {
@@ -139,25 +134,8 @@ fn render_context_counter(frame: &mut Frame, area: Rect, status: &super::app::St
             area,
         );
     } else {
-        // Fallback: turns-based
-        let ratio = if status.context_window_turns > 0 {
-            status.turn_count as f64 / status.context_window_turns as f64
-        } else {
-            0.0
-        };
-        let color = if ratio >= 0.95 {
-            TuiTheme::ERROR
-        } else if ratio >= 0.80 {
-            TuiTheme::WARNING
-        } else {
-            TuiTheme::FG
-        };
         frame.render_widget(
-            Paragraph::new(format!(
-                " {}/{} turns",
-                status.turn_count, status.context_window_turns
-            ))
-            .style(Style::default().fg(color)),
+            Paragraph::new(" --/--").style(Style::default().fg(TuiTheme::FG_DIM)),
             area,
         );
     }
