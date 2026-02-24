@@ -3,6 +3,7 @@ pub mod approval_overlay;
 pub mod chat;
 pub mod command_picker;
 pub mod commands;
+pub mod commit_confirm;
 pub mod diff_view;
 pub mod events;
 pub mod gauge;

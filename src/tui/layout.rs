@@ -94,6 +94,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             mode_picker::render(frame, picker, area, confirming);
         }
     }
+
+    // Commit confirmation
+    if app.state == AppState::CommitConfirm {
+        if let Some(ref msg) = app.commit_message {
+            super::commit_confirm::render(frame, msg, area);
+        }
+    }
 }
 
 /// Double-line horizontal divider.

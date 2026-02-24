@@ -96,6 +96,7 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
                 map_list_picker(key)
             }
         }
+        AppState::CommitConfirm => map_mode_confirm(key),
         AppState::Exiting => Action::Noop,
     }
 }

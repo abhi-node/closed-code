@@ -41,6 +41,7 @@ pub enum AppState {
     DiffView,
     SessionPicker,
     ModePicker { confirming_auto: bool },
+    CommitConfirm,
     Exiting,
 }
 
@@ -113,6 +114,9 @@ pub struct App<'a> {
     pub diff_view_state: Option<DiffView>,
     pub session_picker: Option<SessionPicker>,
     pub mode_picker: Option<ModePicker>,
+    // Commit confirmation
+    pub commit_message: Option<String>,
+    pub commit_working_dir: Option<std::path::PathBuf>,
 }
 
 impl<'a> App<'a> {
@@ -538,6 +542,8 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         diff_view_state: None,
         session_picker: None,
         mode_picker: None,
+        commit_message: None,
+        commit_working_dir: None,
     };
 
     // ── Event loop (terminal reader + tick timer) ──
@@ -711,32 +717,19 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                             match result {
                                 Ok(msg) => {
                                     let msg = msg.trim().trim_matches('"').to_string();
-                                    match crate::git::commit::commit_all(&working_dir, &msg).await {
-                                        Ok(sha) => {
-                                            let mut orch = orch_clone.lock().await;
-                                            orch.refresh_git_context().await;
-                                            drop(orch);
-                                            let _ = tx.send(AppEvent::SystemMessage(format!(
-                                                "Committed: {} ({})",
-                                                sha, msg
-                                            )));
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(AppEvent::Error(format!(
-                                                "Commit failed: {}",
-                                                e
-                                            )));
-                                        }
-                                    }
+                                    let _ = tx.send(AppEvent::CommitReady {
+                                        message: msg,
+                                        working_dir,
+                                    });
                                 }
                                 Err(e) => {
                                     let _ = tx.send(AppEvent::Error(format!(
                                         "Error generating commit message: {}",
                                         e
                                     )));
+                                    let _ = tx.send(AppEvent::OrchestratorDone);
                                 }
                             }
-                            let _ = tx.send(AppEvent::OrchestratorDone);
                         });
                     }
                     CommandResult::RunReviewAgent { diff, working_dir } => {
@@ -940,6 +933,43 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                         }
                         continue;
                     }
+                    Action::ModeConfirmYes if app.state == AppState::CommitConfirm => {
+                        if let (Some(msg), Some(wd)) =
+                            (app.commit_message.take(), app.commit_working_dir.take())
+                        {
+                            let orch_clone = orchestrator.clone();
+                            let tx = app_event_tx.clone();
+                            app.state = AppState::Thinking;
+                            tokio::spawn(async move {
+                                match crate::git::commit::commit_all(&wd, &msg).await {
+                                    Ok(sha) => {
+                                        let mut orch = orch_clone.lock().await;
+                                        orch.refresh_git_context().await;
+                                        drop(orch);
+                                        let _ = tx.send(AppEvent::SystemMessage(format!(
+                                            "Committed: {} ({})",
+                                            sha, msg
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx
+                                            .send(AppEvent::Error(format!("Commit failed: {}", e)));
+                                    }
+                                }
+                                let _ = tx.send(AppEvent::OrchestratorDone);
+                            });
+                        }
+                        continue;
+                    }
+                    Action::ModeConfirmNo if app.state == AppState::CommitConfirm => {
+                        app.commit_message = None;
+                        app.commit_working_dir = None;
+                        app.messages.push(ChatMessage::System {
+                            text: "Commit cancelled.".into(),
+                        });
+                        app.state = AppState::Idle;
+                        continue;
+                    }
                     Action::ModeConfirmYes => {
                         let mode = Mode::Auto;
                         let mut orch = orchestrator.lock().await;
@@ -1126,6 +1156,17 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 app.approval_overlay = Some(ApprovalOverlay::from_change(&change));
                 app.approval_response_tx = Some(response_tx);
                 app.state = AppState::AwaitingApproval;
+            }
+            AppEvent::CommitReady {
+                message,
+                working_dir,
+            } => {
+                app.messages.push(ChatMessage::System {
+                    text: format!("Proposed commit message: \"{}\"", message),
+                });
+                app.commit_message = Some(message);
+                app.commit_working_dir = Some(working_dir);
+                app.state = AppState::CommitConfirm;
             }
             AppEvent::SessionsLoaded(sessions) => {
                 if sessions.is_empty() {

@@ -71,6 +71,11 @@ pub enum AppEvent {
     },
     /// Sessions loaded asynchronously for the session picker.
     SessionsLoaded(Vec<crate::session::SessionMeta>),
+    /// Commit agent finished — message ready for user confirmation.
+    CommitReady {
+        message: String,
+        working_dir: std::path::PathBuf,
+    },
 }
 
 // Manual Debug impl because oneshot::Sender doesn't implement Debug.
@@ -130,6 +135,10 @@ impl fmt::Debug for AppEvent {
             Self::SessionsLoaded(sessions) => f
                 .debug_tuple("SessionsLoaded")
                 .field(&sessions.len())
+                .finish(),
+            Self::CommitReady { message, .. } => f
+                .debug_struct("CommitReady")
+                .field("message", message)
                 .finish(),
         }
     }
