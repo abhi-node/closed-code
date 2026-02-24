@@ -30,6 +30,8 @@ pub enum CommandResult {
     RunCommitAgent { diff: String, working_dir: PathBuf },
     /// Run review agent asynchronously.
     RunReviewAgent { diff: String, working_dir: PathBuf },
+    /// Run compact asynchronously.
+    RunCompact { user_prompt: Option<String>, turns_before: usize },
 }
 
 /// Dispatch a slash command and return messages to display + result.
@@ -180,10 +182,19 @@ pub async fn dispatch(
                 return (messages, CommandResult::Continue);
             }
 
-            if orchestrator.current_plan().is_none() {
+            if orchestrator.current_plan_text().is_none() {
                 messages.push(ChatMessage::System {
                     severity: SystemSeverity::Error,
                     text: "No plan to accept. Ask the assistant to create a plan first.".into(),
+                    diff_lines: None,
+                });
+                return (messages, CommandResult::Continue);
+            }
+
+            if orchestrator.is_plan_accepted() {
+                messages.push(ChatMessage::System {
+                    severity: SystemSeverity::Error,
+                    text: "Plan has already been accepted. Generate a new plan to accept again.".into(),
                     diff_lines: None,
                 });
                 return (messages, CommandResult::Continue);
@@ -483,35 +494,9 @@ pub async fn dispatch(
         }
 
         "/compact" => {
-            let user_prompt = if arg.is_empty() { None } else { Some(arg) };
+            let user_prompt = if arg.is_empty() { None } else { Some(arg.to_string()) };
             let turns_before = orchestrator.turn_count();
-            match orchestrator.compact_history(user_prompt).await {
-                Ok(summary) => {
-                    let preview = if summary.len() > 200 {
-                        format!("{}...", &summary[..197])
-                    } else {
-                        summary
-                    };
-                    messages.push(ChatMessage::System {
-                        severity: SystemSeverity::Success,
-                        text: format!(
-                            "Compacted: {} turns -> {} turns\nSummary: {}",
-                            turns_before,
-                            orchestrator.turn_count(),
-                            preview,
-                        ),
-                        diff_lines: None,
-                    });
-                }
-                Err(e) => {
-                    messages.push(ChatMessage::System {
-                        severity: SystemSeverity::Error,
-                        text: format!("Error: {}", e),
-                        diff_lines: None,
-                    });
-                }
-            }
-            CommandResult::Continue
+            CommandResult::RunCompact { user_prompt, turns_before }
         }
 
         "/history" => {

@@ -10,7 +10,7 @@ use crate::gemini::GeminiClient;
 use crate::sandbox::Sandbox;
 use crate::tool::registry::{create_subagent_registry, ToolRegistry};
 
-const PLANNER_MAX_ITERATIONS: usize = 20;
+const PLANNER_MAX_ITERATIONS: usize = 50;
 
 const PLANNER_SYSTEM_PROMPT: &str = "\
 You are an expert software architect and planning agent. Your job is to analyze a codebase \
@@ -345,7 +345,7 @@ mod tests {
     fn planner_agent_properties() {
         let agent = PlannerAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "planner");
-        assert_eq!(agent.max_iterations(), 20);
+        assert_eq!(agent.max_iterations(), 50);
         assert!(agent.system_prompt().contains("software architect"));
     }
 

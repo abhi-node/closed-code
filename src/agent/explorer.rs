@@ -10,7 +10,7 @@ use crate::gemini::GeminiClient;
 use crate::sandbox::Sandbox;
 use crate::tool::registry::{create_subagent_registry, ToolRegistry};
 
-const EXPLORER_MAX_ITERATIONS: usize = 15;
+const EXPLORER_MAX_ITERATIONS: usize = 50;
 
 const EXPLORER_SYSTEM_PROMPT: &str = "\
 You are an expert code explorer agent. Your job is to thoroughly research a codebase \
@@ -392,7 +392,7 @@ mod tests {
     fn explorer_agent_properties() {
         let agent = ExplorerAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "explorer");
-        assert_eq!(agent.max_iterations(), 15);
+        assert_eq!(agent.max_iterations(), 50);
         assert!(agent.system_prompt().contains("code explorer"));
     }
 }

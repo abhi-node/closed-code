@@ -61,7 +61,6 @@ pub enum OrchestratorEvent {
     },
 }
 
-const MAX_ORCHESTRATOR_ITERATIONS: usize = 30;
 const MAX_RATE_LIMIT_RETRIES: usize = 5;
 
 /// Configuration for constructing an [`Orchestrator`].
@@ -91,7 +90,7 @@ pub struct Orchestrator {
     system_prompt: String,
     max_output_tokens: u32,
     approval_handler: Arc<dyn ApprovalHandler>,
-    current_plan: Option<String>,
+    current_plan: Arc<std::sync::RwLock<Option<String>>>,
     cancelled: Arc<AtomicBool>,
     // Phase 5
     personality: Personality,
@@ -119,12 +118,16 @@ pub struct Orchestrator {
     cache_expire_time: Option<std::time::Instant>,
     // Sub-agent context caching
     subagent_cache_manager: Arc<crate::agent::cache::SubAgentCacheManager>,
+    // Plan state tracking
+    plan_accepted: bool,
 }
 
 impl Orchestrator {
     pub fn new(config: OrchestratorConfig) -> Self {
         let subagent_cache_manager =
             Arc::new(crate::agent::cache::SubAgentCacheManager::new());
+        let current_plan: Arc<std::sync::RwLock<Option<String>>> =
+            Arc::new(std::sync::RwLock::new(None));
         let registry = create_orchestrator_registry(
             config.working_directory.clone(),
             &config.mode,
@@ -134,6 +137,7 @@ impl Orchestrator {
             config.protected_paths.clone(),
             None, // event_tx set later via set_event_sender()
             subagent_cache_manager.clone(),
+            current_plan.clone(),
         );
         let system_prompt = Self::build_system_prompt(
             &config.mode,
@@ -153,7 +157,7 @@ impl Orchestrator {
             system_prompt,
             max_output_tokens: config.max_output_tokens,
             approval_handler: config.approval_handler,
-            current_plan: None,
+            current_plan,
             cancelled: Arc::new(AtomicBool::new(false)),
             personality: config.personality,
             context_window_turns: config.context_window_turns,
@@ -173,6 +177,7 @@ impl Orchestrator {
             cache_fingerprint: None,
             cache_expire_time: None,
             subagent_cache_manager,
+            plan_accepted: false,
         }
     }
 
@@ -190,7 +195,18 @@ impl Orchestrator {
             content: input.to_string(),
             timestamp: Utc::now(),
         });
-        self.prune_history();
+
+        if self.should_auto_compact() {
+            tracing::info!(
+                "Context at {}/{} tokens (95%), auto-compacting...",
+                self.last_prompt_tokens, self.context_limit_tokens
+            );
+            on_event(StreamEvent::TextDelta(
+                "\n[System: Auto-compacting conversation history...]\n".to_string(),
+            ));
+            let _ = self.compact_history(None).await;
+        }
+
         self.ensure_cache().await;
 
         let request = self.build_request();
@@ -328,22 +344,38 @@ impl Orchestrator {
     /// The streaming tool-call loop.
     ///
     /// Sends requests to Gemini, executes function calls, and repeats
-    /// until a text-only response or max iterations.
+    /// until a text-only response or context is exhausted.
     async fn run_tool_loop(&mut self, on_event: &mut impl FnMut(StreamEvent)) -> Result<String> {
         let mut final_text = String::new();
-
-        for iteration in 0..MAX_ORCHESTRATOR_ITERATIONS {
+        loop {
             // Check cancellation before each iteration
             if self.cancelled.load(Ordering::SeqCst) {
                 tracing::info!("Orchestrator cancelled by user");
                 break;
             }
 
-            tracing::debug!(
-                "Orchestrator tool loop iteration {}/{}",
-                iteration + 1,
-                MAX_ORCHESTRATOR_ITERATIONS
-            );
+            // Context-aware: auto-compact at 95% of context limit
+            if self.should_auto_compact() {
+                tracing::info!(
+                    "Context at {}/{} tokens (95%), auto-compacting...",
+                    self.last_prompt_tokens, self.context_limit_tokens
+                );
+                on_event(StreamEvent::TextDelta(
+                    "\n[System: Auto-compacting conversation history...]\n".to_string(),
+                ));
+                match self.compact_history(None).await {
+                    Ok(summary) => {
+                        tracing::info!(
+                            "Auto-compacted: {}",
+                            &summary[..summary.len().min(100)]
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Auto-compact failed ({}), stopping tool loop", e);
+                        break;
+                    }
+                }
+            }
 
             let request = self.build_request();
 
@@ -528,10 +560,7 @@ impl Orchestrator {
         }
 
         if final_text.is_empty() {
-            tracing::warn!(
-                "Orchestrator tool loop exhausted {} iterations without final text",
-                MAX_ORCHESTRATOR_ITERATIONS
-            );
+            tracing::warn!("Orchestrator tool loop ended without final text");
         }
 
         Ok(final_text)
@@ -878,6 +907,7 @@ impl Orchestrator {
                  - edit_file: Targeted search/replace changes (requires user approval)\n\
                  - spawn_explorer: Research code before making changes\n\
                  - spawn_planner: Plan complex multi-step changes before executing\n\
+                 - get_plan: Retrieve the current accepted plan (use to check remaining steps)\n\
                  - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
                  - shell: Run allowlisted commands only (ls, cat, grep, git, cargo, etc.)\n\
                  \n\
@@ -889,12 +919,13 @@ impl Orchestrator {
                  know about.\n\
                  \n\
                  IMPORTANT workflow:\n\
-                 1. Research first: use sub-agents to understand the code before editing\n\
-                 2. Always read the file (read_file) immediately before editing it\n\
-                 3. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
-                 4. Use write_file for new files or complete rewrites\n\
-                 5. Each change shows a diff the user must approve or reject\n\
-                 6. If the user rejects a change, adjust your approach based on their feedback\n\
+                 1. If a plan was accepted, check it with get_plan before starting\n\
+                 2. Research first: use sub-agents to understand the code before editing\n\
+                 3. Always read the file (read_file) immediately before editing it\n\
+                 4. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 5. Use write_file for new files or complete rewrites\n\
+                 6. Each change shows a diff the user must approve or reject\n\
+                 7. If the user rejects a change, adjust your approach based on their feedback\n\
                  \n\
                  Make changes methodically: one file at a time, with clear purpose."
             }
@@ -906,6 +937,7 @@ impl Orchestrator {
                  - edit_file: Make targeted changes using search/replace\n\
                  - spawn_explorer: Research code before making changes\n\
                  - spawn_planner: Plan complex multi-step changes before executing\n\
+                 - get_plan: Retrieve the current accepted plan (use to check remaining steps)\n\
                  - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
                  - shell: Run allowlisted commands only (ls, cat, grep, git, cargo, etc.)\n\
                  \n\
@@ -917,12 +949,13 @@ impl Orchestrator {
                  know about.\n\
                  \n\
                  IMPORTANT workflow:\n\
-                 1. Research first: use sub-agents to understand the code before editing\n\
-                 2. Always read the file (read_file) immediately before editing it\n\
-                 3. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
-                 4. Use write_file for new files or complete rewrites\n\
-                 5. File writes are auto-approved\n\
-                 6. If something goes wrong, use /explore to investigate\n\
+                 1. If a plan was accepted, check it with get_plan before starting\n\
+                 2. Research first: use sub-agents to understand the code before editing\n\
+                 3. Always read the file (read_file) immediately before editing it\n\
+                 4. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 5. Use write_file for new files or complete rewrites\n\
+                 6. File writes are auto-approved\n\
+                 7. If something goes wrong, use /explore to investigate\n\
                  \n\
                  Make changes methodically: one file at a time, with clear purpose."
             }
@@ -935,6 +968,7 @@ impl Orchestrator {
                  - shell: Execute ANY shell command (no allowlist restrictions)\n\
                  - spawn_explorer: Research code before making changes\n\
                  - spawn_planner: Plan complex multi-step changes before executing\n\
+                 - get_plan: Retrieve the current accepted plan (use to check remaining steps)\n\
                  - All filesystem read tools (read_file, list_directory, search_files, grep)\n\
                  \n\
                  CONTEXT CONSERVATION: Before making changes, use sub-agents to research \
@@ -945,12 +979,13 @@ impl Orchestrator {
                  know about.\n\
                  \n\
                  IMPORTANT: File writes are auto-approved and shell commands are unrestricted.\n\
-                 1. Research first: use sub-agents to understand the code before editing\n\
-                 2. Always read the file (read_file) immediately before editing it\n\
-                 3. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
-                 4. Use write_file for new files or complete rewrites\n\
-                 5. Double-check destructive shell commands before executing\n\
-                 6. Never run commands that could damage the system or delete important data\n\
+                 1. If a plan was accepted, check it with get_plan before starting\n\
+                 2. Research first: use sub-agents to understand the code before editing\n\
+                 3. Always read the file (read_file) immediately before editing it\n\
+                 4. Use edit_file for targeted changes (preferred over write_file for existing files)\n\
+                 5. Use write_file for new files or complete rewrites\n\
+                 6. Double-check destructive shell commands before executing\n\
+                 7. Never run commands that could damage the system or delete important data\n\
                  \n\
                  Make changes methodically: one file at a time, with clear purpose."
             }
@@ -1021,6 +1056,7 @@ impl Orchestrator {
             self.protected_paths.clone(),
             self.event_tx.clone(),
             self.subagent_cache_manager.clone(),
+            self.current_plan.clone(),
         );
         self.system_prompt = Self::build_system_prompt(
             &self.mode,
@@ -1041,48 +1077,15 @@ impl Orchestrator {
         self.set_mode(mode);
     }
 
-    /// Prune conversation history when context is too large.
-    /// Uses token-based pruning when token data is available (from Gemini API),
-    /// falls back to turns-based pruning otherwise.
-    pub fn prune_history(&mut self) {
-        let should_prune = if self.last_prompt_tokens > 0 && self.context_limit_tokens > 0 {
-            // Token-based: prune when prompt tokens exceed 85% of context limit
-            let threshold = (self.context_limit_tokens as f64 * 0.85) as u32;
+    /// Check if context is at 95% capacity, triggering auto-compaction.
+    fn should_auto_compact(&self) -> bool {
+        if self.last_prompt_tokens > 0 && self.context_limit_tokens > 0 {
+            let threshold = (self.context_limit_tokens as f64 * 0.95) as u32;
             self.last_prompt_tokens >= threshold
         } else {
-            // Fallback: turns-based
-            self.history.len() > self.context_window_turns
-        };
-
-        if !should_prune {
-            return;
+            // Fallback: turn-based (2x configured window)
+            self.history.len() > self.context_window_turns * 2
         }
-
-        let keep = self.history.len() / 2;
-        let pruned_count = self.history.len() - keep;
-        self.history = self.history.split_off(self.history.len() - keep);
-
-        // Ensure the first message is from the user
-        let first_is_user = self
-            .history
-            .first()
-            .and_then(|c| c.role.as_deref())
-            .map(|r| r == "user")
-            .unwrap_or(false);
-
-        if !first_is_user {
-            self.history.insert(
-                0,
-                Content::user("[Earlier conversation context was pruned]"),
-            );
-        }
-
-        tracing::info!(
-            "Context pruned: removed {} oldest turns ({} remaining, last prompt: {} tokens)",
-            pruned_count,
-            self.history.len(),
-            self.last_prompt_tokens,
-        );
     }
 
     /// Clear the conversation history.
@@ -1134,30 +1137,46 @@ impl Orchestrator {
     /// Store the current plan text.
     /// Called by the REPL after each Plan mode response.
     pub fn set_current_plan(&mut self, plan: String) {
-        self.current_plan = Some(plan);
+        if let Ok(mut guard) = self.current_plan.write() {
+            *guard = Some(plan);
+        }
+        self.plan_accepted = false;
     }
 
-    /// Get the current plan, if any.
-    pub fn current_plan(&self) -> Option<&str> {
-        self.current_plan.as_deref()
+    /// Get the current plan text, if any.
+    pub fn current_plan_text(&self) -> Option<String> {
+        self.current_plan.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Get a shared reference to the plan state (for tools).
+    pub fn plan_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
+        self.current_plan.clone()
     }
 
     /// Accept the current plan and switch to the specified mode.
     ///
     /// Injects the accepted plan into conversation history as context,
     /// then switches to the target mode (which registers write tools).
+    /// The plan remains available via `get_plan` tool.
     /// Returns the plan text if one was set, or None.
     pub fn accept_plan(&mut self, target_mode: Mode) -> Option<String> {
-        if let Some(plan) = self.current_plan.take() {
-            self.history.push(Content::user(&format!(
-                "[ACCEPTED PLAN — Execute this plan step by step]\n\n{}",
-                plan
-            )));
+        let plan = self.current_plan_text();
+        if let Some(ref plan_text) = plan {
+            if !self.plan_accepted {
+                self.history.push(Content::user(&format!(
+                    "[ACCEPTED PLAN — Execute this plan step by step]\n\n{}",
+                    plan_text
+                )));
+                self.plan_accepted = true;
+            }
             self.set_mode(target_mode);
-            Some(plan)
-        } else {
-            None
         }
+        plan
+    }
+
+    /// Whether the current plan has been accepted.
+    pub fn is_plan_accepted(&self) -> bool {
+        self.plan_accepted
     }
 
     /// Get a clone of the cancellation flag for use by signal handlers.
@@ -1222,6 +1241,7 @@ impl Orchestrator {
             self.protected_paths.clone(),
             self.event_tx.clone(),
             self.subagent_cache_manager.clone(),
+            self.current_plan.clone(),
         );
     }
 
@@ -1511,6 +1531,7 @@ impl Orchestrator {
             self.protected_paths.clone(),
             self.event_tx.clone(),
             self.subagent_cache_manager.clone(),
+            self.current_plan.clone(),
         );
     }
 
@@ -1525,6 +1546,7 @@ impl Orchestrator {
             self.protected_paths.clone(),
             None,
             self.subagent_cache_manager.clone(),
+            self.current_plan.clone(),
         );
         registry.len()
     }
@@ -1695,7 +1717,7 @@ impl std::fmt::Debug for Orchestrator {
             .field("mode", &self.mode)
             .field("tools", &self.registry.len())
             .field("history_len", &self.history.len())
-            .field("has_plan", &self.current_plan.is_some())
+            .field("has_plan", &self.current_plan_text().is_some())
             .field("cancelled", &self.is_cancelled())
             .field("personality", &self.personality)
             .field("model", &self.model_name)
@@ -1816,8 +1838,8 @@ mod tests {
     #[test]
     fn orchestrator_new_explore_mode() {
         let orch = test_orchestrator();
-        // 5 filesystem/shell + spawn_explorer = 6
-        assert_eq!(orch.tool_count(), 6);
+        // 5 filesystem/shell + spawn_explorer + get_plan = 7
+        assert_eq!(orch.tool_count(), 7);
         assert_eq!(*orch.mode(), Mode::Explore);
         assert!(orch.system_prompt().contains("READ-ONLY"));
         assert!(!orch.system_prompt().contains("write_file"));
@@ -1829,8 +1851,8 @@ mod tests {
             mode: Mode::Plan,
             ..test_config()
         });
-        // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
-        assert_eq!(orch.tool_count(), 8);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search + get_plan = 9
+        assert_eq!(orch.tool_count(), 9);
         assert_eq!(*orch.mode(), Mode::Plan);
         assert!(orch.system_prompt().contains("PLAN"));
         assert!(orch.system_prompt().contains("/accept"));
@@ -1842,8 +1864,8 @@ mod tests {
             mode: Mode::Execute,
             ..test_config()
         });
-        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
-        assert_eq!(orch.tool_count(), 9);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file + get_plan = 10
+        assert_eq!(orch.tool_count(), 10);
         assert!(orch.system_prompt().contains("EXECUTE"));
         assert!(orch.system_prompt().contains("write_file"));
         assert!(orch.system_prompt().contains("edit_file"));
@@ -1863,56 +1885,43 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_prune_history() {
-        let mut orch = test_orchestrator();
-
-        // Fill history beyond context_window_turns
-        for i in 0..60 {
-            if i % 2 == 0 {
-                orch.history.push(Content::user(&format!("msg {}", i)));
-            } else {
-                orch.history.push(Content::model(&format!("reply {}", i)));
-            }
-        }
-        assert_eq!(orch.turn_count(), 60);
-
-        orch.prune_history();
-        assert!(orch.turn_count() <= 50);
-
-        // First entry should be role "user"
-        let first_role = orch.history[0].role.as_deref();
-        assert_eq!(first_role, Some("user"));
+    fn should_auto_compact_below_threshold() {
+        let orch = test_orchestrator();
+        // No tokens tracked yet — should not compact
+        assert!(!orch.should_auto_compact());
     }
 
     #[test]
-    fn orchestrator_prune_no_op_when_small() {
-        let mut orch = test_orchestrator();
-        orch.history.push(Content::user("hello"));
-        orch.history.push(Content::model("hi"));
-        assert_eq!(orch.turn_count(), 2);
-
-        orch.prune_history();
-        assert_eq!(orch.turn_count(), 2);
-    }
-
-    #[test]
-    fn prune_configurable_turns() {
+    fn should_auto_compact_at_95_percent() {
         let mut orch = Orchestrator::new(OrchestratorConfig {
-            context_window_turns: 20, // smaller context window
+            context_limit_tokens: 1_000_000,
             ..test_config()
         });
+        // Below 95% — no compact
+        orch.last_prompt_tokens = 940_000;
+        assert!(!orch.should_auto_compact());
 
-        for i in 0..30 {
+        // At 95% — should compact
+        orch.last_prompt_tokens = 950_000;
+        assert!(orch.should_auto_compact());
+    }
+
+    #[test]
+    fn should_auto_compact_fallback_turns() {
+        let mut orch = Orchestrator::new(OrchestratorConfig {
+            context_window_turns: 20,
+            ..test_config()
+        });
+        // last_prompt_tokens = 0 means no token data — use turn-based fallback
+        // Threshold is 2x turns = 40
+        for i in 0..41 {
             if i % 2 == 0 {
                 orch.history.push(Content::user(&format!("msg {}", i)));
             } else {
                 orch.history.push(Content::model(&format!("reply {}", i)));
             }
         }
-        assert_eq!(orch.turn_count(), 30);
-
-        orch.prune_history();
-        assert!(orch.turn_count() <= 20);
+        assert!(orch.should_auto_compact());
     }
 
     #[test]
@@ -1975,7 +1984,7 @@ mod tests {
     fn orchestrator_set_mode() {
         let mut orch = test_orchestrator();
         assert_eq!(*orch.mode(), Mode::Explore);
-        assert_eq!(orch.tool_count(), 6);
+        assert_eq!(orch.tool_count(), 7);
 
         // Add some history
         orch.history.push(Content::user("hello"));
@@ -1984,7 +1993,7 @@ mod tests {
         // Switch to Plan mode
         orch.set_mode(Mode::Plan);
         assert_eq!(*orch.mode(), Mode::Plan);
-        assert_eq!(orch.tool_count(), 8);
+        assert_eq!(orch.tool_count(), 9);
         assert!(orch.system_prompt().contains("spawn_planner"));
         assert!(orch.system_prompt().contains("spawn_web_search"));
 
@@ -1994,21 +2003,21 @@ mod tests {
         // Switch to Execute mode
         orch.set_mode(Mode::Execute);
         assert_eq!(*orch.mode(), Mode::Execute);
-        assert_eq!(orch.tool_count(), 9);
+        assert_eq!(orch.tool_count(), 10);
         assert!(orch.system_prompt().contains("write_file"));
         assert!(orch.system_prompt().contains("spawn_planner"));
 
         // Switch to Auto mode
         orch.set_mode(Mode::Auto);
         assert_eq!(*orch.mode(), Mode::Auto);
-        assert_eq!(orch.tool_count(), 9);
+        assert_eq!(orch.tool_count(), 10);
         assert!(orch.system_prompt().contains("AUTO"));
         assert!(orch.system_prompt().contains("ANY shell command"));
 
         // Switch back to Explore
         orch.set_mode(Mode::Explore);
         assert_eq!(*orch.mode(), Mode::Explore);
-        assert_eq!(orch.tool_count(), 6);
+        assert_eq!(orch.tool_count(), 7);
         assert!(!orch.system_prompt().contains("spawn_planner"));
     }
 
@@ -2019,9 +2028,9 @@ mod tests {
             ..test_config()
         });
 
-        assert!(orch.current_plan().is_none());
+        assert!(orch.current_plan_text().is_none());
         orch.set_current_plan("Step 1: Add feature X".into());
-        assert_eq!(orch.current_plan(), Some("Step 1: Add feature X"));
+        assert_eq!(orch.current_plan_text().as_deref(), Some("Step 1: Add feature X"));
     }
 
     #[test]
@@ -2037,8 +2046,9 @@ mod tests {
         assert!(plan.is_some());
         assert_eq!(plan.unwrap(), "The plan content");
         assert_eq!(*orch.mode(), Mode::Execute);
-        assert_eq!(orch.tool_count(), 9); // Now has write + spawn_planner tools
-        assert!(orch.current_plan().is_none()); // Plan consumed
+        assert_eq!(orch.tool_count(), 10); // write + spawn_planner + get_plan tools
+        // Plan persists after acceptance (available via get_plan tool)
+        assert!(orch.current_plan_text().is_some());
 
         // Plan should be in history
         let last_user_msg = orch.history.last().unwrap();
@@ -2075,7 +2085,7 @@ mod tests {
 
         assert!(plan.is_some());
         assert_eq!(*orch.mode(), Mode::Guided);
-        assert_eq!(orch.tool_count(), 9); // Same tools as Execute
+        assert_eq!(orch.tool_count(), 10); // Same tools as Execute
     }
 
     #[test]
@@ -2090,12 +2100,7 @@ mod tests {
         orch.set_mode_with_handler(Mode::Guided, Some(new_handler));
 
         assert_eq!(*orch.mode(), Mode::Guided);
-        assert_eq!(orch.tool_count(), 9); // write + spawn_planner tools registered
-    }
-
-    #[test]
-    fn max_orchestrator_iterations_constant() {
-        assert_eq!(MAX_ORCHESTRATOR_ITERATIONS, 30);
+        assert_eq!(orch.tool_count(), 10); // write + spawn_planner + get_plan tools registered
     }
 
     // ── Phase 5: Personality Tests ──
@@ -2198,8 +2203,8 @@ mod tests {
             mode: Mode::Auto,
             ..test_config()
         });
-        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
-        assert_eq!(orch.tool_count(), 9);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file + get_plan = 10
+        assert_eq!(orch.tool_count(), 10);
         assert_eq!(*orch.mode(), Mode::Auto);
         assert!(orch.system_prompt().contains("AUTO"));
         assert!(orch.system_prompt().contains("ANY shell command"));
@@ -2215,13 +2220,13 @@ mod tests {
 
         orch.set_mode(Mode::Auto);
         assert_eq!(*orch.mode(), Mode::Auto);
-        assert_eq!(orch.tool_count(), 9);
+        assert_eq!(orch.tool_count(), 10);
         assert!(orch.system_prompt().contains("AUTO"));
 
         // Switch back
         orch.set_mode(Mode::Explore);
         assert_eq!(*orch.mode(), Mode::Explore);
-        assert_eq!(orch.tool_count(), 6);
+        assert_eq!(orch.tool_count(), 7);
         assert!(!orch.system_prompt().contains("AUTO"));
     }
 

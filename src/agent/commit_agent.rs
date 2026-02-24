@@ -10,7 +10,7 @@ use crate::gemini::GeminiClient;
 use crate::sandbox::Sandbox;
 use crate::tool::registry::{create_subagent_registry, ToolRegistry};
 
-const COMMIT_MAX_ITERATIONS: usize = 10;
+const COMMIT_MAX_ITERATIONS: usize = 20;
 
 const COMMIT_SYSTEM_PROMPT: &str = "\
 You are a commit message generator agent. Your job is to analyze code changes \
@@ -357,7 +357,7 @@ mod tests {
     fn commit_agent_properties() {
         let agent = CommitAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "commit");
-        assert_eq!(agent.max_iterations(), 10);
+        assert_eq!(agent.max_iterations(), 20);
         assert!(agent.system_prompt().contains("commit message"));
     }
 
@@ -381,6 +381,6 @@ mod tests {
         assert_eq!(report.detailed_report, "No detailed report provided");
     }
 
-    // Compile-time check: commit agent should be lighter than explorer
-    const _: () = assert!(COMMIT_MAX_ITERATIONS < 15); // Explorer is 15
+    // Compile-time check: commit agent should be lighter than explorer (50)
+    const _: () = assert!(COMMIT_MAX_ITERATIONS < 50);
 }

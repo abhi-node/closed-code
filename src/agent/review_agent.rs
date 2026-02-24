@@ -10,7 +10,7 @@ use crate::gemini::GeminiClient;
 use crate::sandbox::Sandbox;
 use crate::tool::registry::{create_subagent_registry, ToolRegistry};
 
-const REVIEW_MAX_ITERATIONS: usize = 15;
+const REVIEW_MAX_ITERATIONS: usize = 30;
 
 const REVIEW_SYSTEM_PROMPT: &str = "\
 You are an expert code reviewer agent. Your job is to analyze code changes \
@@ -345,7 +345,7 @@ mod tests {
     fn review_agent_properties() {
         let agent = ReviewAgent::new(PathBuf::from("/tmp"), mock_sandbox());
         assert_eq!(agent.agent_type(), "reviewer");
-        assert_eq!(agent.max_iterations(), 15);
+        assert_eq!(agent.max_iterations(), 30);
         assert!(agent.system_prompt().contains("code reviewer"));
     }
 
@@ -384,6 +384,6 @@ mod tests {
 
     #[test]
     fn review_agent_constants() {
-        assert_eq!(REVIEW_MAX_ITERATIONS, 15);
+        assert_eq!(REVIEW_MAX_ITERATIONS, 30);
     }
 }

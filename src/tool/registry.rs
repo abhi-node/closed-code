@@ -182,6 +182,7 @@ pub fn create_orchestrator_registry(
         tokio::sync::mpsc::UnboundedSender<crate::agent::orchestrator::OrchestratorEvent>,
     >,
     subagent_cache_manager: Arc<crate::agent::cache::SubAgentCacheManager>,
+    plan: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 ) -> ToolRegistry {
     let bypass_shell = matches!(mode, Mode::Auto);
     let mut registry = ToolRegistry::new();
@@ -256,6 +257,9 @@ pub fn create_orchestrator_registry(
         }
     }
 
+    // Plan tool — available in all modes
+    registry.register(Box::new(super::plan::GetPlanTool::new(plan)));
+
     registry
 }
 
@@ -273,6 +277,10 @@ mod tests {
 
     fn mock_cache_manager() -> Arc<crate::agent::cache::SubAgentCacheManager> {
         Arc::new(crate::agent::cache::SubAgentCacheManager::new())
+    }
+
+    fn mock_plan() -> std::sync::Arc<std::sync::RwLock<Option<String>>> {
+        std::sync::Arc::new(std::sync::RwLock::new(None))
     }
 
     #[derive(Debug)]
@@ -465,10 +473,12 @@ mod tests {
             vec![],
             None,
             mock_cache_manager(),
+            mock_plan(),
         );
-        // 5 filesystem/shell + spawn_explorer = 6
-        assert_eq!(registry.len(), 6);
+        // 5 filesystem/shell + spawn_explorer + get_plan = 7
+        assert_eq!(registry.len(), 7);
         assert!(registry.get("spawn_explorer").is_some());
+        assert!(registry.get("get_plan").is_some());
         assert!(registry.get("spawn_planner").is_none());
         assert!(registry.get("spawn_web_search").is_none());
     }
@@ -488,9 +498,10 @@ mod tests {
             vec![],
             None,
             mock_cache_manager(),
+            mock_plan(),
         );
-        // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
-        assert_eq!(registry.len(), 8);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search + get_plan = 9
+        assert_eq!(registry.len(), 9);
         assert!(registry.get("spawn_explorer").is_some());
         assert!(registry.get("spawn_planner").is_some());
         assert!(registry.get("spawn_web_search").is_some());
@@ -515,9 +526,10 @@ mod tests {
             vec![],
             None,
             mock_cache_manager(),
+            mock_plan(),
         );
-        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
-        assert_eq!(registry.len(), 9);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file + get_plan = 10
+        assert_eq!(registry.len(), 10);
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
         assert!(registry.get("spawn_explorer").is_some());
@@ -539,9 +551,10 @@ mod tests {
             vec![],
             None,
             mock_cache_manager(),
+            mock_plan(),
         );
-        // No write tools, but spawn tools: 5 filesystem/shell + spawn_explorer + spawn_planner = 7
-        assert_eq!(registry.len(), 7);
+        // No write tools, but spawn tools: 5 filesystem/shell + spawn_explorer + spawn_planner + get_plan = 8
+        assert_eq!(registry.len(), 8);
         assert!(registry.get("write_file").is_none());
         assert!(registry.get("edit_file").is_none());
     }
@@ -563,9 +576,10 @@ mod tests {
             vec![],
             None,
             mock_cache_manager(),
+            mock_plan(),
         );
         // Explore mode: no write tools regardless of handler
-        assert_eq!(registry.len(), 6);
+        assert_eq!(registry.len(), 7);
         assert!(registry.get("write_file").is_none());
     }
 
@@ -586,9 +600,10 @@ mod tests {
             vec![],
             None,
             mock_cache_manager(),
+            mock_plan(),
         );
-        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
-        assert_eq!(registry.len(), 9);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file + get_plan = 10
+        assert_eq!(registry.len(), 10);
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
         assert!(registry.get("spawn_explorer").is_some());
@@ -623,9 +638,10 @@ mod tests {
             vec![],
             None,
             mock_cache_manager(),
+            mock_plan(),
         );
-        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
-        assert_eq!(registry.len(), 9);
+        // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file + get_plan = 10
+        assert_eq!(registry.len(), 10);
         assert!(registry.get("write_file").is_some());
         assert!(registry.get("edit_file").is_some());
         assert!(registry.get("spawn_explorer").is_some());

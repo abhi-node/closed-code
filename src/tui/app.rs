@@ -846,6 +846,40 @@ pub async fn run(config: &Config, session_id: Option<&str>) -> anyhow::Result<()
                             let _ = tx.send(AppEvent::OrchestratorDone);
                         });
                     }
+                    CommandResult::RunCompact { user_prompt, turns_before } => {
+                        app.state = AppState::Thinking;
+                        app.messages.push(ChatMessage::system(
+                            SystemSeverity::Info,
+                            "Compacting history...",
+                        ));
+
+                        let orch_clone = orchestrator.clone();
+                        let tx = app_event_tx.clone();
+                        tokio::spawn(async move {
+                            let mut orch = orch_clone.lock().await;
+                            let result = orch.compact_history(user_prompt.as_deref()).await;
+                            let turns_after = orch.turn_count();
+                            drop(orch);
+
+                            match result {
+                                Ok(summary) => {
+                                    let preview = if summary.len() > 200 {
+                                        format!("{}...", &summary[..197])
+                                    } else {
+                                        summary
+                                    };
+                                    let _ = tx.send(AppEvent::SystemMessage(format!(
+                                        "Compacted: {} turns -> {} turns\nSummary: {}",
+                                        turns_before, turns_after, preview,
+                                    )));
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(AppEvent::Error(format!("Compact failed: {}", e)));
+                                }
+                            }
+                            let _ = tx.send(AppEvent::OrchestratorDone);
+                        });
+                    }
                     CommandResult::Continue => {}
                 }
             } else if let Some(shell_input) = input.strip_prefix('!') {
