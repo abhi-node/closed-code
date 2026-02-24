@@ -70,6 +70,7 @@ impl Agent for WebSearchAgent {
             // google_search grounding — NOT function calling
             tools: Some(vec![GeminiTool::GoogleSearch(GoogleSearchTool::new())]),
             tool_config: None, // No function calling config for google_search
+            cached_content: None,
         };
 
         let response = tokio::time::timeout(

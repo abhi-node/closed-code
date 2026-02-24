@@ -2,7 +2,7 @@ use clap::Parser;
 
 use closed_code::cli::{Cli, Commands};
 use closed_code::config::Config;
-use closed_code::repl::{run_oneshot, run_resume};
+use closed_code::repl::run_oneshot;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,10 +29,10 @@ async fn main() -> anyhow::Result<()> {
             run_oneshot(&config, question).await?;
         }
         Some(Commands::Resume { session_id }) => {
-            run_resume(&config, session_id.as_deref()).await?;
+            closed_code::tui::run_tui(&config, session_id.as_deref()).await?;
         }
         None => {
-            closed_code::tui::run_tui(&config).await?;
+            closed_code::tui::run_tui(&config, None).await?;
         }
     }
 

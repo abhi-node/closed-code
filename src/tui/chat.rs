@@ -19,21 +19,37 @@ pub enum ChatMessage {
     },
     System {
         text: String,
+        severity: message::SystemSeverity,
+        diff_lines: Option<Vec<super::approval_overlay::DiffLine>>,
     },
+}
+
+impl ChatMessage {
+    /// Create a System message with no diff (convenience constructor).
+    pub fn system(severity: message::SystemSeverity, text: impl Into<String>) -> Self {
+        ChatMessage::System {
+            text: text.into(),
+            severity,
+            diff_lines: None,
+        }
+    }
 }
 
 /// Display state for a tool call within an assistant message.
 #[derive(Debug, Clone)]
 pub enum ToolCallDisplay {
     Running {
+        tool_call_id: u64,
         name: String,
         args_display: String,
     },
     Completed {
+        tool_call_id: u64,
         name: String,
         duration: Duration,
     },
     Failed {
+        tool_call_id: u64,
         name: String,
         error: String,
     },
@@ -123,35 +139,79 @@ impl ChatViewport {
     }
 }
 
-/// Render the chat area with all messages.
+/// Render the chat area with all messages, using a line-count cache for performance.
+///
+/// The `line_cache` stores the number of rendered lines per message (including the
+/// trailing blank spacer line). Only new or changed messages are re-measured, and
+/// only the visible range of messages is fully rendered.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     messages: &[ChatMessage],
     viewport: &mut ChatViewport,
     tick: usize,
+    line_cache: &mut Vec<usize>,
 ) {
-    // Build all lines from messages
     let width = area.width.saturating_sub(2) as usize; // account for side borders
-    let mut all_lines: Vec<Line<'_>> = Vec::new();
 
-    for msg in messages {
-        let msg_lines = message::render_message(msg, width, tick);
-        all_lines.extend(msg_lines);
-        all_lines.push(Line::default()); // spacing between messages
+    // ── Incrementally update line cache ──
+    // Truncate if messages were removed (e.g. /clear)
+    if line_cache.len() > messages.len() {
+        line_cache.truncate(messages.len());
+    }
+    // Compute line counts for any new messages
+    for msg in messages.iter().skip(line_cache.len()) {
+        let count = message::render_message(msg, width, tick).len() + 1; // +1 spacer
+        line_cache.push(count);
+    }
+    // Always recompute the last message (it may be streaming / growing)
+    if let Some(last_idx) = messages.len().checked_sub(1) {
+        line_cache[last_idx] =
+            message::render_message(&messages[last_idx], width, tick).len() + 1;
     }
 
+    // Compute total height from cache
+    let total_height: usize = line_cache.iter().sum();
+
     // Update viewport dimensions
-    viewport.total_height = all_lines.len();
+    viewport.total_height = total_height;
     viewport.visible_height = area.height as usize;
 
-    // Apply scroll offset
     let offset = viewport.effective_offset();
-    let visible_lines: Vec<Line<'_>> = all_lines
-        .into_iter()
-        .skip(offset)
-        .take(viewport.visible_height)
-        .collect();
+
+    // ── Find the first visible message via prefix-sum scan ──
+    let mut cumulative = 0usize;
+    let mut first_msg_idx = 0;
+    let mut skip_lines_in_first = 0; // lines to skip within the first visible message
+
+    for (i, &count) in line_cache.iter().enumerate() {
+        if cumulative + count > offset {
+            first_msg_idx = i;
+            skip_lines_in_first = offset - cumulative;
+            break;
+        }
+        cumulative += count;
+        first_msg_idx = i + 1; // past all messages
+    }
+
+    // ── Render only the visible range ──
+    let mut visible_lines: Vec<Line<'_>> = Vec::with_capacity(viewport.visible_height);
+
+    for (i, msg) in messages.iter().enumerate().skip(first_msg_idx) {
+        let mut msg_lines = message::render_message(msg, width, tick);
+        msg_lines.push(Line::default()); // spacer
+
+        let lines_to_skip = if i == first_msg_idx { skip_lines_in_first } else { 0 };
+        for line in msg_lines.into_iter().skip(lines_to_skip) {
+            visible_lines.push(line);
+            if visible_lines.len() >= viewport.visible_height {
+                break;
+            }
+        }
+        if visible_lines.len() >= viewport.visible_height {
+            break;
+        }
+    }
 
     // Render with side borders
     let block = ratatui::widgets::Block::default()
@@ -162,13 +222,24 @@ pub fn render(
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(visible_lines), inner);
 
-    // Scroll indicator
-    if viewport.lines_above() > 0 {
-        let indicator = format!(" {} lines above ", viewport.lines_above());
+    // ── Scroll indicators ──
+    let lines_above = viewport.lines_above();
+    if lines_above > 0 {
+        let indicator = format!(" {} lines above ", lines_above);
         let indicator_line =
             Line::from(Span::styled(indicator, Style::new().fg(TuiTheme::FG_MUTED)))
                 .alignment(Alignment::Center);
         let indicator_area = Rect::new(area.x, area.y, area.width, 1);
+        frame.render_widget(Paragraph::new(indicator_line), indicator_area);
+    }
+
+    let lines_below = total_height.saturating_sub(offset + viewport.visible_height);
+    if lines_below > 0 {
+        let indicator = format!(" {} lines below ", lines_below);
+        let indicator_line =
+            Line::from(Span::styled(indicator, Style::new().fg(TuiTheme::FG_MUTED)))
+                .alignment(Alignment::Center);
+        let indicator_area = Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1);
         frame.render_widget(Paragraph::new(indicator_line), indicator_area);
     }
 }

@@ -5,7 +5,10 @@ use backon::Retryable;
 use reqwest_eventsource::EventSource;
 
 use crate::error::{ClosedCodeError, Result};
-use crate::gemini::types::{GenerateContentRequest, GenerateContentResponse};
+use crate::gemini::types::{
+    CachedContentResponse, CreateCachedContentRequest, GenerateContentRequest,
+    GenerateContentResponse, UpdateCachedContentRequest,
+};
 
 pub struct GeminiClient {
     client: reqwest::Client,
@@ -86,14 +89,96 @@ impl GeminiClient {
     }
 
     /// Streaming generate — returns an SSE event source.
-    pub fn stream_generate_content(&self, request: &GenerateContentRequest) -> EventSource {
+    pub fn stream_generate_content(
+        &self,
+        request: &GenerateContentRequest,
+    ) -> Result<EventSource> {
         let request_builder = self
             .client
             .post(format!("{}?alt=sse", self.url("streamGenerateContent")))
             .header("x-goog-api-key", &self.api_key)
             .json(request);
 
-        EventSource::new(request_builder).expect("failed to create EventSource")
+        EventSource::new(request_builder)
+            .map_err(|e| crate::error::ClosedCodeError::StreamError(e.to_string()))
+    }
+
+    // ── Context Caching ──
+
+    /// Create a cached content resource containing system instruction and tools.
+    /// Returns the cache name on success (e.g. `"cachedContents/abc123"`).
+    pub async fn create_cached_content(
+        &self,
+        request: &CreateCachedContentRequest,
+    ) -> Result<CachedContentResponse> {
+        let url = format!("{}/cachedContents", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(request)
+            .send()
+            .await
+            .map_err(ClosedCodeError::Network)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ClosedCodeError::from_status(status.as_u16(), body));
+        }
+
+        Ok(response.json().await?)
+    }
+
+    /// Refresh the TTL on an existing cached content resource.
+    pub async fn update_cached_content_ttl(
+        &self,
+        name: &str,
+        ttl: &str,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/{}?updateMask=ttl",
+            self.base_url, name
+        );
+        let body = UpdateCachedContentRequest {
+            ttl: ttl.to_string(),
+        };
+        let response = self
+            .client
+            .patch(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(ClosedCodeError::Network)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ClosedCodeError::from_status(status.as_u16(), body));
+        }
+
+        Ok(())
+    }
+
+    /// Delete a cached content resource.
+    pub async fn delete_cached_content(&self, name: &str) -> Result<()> {
+        let url = format!("{}/{}", self.base_url, name);
+        let response = self
+            .client
+            .delete(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .send()
+            .await
+            .map_err(ClosedCodeError::Network)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ClosedCodeError::from_status(status.as_u16(), body));
+        }
+
+        Ok(())
     }
 }
 

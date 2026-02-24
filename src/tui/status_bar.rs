@@ -74,9 +74,24 @@ fn render_working_indicator(frame: &mut Frame, area: Rect, state: &AppState, tic
     let label = match state {
         AppState::Thinking => "Thinking...",
         AppState::Streaming => "Streaming..",
+        AppState::ToolExecuting { count } if *count > 1 => {
+            // Leak a formatted string for the static-lifetime label.
+            // Acceptable since this only happens during active tool execution.
+            return render_working_custom(frame, area, &format!("Working ({count})..."), tick);
+        }
         AppState::ToolExecuting { .. } => "Working...",
         _ => "",
     };
+    frame.render_widget(
+        Paragraph::new(format!(" {} {}", spinner, label))
+            .style(Style::default().fg(TuiTheme::ACCENT)),
+        area,
+    );
+}
+
+fn render_working_custom(frame: &mut Frame, area: Rect, label: &str, tick: usize) {
+    let frames = TuiTheme::SPINNER_FRAMES;
+    let spinner = frames[tick % frames.len()];
     frame.render_widget(
         Paragraph::new(format!(" {} {}", spinner, label))
             .style(Style::default().fg(TuiTheme::ACCENT)),

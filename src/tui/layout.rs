@@ -1,8 +1,9 @@
 use ratatui::layout::Constraint;
 use ratatui::prelude::*;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use super::app::{App, AppState};
+use super::file_completion::FileCompletion;
 use super::theme::TuiTheme;
 use super::{approval_overlay, diff_view, header, mode_picker, session_picker, status_bar};
 
@@ -48,12 +49,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         &app.messages,
         &mut app.chat_viewport,
         app.tick_count,
+        &mut app.message_line_cache,
     );
     render_divider(frame, input_divider);
     app.input_pane.set_viewport_width(input_area.width);
     frame.render_widget(app.input_pane.textarea(), input_area);
     render_divider(frame, status_divider);
     status_bar::render(frame, status_area, app);
+
+    // ── File completion popup ──
+    if let Some(ref fc) = app.file_completion {
+        render_completion_popup(frame, fc, input_area);
+    }
 
     // ── Overlays — rendered last, on top ──
 
@@ -108,6 +115,56 @@ fn render_divider(frame: &mut Frame, area: Rect) {
     let line = "═".repeat(area.width as usize);
     let divider = Paragraph::new(line).style(Style::default().fg(TuiTheme::BORDER_DIM));
     frame.render_widget(divider, area);
+}
+
+/// Render a file completion popup above the input area.
+fn render_completion_popup(frame: &mut Frame, fc: &FileCompletion, input_area: Rect) {
+    const MAX_VISIBLE: usize = 8;
+
+    let visible_count = fc.candidates.len().min(MAX_VISIBLE);
+    let popup_height = visible_count as u16 + 2; // +2 for borders
+
+    // Position above the input area
+    let popup_y = input_area.y.saturating_sub(popup_height);
+    let popup_width = input_area.width.min(50);
+    let popup_area = Rect::new(input_area.x + 1, popup_y, popup_width, popup_height);
+
+    // Determine visible window around the selected item
+    let start = if fc.selected >= MAX_VISIBLE {
+        fc.selected - MAX_VISIBLE + 1
+    } else {
+        0
+    };
+
+    let items: Vec<ListItem> = fc
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(MAX_VISIBLE)
+        .map(|(i, candidate)| {
+            let style = if i == fc.selected {
+                Style::default()
+                    .fg(TuiTheme::PICKER_HIGHLIGHT_FG)
+                    .bg(TuiTheme::PICKER_HIGHLIGHT_BG)
+            } else {
+                Style::default().fg(TuiTheme::FG)
+            };
+            ListItem::new(Line::from(Span::styled(candidate.clone(), style)))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TuiTheme::BORDER))
+            .title(" Completions ")
+            .title_style(Style::default().fg(TuiTheme::FG_DIM)),
+    );
+
+    // Clear the area first
+    frame.render_widget(ratatui::widgets::Clear, popup_area);
+    frame.render_widget(list, popup_area);
 }
 
 #[cfg(test)]

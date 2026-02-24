@@ -15,7 +15,6 @@ pub struct InputPane<'a> {
     history_index: Option<usize>,
     saved_input: Option<String>,
     viewport_width: u16,
-    #[allow(dead_code)] // Used in Phase 9c for file path completion
     working_directory: PathBuf,
 }
 
@@ -88,6 +87,57 @@ impl<'a> InputPane<'a> {
 
     pub fn first_char(&self) -> Option<char> {
         self.textarea.lines().first()?.chars().next()
+    }
+
+    /// Get the working directory.
+    pub fn working_directory(&self) -> &std::path::Path {
+        &self.working_directory
+    }
+
+    /// Extract the word (token) immediately before the cursor position.
+    /// Returns `(word, start_column)` or `None` if cursor is at start or whitespace.
+    pub fn word_before_cursor(&self) -> Option<(String, usize)> {
+        let (row, col) = self.textarea.cursor();
+        let line = self.textarea.lines().get(row)?;
+        if col == 0 || col > line.len() {
+            return None;
+        }
+        let before = line.get(..col)?;
+        let start = before.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+        let word = &before[start..];
+        if word.is_empty() {
+            return None;
+        }
+        Some((word.to_string(), start))
+    }
+
+    /// Replace the word at `[start_col..cursor_col]` with `replacement`.
+    pub fn apply_completion(&mut self, start_col: usize, replacement: &str) {
+        let (row, col) = self.textarea.cursor();
+        if let Some(line) = self.textarea.lines().get(row).cloned() {
+            if start_col > line.len() || col > line.len() {
+                return;
+            }
+            let new_line = format!("{}{}{}", &line[..start_col], replacement, &line[col..]);
+            let new_cursor_col = start_col + replacement.len();
+
+            // Rebuild the textarea content with this line replaced
+            let mut all_lines: Vec<String> =
+                self.textarea.lines().iter().map(|s| s.to_string()).collect();
+            all_lines[row] = new_line;
+
+            self.textarea = TextArea::new(all_lines);
+            apply_textarea_config(&mut self.textarea);
+
+            // Restore cursor position
+            for _ in 0..row {
+                self.textarea.move_cursor(tui_textarea::CursorMove::Down);
+            }
+            self.textarea.move_cursor(tui_textarea::CursorMove::Head);
+            for _ in 0..new_cursor_col {
+                self.textarea.move_cursor(tui_textarea::CursorMove::Forward);
+            }
+        }
     }
 
     // ── Clear & Submit ──

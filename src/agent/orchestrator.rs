@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,9 @@ use crate::agent::AgentRequest;
 use crate::config::Personality;
 use crate::error::{ClosedCodeError, Result};
 use crate::gemini::stream::{consume_stream, StreamEvent, StreamResult};
-use crate::gemini::types::{Content, GenerateContentRequest, GenerationConfig, Part};
+use crate::gemini::types::{
+    Content, CreateCachedContentRequest, GenerateContentRequest, GenerationConfig, Part,
+};
 use crate::gemini::GeminiClient;
 use crate::git::GitContext;
 use crate::mode::Mode;
@@ -30,14 +32,17 @@ use chrono::Utc;
 #[derive(Debug, Clone)]
 pub enum OrchestratorEvent {
     ToolStart {
+        tool_call_id: u64,
         name: String,
         args_display: String,
     },
     ToolComplete {
+        tool_call_id: u64,
         name: String,
         duration: Duration,
     },
     ToolError {
+        tool_call_id: u64,
         name: String,
         error: String,
     },
@@ -106,10 +111,20 @@ pub struct Orchestrator {
     // Phase 9c: TUI integration
     suppress_display: bool,
     event_tx: Option<mpsc::UnboundedSender<OrchestratorEvent>>,
+    // Phase 10: Parallel tool execution
+    next_tool_call_id: AtomicU64,
+    // Phase 10: Context caching
+    cached_content_name: Option<String>,
+    cache_fingerprint: Option<(Mode, String)>,
+    cache_expire_time: Option<std::time::Instant>,
+    // Sub-agent context caching
+    subagent_cache_manager: Arc<crate::agent::cache::SubAgentCacheManager>,
 }
 
 impl Orchestrator {
     pub fn new(config: OrchestratorConfig) -> Self {
+        let subagent_cache_manager =
+            Arc::new(crate::agent::cache::SubAgentCacheManager::new());
         let registry = create_orchestrator_registry(
             config.working_directory.clone(),
             &config.mode,
@@ -118,6 +133,7 @@ impl Orchestrator {
             config.sandbox.clone(),
             config.protected_paths.clone(),
             None, // event_tx set later via set_event_sender()
+            subagent_cache_manager.clone(),
         );
         let system_prompt = Self::build_system_prompt(
             &config.mode,
@@ -152,6 +168,11 @@ impl Orchestrator {
             session_store: None,
             suppress_display: false,
             event_tx: None,
+            next_tool_call_id: AtomicU64::new(0),
+            cached_content_name: None,
+            cache_fingerprint: None,
+            cache_expire_time: None,
+            subagent_cache_manager,
         }
     }
 
@@ -170,6 +191,7 @@ impl Orchestrator {
             timestamp: Utc::now(),
         });
         self.prune_history();
+        self.ensure_cache().await;
 
         let request = self.build_request();
 
@@ -181,7 +203,7 @@ impl Orchestrator {
             } else {
                 None
             };
-            let es = self.client.stream_generate_content(&request);
+            let es = self.client.stream_generate_content(&request)?;
             let mut spinner_cleared = false;
 
             match consume_stream(es, |event| {
@@ -224,6 +246,22 @@ impl Orchestrator {
                         if let Some(s) = &spinner {
                             s.finish();
                         }
+                    }
+                    // Cache may have expired — invalidate and retry once
+                    if self.cached_content_name.is_some() && is_cache_error(&e) {
+                        tracing::warn!(
+                            "Context cache error ({}), retrying without cache",
+                            e
+                        );
+                        self.invalidate_cache();
+                        break consume_stream(
+                            self.client
+                                .stream_generate_content(&self.build_request())?,
+                            |event| {
+                                on_event(event);
+                            },
+                        )
+                        .await?;
                     }
                     return Err(e);
                 }
@@ -317,7 +355,7 @@ impl Orchestrator {
                 } else {
                     None
                 };
-                let es = self.client.stream_generate_content(&request);
+                let es = self.client.stream_generate_content(&request)?;
                 let mut spinner_cleared = false;
 
                 match consume_stream(es, |event| {
@@ -362,6 +400,23 @@ impl Orchestrator {
                                 s.finish();
                             }
                         }
+                        // If the error might be due to an expired/invalid context cache,
+                        // invalidate the cache and retry with inline system instruction.
+                        if self.cached_content_name.is_some() && is_cache_error(&e) {
+                            tracing::warn!(
+                                "Context cache error ({}), retrying without cache",
+                                e
+                            );
+                            self.invalidate_cache();
+                            break consume_stream(
+                                self.client
+                                    .stream_generate_content(&self.build_request())?,
+                                |event| {
+                                    on_event(event);
+                                },
+                            )
+                            .await?;
+                        }
                         return Err(e);
                     }
                 }
@@ -402,18 +457,67 @@ impl Orchestrator {
                         }
                     }
 
-                    // Execute all function calls
-                    let mut response_parts: Vec<Part> = Vec::new();
-                    for part in response.function_calls() {
+                    // Execute function calls (parallel for read-only, sequential for others)
+                    let function_calls: Vec<&Part> = response.function_calls();
+                    let mut response_parts: Vec<Part> =
+                        Vec::with_capacity(function_calls.len());
+                    let mut i = 0;
+
+                    while i < function_calls.len() {
                         if self.cancelled.load(Ordering::SeqCst) {
                             break;
                         }
-                        if let Part::FunctionCall { name, args, .. } = part {
-                            let result = self.execute_and_display_tool(name, args).await;
-                            response_parts.push(Part::FunctionResponse {
-                                name: name.clone(),
-                                response: result,
-                            });
+
+                        if let Part::FunctionCall { name, args, .. } = function_calls[i] {
+                            if is_parallelizable(name) {
+                                // Collect consecutive parallelizable calls
+                                let start = i;
+                                while i < function_calls.len() {
+                                    if let Part::FunctionCall { name: n, .. } =
+                                        function_calls[i]
+                                    {
+                                        if is_parallelizable(n) {
+                                            i += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                // Execute batch concurrently, preserving order
+                                let futs: Vec<_> = function_calls[start..i]
+                                    .iter()
+                                    .filter_map(|part| {
+                                        if let Part::FunctionCall { name, args, .. } = part {
+                                            Some((name, args))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .map(|(name, args)| async {
+                                        let result =
+                                            self.execute_and_display_tool(name, args).await;
+                                        Part::FunctionResponse {
+                                            name: name.clone(),
+                                            response: result,
+                                        }
+                                    })
+                                    .collect();
+                                let results = futures::future::join_all(futs).await;
+                                response_parts.extend(results);
+                            } else {
+                                // Sequential execution for write/shell/spawn tools
+                                let result =
+                                    self.execute_and_display_tool(name, args).await;
+                                response_parts.push(Part::FunctionResponse {
+                                    name: name.clone(),
+                                    response: result,
+                                });
+                                i += 1;
+                            }
+                        } else {
+                            i += 1;
                         }
                     }
 
@@ -448,6 +552,13 @@ impl Orchestrator {
         name: &str,
         args: &serde_json::Value,
     ) -> serde_json::Value {
+        // Cooperative cancellation for parallel batches
+        if self.cancelled.load(Ordering::SeqCst) {
+            return serde_json::json!({"error": "Cancelled by user"});
+        }
+
+        let tool_call_id = self.next_tool_call_id.fetch_add(1, Ordering::SeqCst);
+
         self.emit_event(SessionEvent::ToolCall {
             name: name.to_string(),
             args: args.clone(),
@@ -482,6 +593,7 @@ impl Orchestrator {
                     tracing::warn!("Tool '{}' failed: {}", name, e);
                     if let Some(tx) = &self.event_tx {
                         let _ = tx.send(OrchestratorEvent::ToolError {
+                            tool_call_id,
                             name: name.to_string(),
                             error: e.to_string(),
                         });
@@ -504,6 +616,7 @@ impl Orchestrator {
 
             if let Some(tx) = &self.event_tx {
                 let _ = tx.send(OrchestratorEvent::ToolStart {
+                    tool_call_id,
                     name: name.to_string(),
                     args_display: display.clone(),
                 });
@@ -518,6 +631,7 @@ impl Orchestrator {
                     tracing::warn!("Tool '{}' failed: {}", name, e);
                     if let Some(tx) = &self.event_tx {
                         let _ = tx.send(OrchestratorEvent::ToolError {
+                            tool_call_id,
                             name: name.to_string(),
                             error: e.to_string(),
                         });
@@ -528,6 +642,7 @@ impl Orchestrator {
 
             if let Some(tx) = &self.event_tx {
                 let _ = tx.send(OrchestratorEvent::ToolComplete {
+                    tool_call_id,
                     name: name.to_string(),
                     duration: start.elapsed(),
                 });
@@ -547,22 +662,127 @@ impl Orchestrator {
     }
 
     /// Build a GenerateContentRequest from current state.
+    /// When a context cache is active, references the cache instead of
+    /// re-sending system_instruction/tools/tool_config.
     fn build_request(&self) -> GenerateContentRequest {
+        if let Some(ref cache_name) = self.cached_content_name {
+            // Cache holds system_instruction + tools + tool_config
+            GenerateContentRequest {
+                contents: self.history.clone(),
+                system_instruction: None,
+                generation_config: Some(GenerationConfig {
+                    temperature: Some(1.0),
+                    top_p: None,
+                    top_k: None,
+                    max_output_tokens: Some(self.max_output_tokens),
+                }),
+                tools: None,
+                tool_config: None,
+                cached_content: Some(cache_name.clone()),
+            }
+        } else {
+            let tools = self.registry.to_gemini_tools(&self.mode);
+            let tool_config = tools.as_ref().map(|_| ToolRegistry::tool_config());
+
+            GenerateContentRequest {
+                contents: self.history.clone(),
+                system_instruction: Some(Content::system(&self.system_prompt)),
+                generation_config: Some(GenerationConfig {
+                    temperature: Some(1.0),
+                    top_p: None,
+                    top_k: None,
+                    max_output_tokens: Some(self.max_output_tokens),
+                }),
+                tools,
+                tool_config,
+                cached_content: None,
+            }
+        }
+    }
+
+    /// Ensure a context cache exists for the current mode and model.
+    /// Creates a new cache on the first call or after a mode/model change.
+    /// Refreshes TTL when the cache is close to expiry.
+    async fn ensure_cache(&mut self) {
+        let fingerprint = (self.mode, self.model_name.clone());
+        let cache_ttl_secs = 1800; // 30 minutes
+        let refresh_threshold = Duration::from_secs(cache_ttl_secs - 300); // refresh with 5 min left
+
+        if self.cache_fingerprint.as_ref() == Some(&fingerprint) {
+            // Cache fingerprint matches — check if TTL needs refresh
+            if let (Some(ref name), Some(created_at)) =
+                (&self.cached_content_name, self.cache_expire_time)
+            {
+                if created_at.elapsed() >= refresh_threshold {
+                    tracing::debug!("Refreshing context cache TTL: {}", name);
+                    if let Err(e) = self
+                        .client
+                        .update_cached_content_ttl(name, &format!("{}s", cache_ttl_secs))
+                        .await
+                    {
+                        // TTL refresh failed — cache may have expired. Invalidate and recreate.
+                        tracing::warn!("Cache TTL refresh failed ({}), will recreate", e);
+                        self.cached_content_name = None;
+                        self.cache_fingerprint = None;
+                        self.cache_expire_time = None;
+                        // Fall through to create a new cache below
+                    } else {
+                        self.cache_expire_time = Some(std::time::Instant::now());
+                        return;
+                    }
+                } else {
+                    return; // Cache is valid and TTL is fresh
+                }
+            } else {
+                return;
+            }
+        }
+
+        // Invalidate old cache
+        if let Some(ref old_name) = self.cached_content_name {
+            tracing::debug!("Deleting old context cache: {}", old_name);
+            let _ = self.client.delete_cached_content(old_name).await;
+            self.cached_content_name = None;
+            self.cache_fingerprint = None;
+            self.cache_expire_time = None;
+        }
+
+        // Create new cache with system_instruction + tools
         let tools = self.registry.to_gemini_tools(&self.mode);
         let tool_config = tools.as_ref().map(|_| ToolRegistry::tool_config());
-
-        GenerateContentRequest {
-            contents: self.history.clone(),
+        let request = CreateCachedContentRequest {
+            model: format!("models/{}", self.model_name),
             system_instruction: Some(Content::system(&self.system_prompt)),
-            generation_config: Some(GenerationConfig {
-                temperature: Some(1.0),
-                top_p: None,
-                top_k: None,
-                max_output_tokens: Some(self.max_output_tokens),
-            }),
             tools,
             tool_config,
+            ttl: format!("{}s", cache_ttl_secs),
+        };
+
+        match self.client.create_cached_content(&request).await {
+            Ok(resp) => {
+                tracing::info!(
+                    "Created context cache: {} (tokens: {:?})",
+                    resp.name,
+                    resp.usage_metadata.as_ref().and_then(|m| m.total_token_count)
+                );
+                self.cached_content_name = Some(resp.name);
+                self.cache_fingerprint = Some(fingerprint);
+                self.cache_expire_time = Some(std::time::Instant::now());
+            }
+            Err(e) => {
+                tracing::warn!("Failed to create context cache (falling back to inline): {}", e);
+                self.cached_content_name = None;
+                self.cache_fingerprint = None;
+                self.cache_expire_time = None;
+            }
         }
+    }
+
+    /// Invalidate the context cache (e.g., after mode or model change).
+    fn invalidate_cache(&mut self) {
+        self.cached_content_name = None;
+        self.cache_fingerprint = None;
+        self.cache_expire_time = None;
     }
 
     /// Build the mode-specific system prompt with personality prefix.
@@ -783,6 +1003,10 @@ impl Orchestrator {
     pub fn set_mode(&mut self, mode: Mode) {
         let old_mode = self.mode;
         self.mode = mode;
+        self.invalidate_cache();
+        // Sub-agent caches may have different tool sets per mode — drain them.
+        // Server-side caches expire via TTL; we just forget the names.
+        let _old = self.subagent_cache_manager.drain_all();
         self.emit_event(SessionEvent::ModeChange {
             from: old_mode.to_string(),
             to: mode.to_string(),
@@ -796,6 +1020,7 @@ impl Orchestrator {
             self.sandbox.clone(),
             self.protected_paths.clone(),
             self.event_tx.clone(),
+            self.subagent_cache_manager.clone(),
         );
         self.system_prompt = Self::build_system_prompt(
             &self.mode,
@@ -984,6 +1209,9 @@ impl Orchestrator {
     /// Switch model. Rebuilds client and tool registry.
     pub fn set_model(&mut self, model: String) {
         self.model_name = model.clone();
+        self.invalidate_cache();
+        // Drain sub-agent caches — model changed, old caches are for the wrong model.
+        let _old = self.subagent_cache_manager.drain_all();
         self.client = Arc::new(GeminiClient::new(self.client.api_key().to_string(), model));
         self.registry = create_orchestrator_registry(
             self.working_directory.clone(),
@@ -993,6 +1221,7 @@ impl Orchestrator {
             self.sandbox.clone(),
             self.protected_paths.clone(),
             self.event_tx.clone(),
+            self.subagent_cache_manager.clone(),
         );
     }
 
@@ -1122,8 +1351,8 @@ impl Orchestrator {
                     }
                     Part::FunctionResponse { name, response, .. } => {
                         let resp_str = response.to_string();
-                        let truncated = if resp_str.len() > 200 {
-                            format!("{}...", &resp_str[..197])
+                        let truncated = if resp_str.chars().count() > 200 {
+                            format!("{}...", &resp_str[..truncate_byte_index(&resp_str, 197)])
                         } else {
                             resp_str
                         };
@@ -1168,6 +1397,7 @@ impl Orchestrator {
             }),
             tools: None,
             tool_config: None,
+            cached_content: None,
         };
 
         let response = self.client.generate_content(&request).await?;
@@ -1280,6 +1510,7 @@ impl Orchestrator {
             self.sandbox.clone(),
             self.protected_paths.clone(),
             self.event_tx.clone(),
+            self.subagent_cache_manager.clone(),
         );
     }
 
@@ -1293,6 +1524,7 @@ impl Orchestrator {
             self.sandbox.clone(),
             self.protected_paths.clone(),
             None,
+            self.subagent_cache_manager.clone(),
         );
         registry.len()
     }
@@ -1379,8 +1611,8 @@ impl Orchestrator {
                     }
                     Part::FunctionResponse { name, response, .. } => {
                         let resp_str = response.to_string();
-                        let truncated = if resp_str.len() > 1000 {
-                            format!("{}...", &resp_str[..997])
+                        let truncated = if resp_str.chars().count() > 1000 {
+                            format!("{}...", &resp_str[..truncate_byte_index(&resp_str, 997)])
                         } else {
                             resp_str
                         };
@@ -1407,7 +1639,8 @@ impl Orchestrator {
     pub async fn run_commit_agent(&self, diff: &str) -> Result<String> {
         use crate::agent::Agent;
 
-        let mut agent = CommitAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        let mut agent = CommitAgent::new(self.working_directory.clone(), self.sandbox.clone())
+            .with_cache_manager(self.subagent_cache_manager.clone());
         if let Some(ref tx) = self.event_tx {
             agent = agent.with_progress(crate::tool::spawn::make_agent_progress_callback(
                 tx.clone(),
@@ -1430,7 +1663,8 @@ impl Orchestrator {
     pub async fn run_review_agent(&mut self, diff: &str) -> Result<String> {
         use crate::agent::Agent;
 
-        let mut agent = ReviewAgent::new(self.working_directory.clone(), self.sandbox.clone());
+        let mut agent = ReviewAgent::new(self.working_directory.clone(), self.sandbox.clone())
+            .with_cache_manager(self.subagent_cache_manager.clone());
         if let Some(ref tx) = self.event_tx {
             agent = agent.with_progress(crate::tool::spawn::make_agent_progress_callback(
                 tx.clone(),
@@ -1482,6 +1716,33 @@ async fn display_rate_limit_countdown(delay: Duration) {
     eprintln!("\rRetrying now...                    ");
 }
 
+/// Whether an error is likely caused by an expired or invalid context cache.
+fn is_cache_error(err: &ClosedCodeError) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("cached")
+        || msg.contains("cache")
+        || msg.contains("not found")
+        || msg.contains("invalid")
+}
+
+/// Whether a tool is safe to run concurrently with other tools.
+/// Only pure read-only filesystem tools are parallelizable.
+fn is_parallelizable(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "list_directory" | "search_files" | "grep"
+    )
+}
+
+/// Return the byte index of the `n`-th char boundary, or `s.len()` if fewer chars exist.
+/// This is safe for slicing: `&s[..truncate_byte_index(s, n)]` will never panic.
+fn truncate_byte_index(s: &str, max_chars: usize) -> usize {
+    s.char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len())
+}
+
 /// Format a tool call for display: `tool_name(key: "value", key2: 123)`
 pub(crate) fn format_tool_call(name: &str, args: &Value) -> String {
     let params = if let Some(obj) = args.as_object() {
@@ -1489,16 +1750,16 @@ pub(crate) fn format_tool_call(name: &str, args: &Value) -> String {
             .map(|(k, v)| {
                 let display_val = match v {
                     Value::String(s) => {
-                        if s.len() > 60 {
-                            format!("\"{}...\"", &s[..57])
+                        if s.chars().count() > 60 {
+                            format!("\"{}...\"", &s[..truncate_byte_index(s, 57)])
                         } else {
                             format!("\"{}\"", s)
                         }
                     }
                     other => {
                         let s = other.to_string();
-                        if s.len() > 60 {
-                            format!("{}...", &s[..57])
+                        if s.chars().count() > 60 {
+                            format!("{}...", &s[..truncate_byte_index(&s, 57)])
                         } else {
                             s
                         }
@@ -1663,6 +1924,26 @@ mod tests {
         assert!(debug.contains("has_plan"));
         assert!(debug.contains("personality"));
         assert!(debug.contains("model"));
+    }
+
+    #[test]
+    fn is_parallelizable_read_only_tools() {
+        assert!(is_parallelizable("read_file"));
+        assert!(is_parallelizable("list_directory"));
+        assert!(is_parallelizable("search_files"));
+        assert!(is_parallelizable("grep"));
+    }
+
+    #[test]
+    fn is_parallelizable_rejects_write_tools() {
+        assert!(!is_parallelizable("write_file"));
+        assert!(!is_parallelizable("edit_file"));
+        assert!(!is_parallelizable("shell"));
+        assert!(!is_parallelizable("spawn_explorer"));
+        assert!(!is_parallelizable("spawn_planner"));
+        assert!(!is_parallelizable("spawn_web_search"));
+        assert!(!is_parallelizable("create_report"));
+        assert!(!is_parallelizable("unknown_tool"));
     }
 
     #[test]

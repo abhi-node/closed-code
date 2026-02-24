@@ -26,14 +26,17 @@ pub enum AppEvent {
 
     // ── Phase 9c: Tool Events ──
     ToolStart {
+        tool_call_id: u64,
         name: String,
         args_display: String,
     },
     ToolComplete {
+        tool_call_id: u64,
         name: String,
         duration: Duration,
     },
     ToolError {
+        tool_call_id: u64,
         name: String,
         error: String,
     },
@@ -76,6 +79,16 @@ pub enum AppEvent {
         message: String,
         working_dir: std::path::PathBuf,
     },
+
+    // ── Phase 9e: Status & health events ──
+    /// Refreshed orchestrator status snapshot.
+    StatusUpdate(super::app::StatusSnapshot),
+    /// API rate limit hit — show countdown.
+    RateLimited { retry_after_secs: u64 },
+    /// Context window was pruned to fit limits.
+    ContextPruned { turns_removed: usize, turns_remaining: usize },
+    /// Shell command completed.
+    ShellComplete(crate::tui::chat::ChatMessage),
 }
 
 // Manual Debug impl because oneshot::Sender doesn't implement Debug.
@@ -87,16 +100,21 @@ impl fmt::Debug for AppEvent {
             Self::Tick => write!(f, "Tick"),
             Self::TextDelta(t) => f.debug_tuple("TextDelta").field(t).finish(),
             Self::StreamDone => write!(f, "StreamDone"),
-            Self::ToolStart { name, .. } => {
-                f.debug_struct("ToolStart").field("name", name).finish()
+            Self::ToolStart { tool_call_id, name, .. } => {
+                f.debug_struct("ToolStart")
+                    .field("tool_call_id", tool_call_id)
+                    .field("name", name)
+                    .finish()
             }
-            Self::ToolComplete { name, duration } => f
+            Self::ToolComplete { tool_call_id, name, duration } => f
                 .debug_struct("ToolComplete")
+                .field("tool_call_id", tool_call_id)
                 .field("name", name)
                 .field("duration", duration)
                 .finish(),
-            Self::ToolError { name, error } => f
+            Self::ToolError { tool_call_id, name, error } => f
                 .debug_struct("ToolError")
+                .field("tool_call_id", tool_call_id)
                 .field("name", name)
                 .field("error", error)
                 .finish(),
@@ -140,6 +158,17 @@ impl fmt::Debug for AppEvent {
                 .debug_struct("CommitReady")
                 .field("message", message)
                 .finish(),
+            Self::StatusUpdate(_) => write!(f, "StatusUpdate"),
+            Self::RateLimited { retry_after_secs } => f
+                .debug_struct("RateLimited")
+                .field("retry_after_secs", retry_after_secs)
+                .finish(),
+            Self::ContextPruned { turns_removed, turns_remaining } => f
+                .debug_struct("ContextPruned")
+                .field("turns_removed", turns_removed)
+                .field("turns_remaining", turns_remaining)
+                .finish(),
+            Self::ShellComplete(_) => write!(f, "ShellComplete"),
         }
     }
 }

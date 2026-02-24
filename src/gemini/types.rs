@@ -17,6 +17,8 @@ pub struct GenerateContentRequest {
     pub tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_config: Option<ToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +428,48 @@ impl GenerateContentResponse {
     }
 }
 
+// ── Context Caching Types ──
+
+/// Request body for creating a cached content resource.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCachedContentRequest {
+    /// Model the cache is bound to, e.g. `"models/gemini-3.1-pro-preview"`.
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_instruction: Option<Content>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<GeminiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<ToolConfig>,
+    /// Time-to-live duration, e.g. `"1800s"` for 30 minutes.
+    pub ttl: String,
+}
+
+/// Response from creating or retrieving a cached content resource.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedContentResponse {
+    /// Resource name, e.g. `"cachedContents/abc123"`.
+    pub name: String,
+    /// RFC 3339 expiration timestamp.
+    pub expire_time: String,
+    pub usage_metadata: Option<CacheUsageMetadata>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheUsageMetadata {
+    pub total_token_count: Option<u32>,
+}
+
+/// Request body for updating an existing cached content resource.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateCachedContentRequest {
+    /// New TTL duration, e.g. `"1800s"`.
+    pub ttl: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,6 +734,7 @@ mod tests {
             generation_config: None,
             tools: None,
             tool_config: None,
+            cached_content: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("systemInstruction").is_none());
@@ -711,6 +756,7 @@ mod tests {
             }),
             tools: None,
             tool_config: None,
+            cached_content: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("systemInstruction").is_some());
@@ -826,6 +872,7 @@ mod tests {
                     mode: "AUTO".into(),
                 },
             }),
+            cached_content: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert!(json.get("tools").is_some());
@@ -957,6 +1004,7 @@ mod tests {
                 }],
             })]),
             tool_config: None,
+            cached_content: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["tools"][0]["functionDeclarations"][0]["name"], "grep");
@@ -999,5 +1047,69 @@ mod tests {
         );
         assert_eq!(gm.grounding_supports.len(), 1);
         assert_eq!(gm.grounding_supports[0].grounding_chunk_indices, vec![0]);
+    }
+
+    // ── Context Caching Tests ──
+
+    #[test]
+    fn serialize_create_cached_content_request() {
+        let request = CreateCachedContentRequest {
+            model: "models/gemini-3.1-pro-preview".into(),
+            system_instruction: Some(Content::system("be helpful")),
+            tools: None,
+            tool_config: None,
+            ttl: "1800s".into(),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["model"], "models/gemini-3.1-pro-preview");
+        assert_eq!(json["ttl"], "1800s");
+        assert!(json.get("systemInstruction").is_some());
+        assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn deserialize_cached_content_response() {
+        let json = r#"{
+            "name": "cachedContents/abc123",
+            "expireTime": "2026-02-24T16:00:00Z",
+            "usageMetadata": {
+                "totalTokenCount": 5000
+            }
+        }"#;
+        let resp: CachedContentResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.name, "cachedContents/abc123");
+        assert_eq!(resp.expire_time, "2026-02-24T16:00:00Z");
+        assert_eq!(resp.usage_metadata.unwrap().total_token_count, Some(5000));
+    }
+
+    #[test]
+    fn serialize_request_with_cached_content() {
+        let request = GenerateContentRequest {
+            contents: vec![Content::user("test")],
+            system_instruction: None,
+            generation_config: None,
+            tools: None,
+            tool_config: None,
+            cached_content: Some("cachedContents/abc123".into()),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["cachedContent"], "cachedContents/abc123");
+        assert!(json.get("systemInstruction").is_none());
+        assert!(json.get("tools").is_none());
+    }
+
+    #[test]
+    fn serialize_request_omits_cached_content_when_none() {
+        let request = GenerateContentRequest {
+            contents: vec![Content::user("test")],
+            system_instruction: Some(Content::system("system")),
+            generation_config: None,
+            tools: None,
+            tool_config: None,
+            cached_content: None,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert!(json.get("cachedContent").is_none());
+        assert!(json.get("systemInstruction").is_some());
     }
 }

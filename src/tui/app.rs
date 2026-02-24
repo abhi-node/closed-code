@@ -18,9 +18,11 @@ use super::command_picker::CommandPicker;
 use super::commands::{self, CommandResult};
 use super::diff_view::DiffView;
 use super::events::{self, AppEvent};
+use super::file_completion::{self, FileCompletion};
 use super::input::InputPane;
 use super::keybindings::{self, Action};
 use super::layout;
+use super::message::SystemSeverity;
 use super::mode_picker::ModePicker;
 use super::session_picker::SessionPicker;
 use super::tui_approval_handler::TuiApprovalHandler;
@@ -36,7 +38,7 @@ pub enum AppState {
     CommandPicker { filter: String, selected: usize },
     Thinking,
     Streaming,
-    ToolExecuting { tool_name: String },
+    ToolExecuting { count: usize },
     AwaitingApproval,
     DiffView,
     SessionPicker,
@@ -117,6 +119,11 @@ pub struct App<'a> {
     // Commit confirmation
     pub commit_message: Option<String>,
     pub commit_working_dir: Option<std::path::PathBuf>,
+    // Phase 9e: Performance & health
+    pub message_line_cache: Vec<usize>,
+    pub rate_limit_until: Option<std::time::Instant>,
+    pub git_refresh_pending: bool,
+    pub file_completion: Option<FileCompletion>,
 }
 
 impl<'a> App<'a> {
@@ -135,9 +142,7 @@ impl<'a> App<'a> {
                         // Cancellation is handled by setting the cancel flag on the orchestrator.
                         // The spawned streaming task checks this flag and will send OrchestratorDone.
                         // We add an "Interrupted." message and transition to Idle.
-                        self.messages.push(ChatMessage::System {
-                            text: "Interrupted.".into(),
-                        });
+                        self.messages.push(ChatMessage::system(SystemSeverity::Info, "Interrupted."));
                         self.state = AppState::Idle;
                     }
                     _ => {
@@ -211,6 +216,39 @@ impl<'a> App<'a> {
             Action::ScrollDown => self.chat_viewport.scroll_down(3),
             Action::ScrollToTop => self.chat_viewport.scroll_to_top(),
             Action::ScrollToBottom => self.chat_viewport.scroll_to_bottom(),
+
+            // ── File completion ──
+            Action::TabComplete => {
+                if let Some(ref mut fc) = self.file_completion {
+                    fc.next();
+                    if let Some(candidate) = fc.selected_candidate().map(|s| s.to_string()) {
+                        let start_col = fc.start_col;
+                        self.input_pane.apply_completion(start_col, &candidate);
+                    }
+                } else if let Some((word, start_col)) = self.input_pane.word_before_cursor() {
+                    if file_completion::is_path_like(&word) && !word.starts_with('/') {
+                        let wd = self.input_pane.working_directory().to_path_buf();
+                        if let Some(mut fc) = FileCompletion::from_prefix(&word, &wd) {
+                            fc.start_col = start_col;
+                            if let Some(candidate) = fc.selected_candidate().map(|s| s.to_string()) {
+                                self.input_pane.apply_completion(start_col, &candidate);
+                            }
+                            self.file_completion = Some(fc);
+                        }
+                    }
+                }
+                return; // Don't clear completion
+            }
+            Action::TabCompletePrev => {
+                if let Some(ref mut fc) = self.file_completion {
+                    fc.prev();
+                    if let Some(candidate) = fc.selected_candidate().map(|s| s.to_string()) {
+                        let start_col = fc.start_col;
+                        self.input_pane.apply_completion(start_col, &candidate);
+                    }
+                }
+                return; // Don't clear completion
+            }
 
             // ── Command picker ──
             Action::PickerUp => {
@@ -295,14 +333,15 @@ impl<'a> App<'a> {
                 if let Some(tx) = self.approval_response_tx.take() {
                     let _ = tx.send(ApprovalDecision::Approved);
                 }
-                let file = self
+                let (file, diff) = self
                     .approval_overlay
-                    .as_ref()
-                    .map(|o| o.file_path.clone())
+                    .take()
+                    .map(|o| (o.file_path, Some(o.diff_lines)))
                     .unwrap_or_default();
-                self.approval_overlay = None;
                 self.messages.push(ChatMessage::System {
+                    severity: SystemSeverity::Success,
                     text: format!("Approved: {}", file),
+                    diff_lines: diff,
                 });
                 self.state = AppState::Thinking;
             }
@@ -310,14 +349,15 @@ impl<'a> App<'a> {
                 if let Some(tx) = self.approval_response_tx.take() {
                     let _ = tx.send(ApprovalDecision::Rejected);
                 }
-                let file = self
+                let (file, diff) = self
                     .approval_overlay
-                    .as_ref()
-                    .map(|o| o.file_path.clone())
+                    .take()
+                    .map(|o| (o.file_path, Some(o.diff_lines)))
                     .unwrap_or_default();
-                self.approval_overlay = None;
                 self.messages.push(ChatMessage::System {
+                    severity: SystemSeverity::Info,
                     text: format!("Rejected: {}", file),
+                    diff_lines: diff,
                 });
                 self.state = AppState::Thinking;
             }
@@ -415,15 +455,11 @@ impl<'a> App<'a> {
                 match self.state {
                     AppState::SessionPicker => {
                         self.session_picker = None;
-                        self.messages.push(ChatMessage::System {
-                            text: "Cancelled.".into(),
-                        });
+                        self.messages.push(ChatMessage::system(SystemSeverity::Info, "Cancelled."));
                     }
                     AppState::ModePicker { .. } => {
                         self.mode_picker = None;
-                        self.messages.push(ChatMessage::System {
-                            text: "Cancelled.".into(),
-                        });
+                        self.messages.push(ChatMessage::system(SystemSeverity::Info, "Cancelled."));
                     }
                     _ => {}
                 }
@@ -445,7 +481,22 @@ impl<'a> App<'a> {
 
             Action::Noop => {}
         }
+
+        // Any non-Tab action clears file completion
+        self.file_completion = None;
     }
+}
+
+/// Find the last Assistant message in the list (searching backwards).
+///
+/// This is needed because System messages (e.g., approval confirmations) may be
+/// inserted between ToolStart and ToolComplete events, causing `last_mut()` to
+/// return the wrong message.
+fn last_assistant_mut(messages: &mut [ChatMessage]) -> Option<&mut ChatMessage> {
+    messages
+        .iter_mut()
+        .rev()
+        .find(|m| matches!(m, ChatMessage::Assistant { .. }))
 }
 
 fn setup_terminal() -> anyhow::Result<DefaultTerminal> {
@@ -468,7 +519,7 @@ fn restore_terminal() {
     ratatui::restore();
 }
 
-pub async fn run(config: &Config) -> anyhow::Result<()> {
+pub async fn run(config: &Config, session_id: Option<&str>) -> anyhow::Result<()> {
     use crate::agent::orchestrator::OrchestratorEvent;
     use crate::gemini::stream::StreamEvent;
     use std::sync::atomic::Ordering;
@@ -500,7 +551,21 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     });
     orchestrator.detect_git_context().await;
 
-    if config.session_auto_save {
+    // Session setup: resume existing or start new
+    let mut initial_messages: Vec<ChatMessage> = Vec::new();
+    if let Some(id_str) = session_id {
+        let store = SessionStore::new(config.sessions_dir.clone());
+        let sid = match SessionId::parse(id_str) {
+            Ok(id) => id,
+            Err(_) => store.find_by_prefix(id_str)?,
+        };
+        let events = store.load_events(&sid)?;
+        let history = SessionStore::reconstruct_history(&events);
+        let turn_count = history.len();
+        orchestrator.set_history(history);
+        orchestrator.set_session(sid, store);
+        initial_messages.push(ChatMessage::system(SystemSeverity::Success, format!("Resumed session ({} turns restored).", turn_count)));
+    } else if config.session_auto_save {
         let store = SessionStore::new(config.sessions_dir.clone());
         orchestrator.start_session(store);
     }
@@ -544,7 +609,14 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
         mode_picker: None,
         commit_message: None,
         commit_working_dir: None,
+        message_line_cache: Vec::new(),
+        rate_limit_until: None,
+        git_refresh_pending: false,
+        file_completion: None,
     };
+
+    // Inject initial messages (e.g. session resume notification)
+    app.messages.extend(initial_messages);
 
     // ── Event loop (terminal reader + tick timer) ──
     events::spawn_event_loop(app_event_tx.clone());
@@ -554,13 +626,13 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
     tokio::spawn(async move {
         while let Some(event) = orch_event_rx.recv().await {
             let app_event = match event {
-                OrchestratorEvent::ToolStart { name, args_display } => {
-                    AppEvent::ToolStart { name, args_display }
+                OrchestratorEvent::ToolStart { tool_call_id, name, args_display } => {
+                    AppEvent::ToolStart { tool_call_id, name, args_display }
                 }
-                OrchestratorEvent::ToolComplete { name, duration } => {
-                    AppEvent::ToolComplete { name, duration }
+                OrchestratorEvent::ToolComplete { tool_call_id, name, duration } => {
+                    AppEvent::ToolComplete { tool_call_id, name, duration }
                 }
-                OrchestratorEvent::ToolError { name, error } => AppEvent::ToolError { name, error },
+                OrchestratorEvent::ToolError { tool_call_id, name, error } => AppEvent::ToolError { tool_call_id, name, error },
                 OrchestratorEvent::AgentStart { agent_type, task } => {
                     AppEvent::AgentStart { agent_type, task }
                 }
@@ -648,9 +720,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                         });
                     }
                     CommandResult::SwitchMode(mode) => {
-                        app.messages.push(ChatMessage::System {
-                            text: format!("Switched to {} mode.", mode),
-                        });
+                        app.messages.push(ChatMessage::system(SystemSeverity::Info, format!("Switched to {} mode.", mode)));
                     }
                     CommandResult::ShowSessionPicker => {
                         app.state = AppState::SessionPicker;
@@ -857,12 +927,10 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                                 let session_id = meta.session_id.clone();
                                 app.session_picker = None;
                                 app.state = AppState::Idle;
-                                app.messages.push(ChatMessage::System {
-                                    text: format!(
-                                        "Resuming session {}...",
-                                        &session_id.as_str()[..8]
-                                    ),
-                                });
+                                app.messages.push(ChatMessage::system(SystemSeverity::Info, format!(
+                                    "Resuming session {}...",
+                                    &session_id.as_str()[..8]
+                                )));
 
                                 let orch_clone = orchestrator.clone();
                                 let tx = app_event_tx.clone();
@@ -914,9 +982,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                                 // Accept plan with selected mode
                                 let mut orch = orchestrator.lock().await;
                                 if let Some(_plan) = orch.accept_plan(mode) {
-                                    app.messages.push(ChatMessage::System {
-                                        text: format!("Plan accepted. Executing in {} mode.", mode),
-                                    });
+                                    app.messages.push(ChatMessage::system(SystemSeverity::Success, format!("Plan accepted. Executing in {} mode.", mode)));
                                     app.status = StatusSnapshot::from_orchestrator(&orch);
                                 }
                                 drop(orch);
@@ -964,9 +1030,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                     Action::ModeConfirmNo if app.state == AppState::CommitConfirm => {
                         app.commit_message = None;
                         app.commit_working_dir = None;
-                        app.messages.push(ChatMessage::System {
-                            text: "Commit cancelled.".into(),
-                        });
+                        app.messages.push(ChatMessage::system(SystemSeverity::Info, "Commit cancelled."));
                         app.state = AppState::Idle;
                         continue;
                     }
@@ -974,9 +1038,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                         let mode = Mode::Auto;
                         let mut orch = orchestrator.lock().await;
                         if let Some(_plan) = orch.accept_plan(mode) {
-                            app.messages.push(ChatMessage::System {
-                                text: "Plan accepted. Executing in Auto mode.".into(),
-                            });
+                            app.messages.push(ChatMessage::system(SystemSeverity::Success, "Plan accepted. Executing in Auto mode."));
                             app.status = StatusSnapshot::from_orchestrator(&orch);
                         }
                         drop(orch);
@@ -992,6 +1054,8 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
             }
             AppEvent::Resize(_w, _h) => {
                 // Ratatui handles resize on next draw automatically.
+                // Invalidate line cache — widths changed, line counts may differ.
+                app.message_line_cache.clear();
             }
             AppEvent::MouseScrollUp => {
                 app.chat_viewport.scroll_up(3);
@@ -1001,6 +1065,12 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
             }
             AppEvent::Tick => {
                 app.tick_count = app.tick_count.wrapping_add(1);
+                // Rate-limit countdown
+                if let Some(until) = app.rate_limit_until {
+                    if std::time::Instant::now() >= until {
+                        app.rate_limit_until = None;
+                    }
+                }
             }
 
             // ── Streaming events ──
@@ -1012,7 +1082,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 if let Some(ChatMessage::Assistant {
                     text: ref mut msg_text,
                     ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
                     msg_text.push_str(&text);
                 }
@@ -1022,56 +1092,81 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 if let Some(ChatMessage::Assistant {
                     ref mut is_streaming,
                     ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
                     *is_streaming = false;
                 }
             }
 
             // ── Tool events ──
-            AppEvent::ToolStart { name, args_display } => {
-                app.state = AppState::ToolExecuting {
-                    tool_name: name.clone(),
-                };
+            AppEvent::ToolStart { tool_call_id, name, args_display } => {
+                app.message_line_cache.clear();
+                match app.state {
+                    AppState::ToolExecuting { count } => {
+                        app.state = AppState::ToolExecuting { count: count + 1 };
+                    }
+                    _ => {
+                        app.state = AppState::ToolExecuting { count: 1 };
+                    }
+                }
                 if let Some(ChatMessage::Assistant {
                     ref mut tool_calls, ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
-                    tool_calls.push(super::chat::ToolCallDisplay::Running { name, args_display });
+                    tool_calls.push(super::chat::ToolCallDisplay::Running { tool_call_id, name, args_display });
                 }
             }
-            AppEvent::ToolComplete { name, duration } => {
-                app.state = AppState::Thinking;
+            AppEvent::ToolComplete { tool_call_id, name, duration } => {
+                app.message_line_cache.clear();
                 if let Some(ChatMessage::Assistant {
                     ref mut tool_calls, ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
-                    // Find the running tool call and mark it completed
+                    // Find the running tool call by ID and mark it completed
                     if let Some(tc) = tool_calls.iter_mut().rev().find(|tc| {
-                        matches!(tc, super::chat::ToolCallDisplay::Running { name: n, .. } if *n == name)
+                        matches!(tc, super::chat::ToolCallDisplay::Running { tool_call_id: id, .. } if *id == tool_call_id)
                     }) {
-                        *tc = super::chat::ToolCallDisplay::Completed { name, duration };
+                        *tc = super::chat::ToolCallDisplay::Completed { tool_call_id, name, duration };
+                    }
+                    // Transition to Thinking only if no other tools are still Running
+                    let still_running = tool_calls.iter().any(|tc| {
+                        matches!(tc, super::chat::ToolCallDisplay::Running { .. })
+                    });
+                    if !still_running {
+                        app.state = AppState::Thinking;
+                    } else if let AppState::ToolExecuting { count } = app.state {
+                        app.state = AppState::ToolExecuting { count: count.saturating_sub(1).max(1) };
                     }
                 }
             }
-            AppEvent::ToolError { name, error } => {
+            AppEvent::ToolError { tool_call_id, name, error } => {
+                app.message_line_cache.clear();
                 if let Some(ChatMessage::Assistant {
                     ref mut tool_calls, ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
                     if let Some(tc) = tool_calls.iter_mut().rev().find(|tc| {
-                        matches!(tc, super::chat::ToolCallDisplay::Running { name: n, .. } if *n == name)
+                        matches!(tc, super::chat::ToolCallDisplay::Running { tool_call_id: id, .. } if *id == tool_call_id)
                     }) {
-                        *tc = super::chat::ToolCallDisplay::Failed { name, error };
+                        *tc = super::chat::ToolCallDisplay::Failed { tool_call_id, name, error };
+                    }
+                    let still_running = tool_calls.iter().any(|tc| {
+                        matches!(tc, super::chat::ToolCallDisplay::Running { .. })
+                    });
+                    if !still_running {
+                        app.state = AppState::Thinking;
+                    } else if let AppState::ToolExecuting { count } = app.state {
+                        app.state = AppState::ToolExecuting { count: count.saturating_sub(1).max(1) };
                     }
                 }
             }
 
             // ── Agent events ──
             AppEvent::AgentStart { agent_type, task } => {
+                app.message_line_cache.clear();
                 if let Some(ChatMessage::Assistant {
                     ref mut tool_calls, ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
                     tool_calls.push(super::chat::ToolCallDisplay::AgentRunning {
                         agent_type,
@@ -1084,9 +1179,10 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 agent_type,
                 duration,
             } => {
+                app.message_line_cache.clear();
                 if let Some(ChatMessage::Assistant {
                     ref mut tool_calls, ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
                     if let Some(tc) = tool_calls.iter_mut().rev().find(|tc| {
                         matches!(tc, super::chat::ToolCallDisplay::AgentRunning { agent_type: at, .. } if *at == agent_type)
@@ -1104,9 +1200,10 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 tool_name,
                 args_display,
             } => {
+                app.message_line_cache.clear();
                 if let Some(ChatMessage::Assistant {
                     ref mut tool_calls, ..
-                }) = app.messages.last_mut()
+                }) = last_assistant_mut(&mut app.messages)
                 {
                     if let Some(super::chat::ToolCallDisplay::AgentRunning {
                         ref mut last_tool, ..
@@ -1120,19 +1217,17 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
 
             // ── System events ──
             AppEvent::SystemMessage(text) => {
-                app.messages.push(ChatMessage::System { text });
+                app.messages.push(ChatMessage::system(SystemSeverity::Info, text));
             }
             AppEvent::ModeChanged(mode) => {
-                app.messages.push(ChatMessage::System {
-                    text: format!("Mode changed to: {}", mode),
-                });
+                app.messages.push(ChatMessage::system(SystemSeverity::Info, format!("Mode changed to: {}", mode)));
             }
             AppEvent::OrchestratorDone => {
                 // Refresh status from orchestrator
                 let mut orch = orchestrator.lock().await;
                 // Capture plan text in Plan mode (matches repl.rs behavior)
                 if *orch.mode() == crate::mode::Mode::Plan {
-                    if let Some(ChatMessage::Assistant { ref text, .. }) = app.messages.last() {
+                    if let Some(ChatMessage::Assistant { ref text, .. }) = app.messages.iter().rev().find(|m| matches!(m, ChatMessage::Assistant { .. })) {
                         if !text.is_empty() {
                             orch.set_current_plan(text.clone());
                         }
@@ -1143,9 +1238,7 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 app.state = AppState::Idle;
             }
             AppEvent::Error(err) => {
-                app.messages.push(ChatMessage::System {
-                    text: format!("Error: {}", err),
-                });
+                app.messages.push(ChatMessage::system(SystemSeverity::Error, format!("Error: {}", err)));
             }
 
             // ── Phase 9d: Overlay events ──
@@ -1153,31 +1246,62 @@ pub async fn run(config: &Config) -> anyhow::Result<()> {
                 change,
                 response_tx,
             } => {
-                app.approval_overlay = Some(ApprovalOverlay::from_change(&change));
-                app.approval_response_tx = Some(response_tx);
-                app.state = AppState::AwaitingApproval;
+                match app.status.mode {
+                    Mode::Execute | Mode::Auto => {
+                        // Auto-approve without showing overlay
+                        let _ = response_tx.send(ApprovalDecision::Approved);
+                        let overlay = ApprovalOverlay::from_change(&change);
+                        app.messages.push(ChatMessage::System {
+                            severity: SystemSeverity::Success,
+                            text: format!("Auto-approved: {}", change.file_path),
+                            diff_lines: Some(overlay.diff_lines),
+                        });
+                        // State remains unchanged (ToolExecuting/Thinking)
+                    }
+                    _ => {
+                        // Guided/Explore/Plan: show approval overlay
+                        app.approval_overlay = Some(ApprovalOverlay::from_change(&change));
+                        app.approval_response_tx = Some(response_tx);
+                        app.state = AppState::AwaitingApproval;
+                    }
+                }
             }
             AppEvent::CommitReady {
                 message,
                 working_dir,
             } => {
-                app.messages.push(ChatMessage::System {
-                    text: format!("Proposed commit message: \"{}\"", message),
-                });
+                app.messages.push(ChatMessage::system(SystemSeverity::Info, format!("Proposed commit message: \"{}\"", message)));
                 app.commit_message = Some(message);
                 app.commit_working_dir = Some(working_dir);
                 app.state = AppState::CommitConfirm;
             }
             AppEvent::SessionsLoaded(sessions) => {
                 if sessions.is_empty() {
-                    app.messages.push(ChatMessage::System {
-                        text: "No sessions found.".into(),
-                    });
+                    app.messages.push(ChatMessage::system(SystemSeverity::Info, "No sessions found."));
                     app.state = AppState::Idle;
                 } else {
                     app.session_picker = Some(SessionPicker::new(sessions));
                     // state is already SessionPicker from ShowSessionPicker handling
                 }
+            }
+
+            // ── Phase 9e: Status & health events ──
+            AppEvent::StatusUpdate(snapshot) => {
+                app.status = snapshot;
+            }
+            AppEvent::RateLimited { retry_after_secs } => {
+                app.rate_limit_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(retry_after_secs));
+                app.messages.push(ChatMessage::system(SystemSeverity::Warning, format!("Rate limited. Retrying in {}s...", retry_after_secs)));
+            }
+            AppEvent::ContextPruned { turns_removed, turns_remaining } => {
+                app.messages.push(ChatMessage::system(SystemSeverity::Warning, format!(
+                    "Context pruned: {} turns removed, {} remaining.",
+                    turns_removed, turns_remaining
+                )));
+            }
+            AppEvent::ShellComplete(msg) => {
+                app.messages.push(msg);
             }
         }
 
@@ -1246,9 +1370,7 @@ mod tests {
 
     #[test]
     fn app_state_tool_executing() {
-        let state = AppState::ToolExecuting {
-            tool_name: "read_file".into(),
-        };
+        let state = AppState::ToolExecuting { count: 1 };
         assert_ne!(state, AppState::Idle);
     }
 }

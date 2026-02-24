@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::agent::cache::SubAgentCacheManager;
 use crate::agent::explorer::ExplorerAgent;
 use crate::agent::message::{AgentRequest, ToolProgressFn};
 use crate::agent::orchestrator::OrchestratorEvent;
@@ -43,6 +44,7 @@ pub struct SpawnExplorerTool {
     working_directory: PathBuf,
     sandbox: Arc<dyn Sandbox>,
     event_tx: Option<UnboundedSender<OrchestratorEvent>>,
+    cache_manager: Option<Arc<SubAgentCacheManager>>,
 }
 
 impl std::fmt::Debug for SpawnExplorerTool {
@@ -64,11 +66,17 @@ impl SpawnExplorerTool {
             working_directory,
             sandbox,
             event_tx: None,
+            cache_manager: None,
         }
     }
 
     pub fn with_event_tx(mut self, tx: Option<UnboundedSender<OrchestratorEvent>>) -> Self {
         self.event_tx = tx;
+        self
+    }
+
+    pub fn with_cache_manager(mut self, cm: Arc<SubAgentCacheManager>) -> Self {
+        self.cache_manager = Some(cm);
         self
     }
 }
@@ -126,6 +134,9 @@ impl Tool for SpawnExplorerTool {
         if let Some(ref tx) = self.event_tx {
             agent = agent.with_progress(make_agent_progress_callback(tx.clone(), "explorer"));
         }
+        if let Some(ref cm) = self.cache_manager {
+            agent = agent.with_cache_manager(cm.clone());
+        }
         let response = agent.run(&self.client, request).await?;
 
         Ok(json!({
@@ -160,6 +171,7 @@ pub struct SpawnPlannerTool {
     working_directory: PathBuf,
     sandbox: Arc<dyn Sandbox>,
     event_tx: Option<UnboundedSender<OrchestratorEvent>>,
+    cache_manager: Option<Arc<SubAgentCacheManager>>,
 }
 
 impl std::fmt::Debug for SpawnPlannerTool {
@@ -181,11 +193,17 @@ impl SpawnPlannerTool {
             working_directory,
             sandbox,
             event_tx: None,
+            cache_manager: None,
         }
     }
 
     pub fn with_event_tx(mut self, tx: Option<UnboundedSender<OrchestratorEvent>>) -> Self {
         self.event_tx = tx;
+        self
+    }
+
+    pub fn with_cache_manager(mut self, cm: Arc<SubAgentCacheManager>) -> Self {
+        self.cache_manager = Some(cm);
         self
     }
 }
@@ -240,6 +258,9 @@ impl Tool for SpawnPlannerTool {
         let mut agent = PlannerAgent::new(self.working_directory.clone(), self.sandbox.clone());
         if let Some(ref tx) = self.event_tx {
             agent = agent.with_progress(make_agent_progress_callback(tx.clone(), "planner"));
+        }
+        if let Some(ref cm) = self.cache_manager {
+            agent = agent.with_cache_manager(cm.clone());
         }
         let response = agent.run(&self.client, request).await?;
 

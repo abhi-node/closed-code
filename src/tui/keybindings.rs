@@ -67,6 +67,10 @@ pub enum Action {
     ModeConfirmYes,
     ModeConfirmNo,
 
+    // ── File Completion (Phase 9e) ──
+    TabComplete,
+    TabCompletePrev,
+
     Noop,
 }
 
@@ -127,6 +131,10 @@ fn map_idle(key: KeyEvent) -> Action {
         (KeyCode::Down, _) => Action::HistoryNext,
         (KeyCode::PageUp, _) => Action::PageUp,
         (KeyCode::PageDown, _) => Action::PageDown,
+
+        // Tab completion
+        (KeyCode::Tab, _) => Action::TabComplete,
+        (KeyCode::BackTab, _) => Action::TabCompletePrev,
 
         // Edit
         (KeyCode::Backspace, _) => Action::Backspace,
@@ -376,9 +384,7 @@ mod tests {
 
     #[test]
     fn tool_executing_ignores_keys() {
-        let state = AppState::ToolExecuting {
-            tool_name: "read_file".into(),
-        };
+        let state = AppState::ToolExecuting { count: 1 };
         assert_eq!(map_key(key(KeyCode::Char('a')), &state), Action::Noop);
     }
 

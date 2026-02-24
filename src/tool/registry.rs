@@ -170,6 +170,7 @@ pub fn create_subagent_registry(
 ///
 /// In Execute mode, `approval_handler` must be `Some` to register write tools.
 /// In other modes, `approval_handler` is ignored (write tools are not registered).
+#[allow(clippy::too_many_arguments)]
 pub fn create_orchestrator_registry(
     working_directory: PathBuf,
     mode: &Mode,
@@ -180,6 +181,7 @@ pub fn create_orchestrator_registry(
     event_tx: Option<
         tokio::sync::mpsc::UnboundedSender<crate::agent::orchestrator::OrchestratorEvent>,
     >,
+    subagent_cache_manager: Arc<crate::agent::cache::SubAgentCacheManager>,
 ) -> ToolRegistry {
     let bypass_shell = matches!(mode, Mode::Auto);
     let mut registry = ToolRegistry::new();
@@ -195,7 +197,8 @@ pub fn create_orchestrator_registry(
         Mode::Explore => {
             registry.register(Box::new(
                 super::spawn::SpawnExplorerTool::new(client, working_directory, sandbox)
-                    .with_event_tx(event_tx),
+                    .with_event_tx(event_tx)
+                    .with_cache_manager(subagent_cache_manager),
             ));
         }
         Mode::Plan => {
@@ -205,7 +208,8 @@ pub fn create_orchestrator_registry(
                     working_directory.clone(),
                     sandbox.clone(),
                 )
-                .with_event_tx(event_tx.clone()),
+                .with_event_tx(event_tx.clone())
+                .with_cache_manager(subagent_cache_manager.clone()),
             ));
             registry.register(Box::new(
                 super::spawn::SpawnPlannerTool::new(
@@ -213,7 +217,8 @@ pub fn create_orchestrator_registry(
                     working_directory.clone(),
                     sandbox,
                 )
-                .with_event_tx(event_tx),
+                .with_event_tx(event_tx)
+                .with_cache_manager(subagent_cache_manager),
             ));
             registry.register(Box::new(super::spawn::SpawnWebSearchTool::new(
                 client,
@@ -227,11 +232,13 @@ pub fn create_orchestrator_registry(
                     working_directory.clone(),
                     sandbox.clone(),
                 )
-                .with_event_tx(event_tx.clone()),
+                .with_event_tx(event_tx.clone())
+                .with_cache_manager(subagent_cache_manager.clone()),
             ));
             registry.register(Box::new(
                 super::spawn::SpawnPlannerTool::new(client, working_directory.clone(), sandbox)
-                    .with_event_tx(event_tx),
+                    .with_event_tx(event_tx)
+                    .with_cache_manager(subagent_cache_manager),
             ));
             // Write tools — Guided, Execute, and Auto modes
             if let Some(handler) = approval_handler {
@@ -262,6 +269,10 @@ mod tests {
 
     fn mock_sandbox() -> Arc<dyn Sandbox> {
         Arc::new(MockSandbox::new(PathBuf::from("/tmp")))
+    }
+
+    fn mock_cache_manager() -> Arc<crate::agent::cache::SubAgentCacheManager> {
+        Arc::new(crate::agent::cache::SubAgentCacheManager::new())
     }
 
     #[derive(Debug)]
@@ -453,6 +464,7 @@ mod tests {
             mock_sandbox(),
             vec![],
             None,
+            mock_cache_manager(),
         );
         // 5 filesystem/shell + spawn_explorer = 6
         assert_eq!(registry.len(), 6);
@@ -475,6 +487,7 @@ mod tests {
             mock_sandbox(),
             vec![],
             None,
+            mock_cache_manager(),
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + spawn_web_search = 8
         assert_eq!(registry.len(), 8);
@@ -501,6 +514,7 @@ mod tests {
             mock_sandbox(),
             vec![],
             None,
+            mock_cache_manager(),
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(registry.len(), 9);
@@ -524,6 +538,7 @@ mod tests {
             mock_sandbox(),
             vec![],
             None,
+            mock_cache_manager(),
         );
         // No write tools, but spawn tools: 5 filesystem/shell + spawn_explorer + spawn_planner = 7
         assert_eq!(registry.len(), 7);
@@ -547,6 +562,7 @@ mod tests {
             mock_sandbox(),
             vec![],
             None,
+            mock_cache_manager(),
         );
         // Explore mode: no write tools regardless of handler
         assert_eq!(registry.len(), 6);
@@ -569,6 +585,7 @@ mod tests {
             mock_sandbox(),
             vec![],
             None,
+            mock_cache_manager(),
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(registry.len(), 9);
@@ -605,6 +622,7 @@ mod tests {
             mock_sandbox(),
             vec![],
             None,
+            mock_cache_manager(),
         );
         // 5 filesystem/shell + spawn_explorer + spawn_planner + write_file + edit_file = 9
         assert_eq!(registry.len(), 9);

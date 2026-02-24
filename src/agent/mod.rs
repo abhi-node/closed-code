@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod commit_agent;
 pub mod explorer;
 pub mod message;

@@ -131,8 +131,8 @@ impl Tool for ReadFileTool {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
 
-        let start = start_line.unwrap_or(1).saturating_sub(1);
-        let end = end_line.unwrap_or(total_lines).min(total_lines);
+        let start = start_line.unwrap_or(1).saturating_sub(1).min(total_lines);
+        let end = end_line.unwrap_or(total_lines).min(total_lines).max(start);
 
         let selected: Vec<String> = lines[start..end]
             .iter()

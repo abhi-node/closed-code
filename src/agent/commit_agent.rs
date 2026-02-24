@@ -1,8 +1,7 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
-
+use crate::agent::cache::{self, SubAgentCacheManager};
 use crate::agent::message::{AgentResponse, ToolProgressFn};
 use crate::agent::{Agent, AgentRequest};
 use crate::error::{ClosedCodeError, Result};
@@ -12,7 +11,6 @@ use crate::sandbox::Sandbox;
 use crate::tool::registry::{create_subagent_registry, ToolRegistry};
 
 const COMMIT_MAX_ITERATIONS: usize = 10;
-const COMMIT_TIMEOUT_SECS: u64 = 90;
 
 const COMMIT_SYSTEM_PROMPT: &str = "\
 You are a commit message generator agent. Your job is to analyze code changes \
@@ -39,6 +37,7 @@ pub struct CommitAgent {
     working_directory: PathBuf,
     sandbox: Arc<dyn Sandbox>,
     on_tool_progress: Option<ToolProgressFn>,
+    cache_manager: Option<Arc<SubAgentCacheManager>>,
 }
 
 impl std::fmt::Debug for CommitAgent {
@@ -55,11 +54,17 @@ impl CommitAgent {
             working_directory,
             sandbox,
             on_tool_progress: None,
+            cache_manager: None,
         }
     }
 
     pub fn with_progress(mut self, f: ToolProgressFn) -> Self {
         self.on_tool_progress = Some(f);
+        self
+    }
+
+    pub fn with_cache_manager(mut self, cm: Arc<SubAgentCacheManager>) -> Self {
+        self.cache_manager = Some(cm);
         self
     }
 
@@ -72,6 +77,7 @@ impl CommitAgent {
         system_instruction: Content,
         tools: Option<Vec<GeminiTool>>,
         tool_config: Option<ToolConfig>,
+        mut cached_content: Option<String>,
     ) -> Result<Option<AgentResponse>> {
         let registry =
             create_subagent_registry(self.working_directory.clone(), self.sandbox.clone());
@@ -83,20 +89,30 @@ impl CommitAgent {
                 self.max_iterations()
             );
 
-            let request = GenerateContentRequest {
-                contents: history.clone(),
-                system_instruction: Some(system_instruction.clone()),
-                generation_config: Some(GenerationConfig {
-                    temperature: Some(0.7),
-                    top_p: None,
-                    top_k: None,
-                    max_output_tokens: Some(8192),
-                }),
-                tools: tools.clone(),
-                tool_config: tool_config.clone(),
-            };
+            let request = cache::build_subagent_request(
+                history,
+                &system_instruction,
+                &tools,
+                &tool_config,
+                &cached_content,
+            );
 
-            let response = client.generate_content(&request).await?;
+            let response = match client.generate_content(&request).await {
+                Ok(r) => r,
+                Err(e) if cached_content.is_some() && cache::is_subagent_cache_error(&e) => {
+                    tracing::warn!("Commit cache error, retrying without cache: {}", e);
+                    cached_content = None;
+                    let retry_req = cache::build_subagent_request(
+                        history,
+                        &system_instruction,
+                        &tools,
+                        &tool_config,
+                        &None,
+                    );
+                    client.generate_content(&retry_req).await?
+                }
+                Err(e) => return Err(e),
+            };
 
             let candidate = response
                 .candidates
@@ -268,6 +284,20 @@ impl Agent for CommitAgent {
         let tool_config = Some(ToolRegistry::tool_config());
         let system_instruction = Content::system(self.system_prompt());
 
+        let cached_content = if let Some(ref cm) = self.cache_manager {
+            cache::ensure_subagent_cache(
+                cm,
+                client,
+                self.agent_type(),
+                &system_instruction,
+                &tools,
+                &tool_config,
+            )
+            .await
+        } else {
+            None
+        };
+
         // Build initial message from the request
         let mut user_message = format!("Task: {}\n", request.task);
         if !request.context.is_empty() {
@@ -283,16 +313,16 @@ impl Agent for CommitAgent {
 
         let mut history = vec![Content::user(&user_message)];
 
-        // Run with timeout
-        let result = tokio::time::timeout(
-            Duration::from_secs(COMMIT_TIMEOUT_SECS),
-            self.run_subagent_loop(client, &mut history, system_instruction, tools, tool_config),
-        )
-        .await
-        .map_err(|_| ClosedCodeError::AgentTimeout {
-            agent_id: self.agent_type().into(),
-            seconds: COMMIT_TIMEOUT_SECS,
-        })??;
+        let result = self
+            .run_subagent_loop(
+                client,
+                &mut history,
+                system_instruction,
+                tools,
+                tool_config,
+                cached_content,
+            )
+            .await?;
 
         match result {
             Some(mut response) => {
@@ -351,7 +381,6 @@ mod tests {
         assert_eq!(report.detailed_report, "No detailed report provided");
     }
 
-    // Compile-time checks: commit agent should be faster/lighter than explorer
+    // Compile-time check: commit agent should be lighter than explorer
     const _: () = assert!(COMMIT_MAX_ITERATIONS < 15); // Explorer is 15
-    const _: () = assert!(COMMIT_TIMEOUT_SECS < 120); // Explorer is 120
 }

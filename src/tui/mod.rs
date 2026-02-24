@@ -6,6 +6,7 @@ pub mod commands;
 pub mod commit_confirm;
 pub mod diff_view;
 pub mod events;
+pub mod file_completion;
 pub mod gauge;
 pub mod header;
 pub mod input;
@@ -24,6 +25,7 @@ use crate::config::Config;
 /// Launch the full-screen TUI application.
 ///
 /// Replaces `run_repl()` as the default interactive entry point.
-pub async fn run_tui(config: &Config) -> anyhow::Result<()> {
-    app::run(config).await
+/// If `session_id` is provided, the TUI will resume that session on startup.
+pub async fn run_tui(config: &Config, session_id: Option<&str>) -> anyhow::Result<()> {
+    app::run(config, session_id).await
 }
