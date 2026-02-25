@@ -68,6 +68,11 @@ impl TuiTheme {
     pub const PICKER_HIGHLIGHT_FG: Color = tailwind::SLATE.c100;
     pub const PICKER_MATCH: Color = tailwind::AMBER.c400;
 
+    // ── File Picker (Phase 10) ──
+    pub const FILE_PICKER_BORDER: Color = tailwind::CYAN.c400;
+    pub const FILE_PICKER_HIGHLIGHT_BG: Color = tailwind::CYAN.c800;
+    pub const TEXT_NORMAL: Color = tailwind::SLATE.c200;
+
     // ── Spinner Frames ──
     pub const SPINNER_FRAMES: &'static [&'static str] =
         &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

@@ -86,7 +86,7 @@ pub fn map_key(key: KeyEvent, state: &AppState) -> Action {
 
     match state {
         AppState::Idle => map_idle(key),
-        AppState::CommandPicker { .. } => map_picker(key),
+        AppState::CommandPicker { .. } | AppState::FilePicker { .. } => map_picker(key),
         AppState::Thinking => map_thinking(key),
         AppState::Streaming => map_streaming(key),
         AppState::ToolExecuting { .. } => map_thinking(key),

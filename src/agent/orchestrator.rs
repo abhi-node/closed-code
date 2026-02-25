@@ -184,14 +184,32 @@ impl Orchestrator {
     /// executes any function calls, and returns the final assistant text.
     pub async fn handle_user_input_streaming(
         &mut self,
-        input: &str,
+        parts: Vec<Part>,
         mut on_event: impl FnMut(StreamEvent),
     ) -> Result<String> {
-        self.history.push(Content::user(input));
+        let first_text = parts.iter().find_map(|p| {
+            if let Part::Text(t) = p { Some(t.clone()) } else { None }
+        }).unwrap_or_default();
+
+        self.history.push(Content {
+            role: Some("user".into()),
+            parts: parts.clone(),
+        });
+
         self.emit_event(SessionEvent::UserMessage {
-            content: input.to_string(),
+            content: first_text,
             timestamp: Utc::now(),
         });
+
+        for part in &parts {
+            if let Part::InlineData { mime_type, .. } = part {
+                self.emit_event(SessionEvent::ImageAttached {
+                    mime_type: mime_type.clone(),
+                    size_bytes: 0, // Inlined images don't strictly have a path size here, but required by struct
+                    timestamp: Utc::now(),
+                });
+            }
+        }
 
         if self.should_auto_compact() {
             tracing::info!(

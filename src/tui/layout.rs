@@ -74,6 +74,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             .render(frame, filter, selected, area, chat_area);
     }
 
+    // File picker
+    if let AppState::FilePicker { .. } = app.state {
+        if let Some(ref mut picker) = app.file_picker {
+            picker.render(frame, area, chat_area);
+        }
+    }
+
     // Approval overlay
     if app.state == AppState::AwaitingApproval {
         if let Some(ref overlay) = app.approval_overlay {

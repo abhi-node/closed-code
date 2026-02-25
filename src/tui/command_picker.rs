@@ -160,6 +160,12 @@ pub fn all_commands() -> Vec<CommandEntry> {
             category: Config,
         },
         CommandEntry {
+            name: "/reindex",
+            args: "",
+            description: "Rebuild the file fuzzy search index",
+            category: Config,
+        },
+        CommandEntry {
             name: "/personality",
             args: "[style]",
             description: "Show or change personality",

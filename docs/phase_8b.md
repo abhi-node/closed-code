@@ -311,7 +311,9 @@ Add `pub mod image;` to module declarations.
 
 ---
 
-## Sub-Phase 8b.2: ImageDescriptionAgent
+## Sub-Phase 8b.2: ImageDescriptionAgent (DEPRECATED)
+
+> **DEPRECATION NOTICE**: As of Phase 10, the `ImageDescriptionAgent` architecture has been abandoned in favor of direct `Part::InlineData` injection. Gemini 1.5 processes native images efficiently (258 tokens flat), preserving visual/spatial detail that is lost during text translation, while saving an API round-trip. This section remains for historical design reference only.
 
 ### New File: `src/agent/image_description.rs`
 

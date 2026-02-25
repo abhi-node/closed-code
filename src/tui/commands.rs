@@ -32,6 +32,8 @@ pub enum CommandResult {
     RunReviewAgent { diff: String, working_dir: PathBuf },
     /// Run compact asynchronously.
     RunCompact { user_prompt: Option<String>, turns_before: usize },
+    /// Reindex file fuzzy search.
+    Reindex,
 }
 
 /// Dispatch a slash command and return messages to display + result.
@@ -528,6 +530,15 @@ pub async fn dispatch(
                 }
             }
             CommandResult::Continue
+        }
+
+        "/reindex" => {
+            messages.push(ChatMessage::System {
+                severity: SystemSeverity::Info,
+                text: "Rebuilding file index...".into(),
+                diff_lines: None,
+            });
+            CommandResult::Reindex
         }
 
         "/resume" => {

@@ -55,13 +55,15 @@ Existing systems (TUI, Config, Shell, Tools) will be incrementally enhanced to s
 - **Dependency**: Add `nucleo = "0.5"` for high-performance fuzzy matching (same engine as Helix).
 - **File Indexer**: A background Tokio task that recursively scans the workspace (respecting `.gitignore` and the new `.closed-code-ignore`), caching the results so the main UI thread is not blocked.
 - **TUI Overlay (`src/tui/file_picker.rs`)**: 
-  - Triggered when the user types `@` in the input pane.
+  - Triggered when the user types `@` at the start of a word in the input pane.
   - Displays a floating list of top 10 matches, updated reactively as the user types.
   - Arrow keys navigate, `Tab`/`Enter` inserts the path.
-- **Image Tagging (`@image` or `@img`)**:
-  - Filters the fuzzy picker to image extensions (`.png`, `.jpg`, `.webp`, etc.).
-  - Reuses the `read_image_file()` and `ImageDescriptionAgent` pipeline from Phase 8.
-  - Multiple tags are resolved independently before sending the prompt to the LLM.
+- **Auto-Detection & Direct Injection**:
+  - The `ImageDescriptionAgent` (Phase 8b) is fully deprecated.
+  - When the user submits a prompt, it is parsed for `@path/to/file` tags.
+  - If the path is an image (`.png`, `.jpg`, etc.), it is read, base64 encoded, and injected natively as `Part::InlineData`. Gemini 1.5 processes this directly (at a flat 258 tokens per image), preserving 100% of spatial UI details and bypassing any slow API translation roundtrips.
+  - If the path is a text file, the contents are read and inlined directly into the prompt (capped at 1MB to protect context limits).
+  - The tags in the prompt text are cleanly replaced with `[Attached File: path]` or `[Attached Image: path]` placeholders.
 
 ---
 
@@ -234,7 +236,7 @@ Given the massive scope of Phase 10 (~3,500 lines, 10-15 files), it must be impl
    - *Rationale*: Standalone feature, easy to verify independently without affecting core logic.
 
 5. **Step 5: Fuzzy File Search & Image Tagging**
-   - Integrate `nucleo`. Build the `FileIndexer` background task. Create the TUI overlay. Wire up `@image` to the existing vision pipeline.
+   - Integrate `nucleo`. Build the `FileIndexer` background task. Create the TUI overlay. Wire up `@path` auto-detection in `tag_processor.rs` to inline files and directly inject images as `Part::InlineData`.
    - *Rationale*: Significantly enhances user experience. Requires careful integration with the TUI event loop to remain performant.
 
 6. **Step 6: Rich TUI Animations**

@@ -257,6 +257,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "backon",
+ "base64",
  "chrono",
  "clap",
  "crossterm",

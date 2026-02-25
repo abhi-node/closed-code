@@ -7,6 +7,8 @@ pub mod commit_confirm;
 pub mod diff_view;
 pub mod events;
 pub mod file_completion;
+pub mod file_indexer;
+pub mod file_picker;
 pub mod gauge;
 pub mod header;
 pub mod input;

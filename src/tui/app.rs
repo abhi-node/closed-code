@@ -5,6 +5,7 @@ use tokio::sync::oneshot;
 
 use crate::agent::orchestrator::{Orchestrator, OrchestratorConfig};
 use crate::config::Config;
+use crate::gemini::types::Part;
 use crate::gemini::GeminiClient;
 use crate::mode::Mode;
 use crate::sandbox::create_sandbox;
@@ -19,6 +20,8 @@ use super::commands::{self, CommandResult};
 use super::diff_view::DiffView;
 use super::events::{self, AppEvent};
 use super::file_completion::{self, FileCompletion};
+use super::file_indexer::FileIndexer;
+use super::file_picker::FilePicker;
 use super::input::InputPane;
 use super::keybindings::{self, Action};
 use super::layout;
@@ -36,6 +39,7 @@ use super::tui_approval_handler::TuiApprovalHandler;
 pub enum AppState {
     Idle,
     CommandPicker { filter: String, selected: usize },
+    FilePicker { filter: String, selected: usize, start_col: usize },
     Thinking,
     Streaming,
     ToolExecuting { count: usize },
@@ -122,6 +126,8 @@ pub struct App<'a> {
     pub rate_limit_until: Option<std::time::Instant>,
     pub git_refresh_pending: bool,
     pub file_completion: Option<FileCompletion>,
+    pub file_indexer: FileIndexer,
+    pub file_picker: Option<FilePicker>,
 }
 
 impl<'a> App<'a> {
@@ -132,9 +138,10 @@ impl<'a> App<'a> {
             }
             Action::Cancel => {
                 match &self.state {
-                    AppState::CommandPicker { .. } => {
+                    AppState::CommandPicker { .. } | AppState::FilePicker { .. } => {
                         self.state = AppState::Idle;
                         self.input_pane.clear();
+                        self.file_picker = None;
                     }
                     AppState::Thinking | AppState::Streaming | AppState::ToolExecuting { .. } => {
                         // Cancellation is handled by setting the cancel flag on the orchestrator.
@@ -168,6 +175,22 @@ impl<'a> App<'a> {
                         filter: String::new(),
                         selected: 0,
                     };
+                } else if c == '@' {
+                    let text = self.input_pane.text();
+                    let is_valid_trigger = text.is_empty() || text.ends_with(char::is_whitespace);
+                    let start_col = self.input_pane.textarea().cursor().1;
+                    self.input_pane.insert_char('@');
+                    
+                    if is_valid_trigger {
+                        let mut picker = FilePicker::new(10);
+                        picker.update_matches(&mut self.file_indexer);
+                        self.file_picker = Some(picker);
+                        self.state = AppState::FilePicker {
+                            filter: String::new(),
+                            selected: 0,
+                            start_col,
+                        };
+                    }
                 } else {
                     self.input_pane.insert_char(c);
                 }
@@ -255,6 +278,10 @@ impl<'a> App<'a> {
                 } = self.state
                 {
                     *selected = selected.saturating_sub(1);
+                } else if let AppState::FilePicker { .. } = self.state {
+                    if let Some(ref mut picker) = self.file_picker {
+                        picker.previous();
+                    }
                 }
             }
             Action::PickerDown => {
@@ -267,6 +294,10 @@ impl<'a> App<'a> {
                     let count = self.command_picker.filtered_count(filter);
                     if *selected + 1 < count {
                         *selected += 1;
+                    }
+                } else if let AppState::FilePicker { .. } = self.state {
+                    if let Some(ref mut picker) = self.file_picker {
+                        picker.next();
                     }
                 }
             }
@@ -286,30 +317,56 @@ impl<'a> App<'a> {
                         self.input_pane.clear();
                         self.input_pane.set_text(&text);
                     }
+                    self.state = AppState::Idle;
+                } else if let AppState::FilePicker { start_col, .. } = self.state {
+                    if let Some(ref picker) = self.file_picker {
+                        if let Some(path) = picker.get_selected() {
+                            let replacement = format!("@{} ", path);
+                            self.input_pane.apply_completion(start_col, &replacement);
+                        }
+                    }
+                    self.state = AppState::Idle;
+                    self.file_picker = None;
                 }
-                self.state = AppState::Idle;
             }
             Action::PickerDismiss => {
                 self.state = AppState::Idle;
                 self.input_pane.clear();
+                self.file_picker = None;
             }
             Action::PickerBackspace => {
                 let text = self.input_pane.text();
-                if text.len() <= 1 {
-                    // Backspace past `/` — close picker
-                    self.state = AppState::Idle;
-                    self.input_pane.clear();
-                } else {
-                    self.input_pane.delete_char_before();
-                    if let AppState::CommandPicker {
-                        ref mut filter,
-                        ref mut selected,
-                        ..
-                    } = self.state
-                    {
-                        let new_text = self.input_pane.text();
-                        *filter = new_text.strip_prefix('/').unwrap_or("").to_string();
-                        *selected = 0;
+                if let AppState::CommandPicker { .. } = self.state {
+                    if text.len() <= 1 {
+                        // Backspace past `/` — close picker
+                        self.state = AppState::Idle;
+                        self.input_pane.clear();
+                    } else {
+                        self.input_pane.delete_char_before();
+                        if let AppState::CommandPicker {
+                            ref mut filter,
+                            ref mut selected,
+                            ..
+                        } = self.state
+                        {
+                            let new_text = self.input_pane.text();
+                            *filter = new_text.strip_prefix('/').unwrap_or("").to_string();
+                            *selected = 0;
+                        }
+                    }
+                } else if let AppState::FilePicker { ref mut filter, start_col, .. } = self.state {
+                    if self.input_pane.textarea().cursor().1 <= start_col + 1 {
+                        // Backspace past `@` — close picker
+                        self.state = AppState::Idle;
+                        self.file_picker = None;
+                        self.input_pane.delete_char_before();
+                    } else {
+                        self.input_pane.delete_char_before();
+                        filter.pop();
+                        if let Some(ref mut picker) = self.file_picker {
+                            picker.query = filter.clone();
+                            picker.update_matches(&mut self.file_indexer);
+                        }
                     }
                 }
             }
@@ -323,6 +380,12 @@ impl<'a> App<'a> {
                 {
                     filter.push(c);
                     *selected = 0;
+                } else if let AppState::FilePicker { ref mut filter, .. } = self.state {
+                    filter.push(c);
+                    if let Some(ref mut picker) = self.file_picker {
+                        picker.query = filter.clone();
+                        picker.update_matches(&mut self.file_indexer);
+                    }
                 }
             }
 
@@ -610,6 +673,8 @@ pub async fn run(config: &Config, session_id: Option<&str>) -> anyhow::Result<()
         rate_limit_until: None,
         git_refresh_pending: false,
         file_completion: None,
+        file_indexer: FileIndexer::new(config.working_directory.clone()),
+        file_picker: None,
     };
 
     // Inject initial messages (e.g. session resume notification)
@@ -692,7 +757,7 @@ pub async fn run(config: &Config, session_id: Option<&str>) -> anyhow::Result<()
                             let mut orch = orch_clone.lock().await;
                             let result = orch
                                 .handle_user_input_streaming(
-                                    "Execute the accepted plan step by step.",
+                                    vec![Part::Text("Execute the accepted plan step by step.".to_string())],
                                     |event| match &event {
                                         StreamEvent::TextDelta(text) => {
                                             let _ = tx.send(AppEvent::TextDelta(text.clone()));
@@ -877,6 +942,9 @@ pub async fn run(config: &Config, session_id: Option<&str>) -> anyhow::Result<()
                             let _ = tx.send(AppEvent::OrchestratorDone);
                         });
                     }
+                    CommandResult::Reindex => {
+                        app.file_indexer.refresh();
+                    }
                     CommandResult::Continue => {}
                 }
             } else if let Some(shell_input) = input.strip_prefix('!') {
@@ -903,12 +971,22 @@ pub async fn run(config: &Config, session_id: Option<&str>) -> anyhow::Result<()
                 let flag = cancel_flag.clone();
                 flag.store(false, Ordering::SeqCst);
 
-                let input_owned = input;
+                let input_owned = input.clone();
+                let wd = config.working_directory.clone();
                 tokio::spawn(async move {
+                    let parts = match crate::agent::tag_processor::process_tags(&input_owned, &wd).await {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::Error(format!("Failed to process tags: {}", e)));
+                            let _ = tx.send(AppEvent::OrchestratorDone);
+                            return;
+                        }
+                    };
+
                     let mut orch = orch_clone.lock().await;
                     orch.reset_cancel();
                     let result = orch
-                        .handle_user_input_streaming(&input_owned, |event| match &event {
+                        .handle_user_input_streaming(parts, |event| match &event {
                             StreamEvent::TextDelta(text) => {
                                 let _ = tx.send(AppEvent::TextDelta(text.clone()));
                             }
@@ -1100,6 +1178,13 @@ pub async fn run(config: &Config, session_id: Option<&str>) -> anyhow::Result<()
                 if let Some(until) = app.rate_limit_until {
                     if std::time::Instant::now() >= until {
                         app.rate_limit_until = None;
+                    }
+                }
+                
+                // Update file picker matches as indexer populates in background
+                if let AppState::FilePicker { .. } = app.state {
+                    if let Some(ref mut picker) = app.file_picker {
+                        picker.update_matches(&mut app.file_indexer);
                     }
                 }
             }

@@ -58,8 +58,10 @@ pub async fn run_oneshot(config: &Config, question: &str) -> anyhow::Result<()> 
     });
     orchestrator.detect_git_context().await;
 
+    let parts = crate::agent::tag_processor::process_tags(question, &config.working_directory).await?;
+    
     match orchestrator
-        .handle_user_input_streaming(question, default_stream_handler)
+        .handle_user_input_streaming(parts, default_stream_handler)
         .await
     {
         Ok(_) => {

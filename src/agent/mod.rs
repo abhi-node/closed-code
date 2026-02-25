@@ -5,6 +5,7 @@ pub mod message;
 pub mod orchestrator;
 pub mod planner;
 pub mod review_agent;
+pub mod tag_processor;
 pub mod web_searcher;
 
 use async_trait::async_trait;
