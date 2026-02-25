@@ -76,6 +76,7 @@ dialoguer = "0.11"
 
 # TOML configuration file parsing
 toml = "0.8"
+nucleo = "0.5"
 
 # Platform-specific sandboxing (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]

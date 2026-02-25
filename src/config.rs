@@ -135,19 +135,12 @@ impl Config {
             .or(merged.api_key)
             .ok_or(ClosedCodeError::MissingApiKey)?;
 
-        let model = cli.model.clone();
-        // If user didn't pass --model explicitly, check TOML
-        // clap gives the default_value, so we can't easily distinguish.
-        // Workaround: if TOML has model and CLI has the default, use TOML.
-        // For simplicity, CLI always wins since clap provides a default.
-        let model = merged.model.unwrap_or(model);
-        // But CLI flag should override TOML — re-check if user explicitly passed --model
-        // clap doesn't distinguish "default" vs "explicit". We use a simple heuristic:
-        // if the cli.model != default, the user explicitly set it.
+        // Resolve model: CLI flag overrides TOML, but clap always provides a default.
+        // Heuristic: if cli.model != default, the user explicitly set it.
         let model = if cli.model != "gemini-3.1-pro-preview" {
             cli.model.clone()
         } else {
-            model
+            merged.model.unwrap_or_else(|| cli.model.clone())
         };
 
         let mode_str = if cli.mode != "explore" {

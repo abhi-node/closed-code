@@ -12,7 +12,7 @@ impl Spinner {
             ProgressStyle::default_spinner()
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
                 .template("{spinner} {msg}")
-                .unwrap(),
+                .expect("hardcoded spinner template"),
         );
         bar.enable_steady_tick(Duration::from_millis(80));
         bar.set_message(message.to_string());

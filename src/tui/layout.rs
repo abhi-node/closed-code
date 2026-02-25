@@ -70,9 +70,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         selected,
     } = app.state
     {
-        let filter = filter.clone();
         app.command_picker
-            .render(frame, &filter, selected, area, chat_area);
+            .render(frame, filter, selected, area, chat_area);
     }
 
     // Approval overlay

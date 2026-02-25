@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use ratatui::style::{Style, Stylize};
@@ -11,7 +12,7 @@ const HISTORY_MAX: usize = 200;
 
 pub struct InputPane<'a> {
     textarea: TextArea<'a>,
-    pub(crate) history: Vec<String>,
+    pub(crate) history: VecDeque<String>,
     history_index: Option<usize>,
     saved_input: Option<String>,
     viewport_width: u16,
@@ -25,7 +26,7 @@ impl<'a> InputPane<'a> {
 
         Self {
             textarea,
-            history: Vec::new(),
+            history: VecDeque::new(),
             history_index: None,
             saved_input: None,
             viewport_width: 80,
@@ -156,10 +157,10 @@ impl<'a> InputPane<'a> {
             return None;
         }
         // Avoid consecutive duplicates in history
-        if self.history.last() != Some(&text) {
-            self.history.push(text.clone());
+        if self.history.back() != Some(&text) {
+            self.history.push_back(text.clone());
             if self.history.len() > HISTORY_MAX {
-                self.history.remove(0);
+                self.history.pop_front();
             }
         }
         self.clear();
